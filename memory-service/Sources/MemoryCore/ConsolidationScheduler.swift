@@ -29,7 +29,11 @@ public final class ConsolidationScheduler {
     private var pauseTask: Task<Void, Never>?
     private var idleTask: Task<Void, Never>?
     private var running: Task<Void, Never>?
-    private var cancelFlag = false
+    // Thread-safe storage instead of a @MainActor-isolated Bool: the engine's
+    // `isCancelled` closure is called from the cooperative thread pool (engine
+    // is not @MainActor), so `MainActor.assumeIsolated { cancelFlag }` would
+    // trap with a fatal error → SIGILL on Linux. See `AtomicFlag` below.
+    private let cancelFlag = AtomicFlag(false)
 
     public init(runner: ConsolidationRunning, isReady: @escaping () -> Bool, hasPendingCycle: @escaping () -> Bool,
                 isUserBusy: @escaping () -> Bool = { false },
@@ -42,7 +46,7 @@ public final class ConsolidationScheduler {
     /// Called at the START of every user turn: cancel any running consolidation. Does NOT arm
     /// timers — timers are armed at turn end via noteTurnEnded().
     public func noteUserActivity() {
-        cancelFlag = true
+        cancelFlag.set(true)
         running?.cancel(); running = nil
         pauseTask?.cancel(); idleTask?.cancel()
         state = .idle
@@ -92,9 +96,9 @@ public final class ConsolidationScheduler {
 
     private func launch(light: Bool) {
         guard isReady(), running == nil, !isUserBusy() else { return }
-        cancelFlag = false
-        let isCancelled: @Sendable () -> Bool = { [weak self] in
-            MainActor.assumeIsolated { self?.cancelFlag ?? true }
+        cancelFlag.set(false)
+        let isCancelled: @Sendable () -> Bool = { [cancelFlag] in
+            cancelFlag.get()
         }
         state = light ? .reflecting : .sleeping("nrem")
         running = Task { [weak self, runner] in
@@ -107,4 +111,17 @@ public final class ConsolidationScheduler {
             }
         }
     }
+}
+
+/// Lock-backed Bool that's safe to read/write from any task or thread.
+/// Replaces a @MainActor-isolated flag whose closure-reads via
+/// `MainActor.assumeIsolated` would trap when called off the main actor
+/// (e.g. from the engine's non-isolated `runLight`/`runCycle` on Linux,
+/// where the trap surfaces as SIGILL).
+final class AtomicFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Bool
+    init(_ value: Bool) { self.value = value }
+    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
 }
