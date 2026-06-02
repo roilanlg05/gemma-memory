@@ -8,13 +8,17 @@ public struct AppConfig: Sendable {
     public var dbPath: String
     public var embedderURL: String
     public var modelURL: String
+    public var modelName: String
     public var port: Int
 
-    public init(bearerToken: String, dbPath: String, embedderURL: String, modelURL: String, port: Int = 8081) {
+    public init(bearerToken: String, dbPath: String, embedderURL: String, modelURL: String,
+                modelName: String = "unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit",
+                port: Int = 8081) {
         self.bearerToken = bearerToken
         self.dbPath = dbPath
         self.embedderURL = embedderURL
         self.modelURL = modelURL
+        self.modelName = modelName
         self.port = port
     }
 
@@ -35,6 +39,7 @@ public struct AppConfig: Sendable {
             dbPath: env["MEMORY_DB_PATH"] ?? "/data/memory.sqlite",
             embedderURL: env["EMBEDDER_URL"] ?? "http://embedder:8000",
             modelURL: env["MODEL_URL"] ?? "http://host.docker.internal:8080",
+            modelName: env["MODEL_NAME"] ?? "unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit",
             port: Int(env["MEMORY_PORT"] ?? "8081") ?? 8081
         )
     }
@@ -64,7 +69,8 @@ public final class Services: @unchecked Sendable {
         self.embedder = embedder
         self.retriever = MemoryRetriever(store: store, embedder: embedder)
         self.bearerToken = config.bearerToken
-        let modelClient = RemoteModelClient(baseURL: URL(string: config.modelURL)!)
+        let modelClient = RemoteModelClient(baseURL: URL(string: config.modelURL)!,
+                                            model: config.modelName)
         self.modelClient = modelClient
         let engine = MemoryConsolidationEngine(store: store, embedder: embedder,
                                                runtime: modelClient, transcriptStore: transcript)

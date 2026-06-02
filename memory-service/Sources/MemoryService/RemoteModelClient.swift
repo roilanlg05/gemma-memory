@@ -14,9 +14,19 @@ public struct RemoteModelClient: ModelTextClient {
     public let baseURL: URL
     public let session: URLSession
     public let timeout: TimeInterval
+    public let model: String
 
-    public init(baseURL: URL, session: URLSession = .shared, timeout: TimeInterval = 120) {
+    /// - Parameters:
+    ///   - model: model id to send in the OpenAI-compatible `model` field. mlx_vlm.server
+    ///     falls back to its built-in default (e.g. nanoLLaVA) if the field is missing, which
+    ///     triggers an on-demand load + breaks our speculative drafter. Always send the model
+    ///     we actually want consolidation phases to run against.
+    public init(baseURL: URL,
+                model: String = "unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit",
+                session: URLSession = .shared,
+                timeout: TimeInterval = 120) {
         self.baseURL = baseURL
+        self.model = model
         self.session = session
         self.timeout = timeout
     }
@@ -24,12 +34,14 @@ public struct RemoteModelClient: ModelTextClient {
     public func generate(prompt: String, options: ModelTextOptions) async throws -> String {
         struct Msg: Encodable { let role: String; let content: String }
         struct Req: Encodable {
+            let model: String
             let messages: [Msg]
             let max_tokens: Int
             let temperature: Double
             let chat_template_kwargs: [String: Bool]
         }
-        let req = Req(messages: [.init(role: "user", content: prompt)],
+        let req = Req(model: model,
+                      messages: [.init(role: "user", content: prompt)],
                       max_tokens: options.maxTokens,
                       temperature: options.temperature,
                       chat_template_kwargs: ["enable_thinking": false])
