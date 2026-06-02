@@ -22,7 +22,7 @@ services:
       - MEMORY_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
       - MEMORY_DB_PATH=/data/memory.sqlite
       - EMBEDDER_URL=http://embedder:8000
-      - MODEL_URL=http://host.docker.internal:8080
+      - MODEL_URL=${MODEL_URL:-http://host.docker.internal:8080}
       - IDLE_MS=180000
       - POST_TURN_MS=15000
     volumes:
