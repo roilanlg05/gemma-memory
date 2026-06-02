@@ -13,6 +13,15 @@ struct InspectorHandlers {
     func register(on group: RouterGroup<BasicRequestContext>) {
         group.get("/nodes", use: nodes)
         group.get("/transcript/recent", use: recent)
+        group.get("/graph", use: graph)
+    }
+
+    @Sendable func graph(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
+        let nodeLimit = req.uri.queryParameters["nodeLimit"].flatMap { Int($0) } ?? 300
+        let result = try services.store.loadGraph(nodeLimit: nodeLimit)
+        let data = try JSONEncoder().encode(result)
+        return Response(status: .ok, headers: [.contentType: "application/json"],
+                        body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
     }
 
     @Sendable func nodes(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
