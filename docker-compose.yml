@@ -1,0 +1,43 @@
+services:
+  embedder:
+    build:
+      context: ./embedder
+    expose:
+      - "8000"
+    volumes:
+      - embedder-models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  memory:
+    build:
+      context: ./memory-service
+    ports:
+      - "8081:8081"
+    environment:
+      - MEMORY_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
+      - MEMORY_DB_PATH=/data/memory.sqlite
+      - EMBEDDER_URL=http://embedder:8000
+      - MODEL_URL=http://host.docker.internal:8080
+      - IDLE_MS=180000
+      - POST_TURN_MS=15000
+    volumes:
+      - ./docker-data/memory:/data
+    depends_on:
+      embedder:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  embedder-models:

@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Python
+embedder/__pycache__/
+embedder/models/
+embedder/.pytest_cache/
+embedder/.venv/
+embedder/*.pyc
+
+# Swift
+memory-service/.build/
+memory-service/.swiftpm/
+memory-service/*.xcodeproj/
+# Package.resolved IS tracked — reproducible builds across the dev Mac and the Linux container
+
+# Docker volumes
+docker-data/
+
+# OS
+.DS_Store
