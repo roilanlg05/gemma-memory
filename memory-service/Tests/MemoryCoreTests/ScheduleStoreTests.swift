@@ -30,4 +30,17 @@ final class ScheduleStoreTests: XCTestCase {
         let k3 = MemoryText.eventCanonicalKey(title: "dentist appointment", startAt: 1_780_657_200) // +1h
         XCTAssertNotEqual(k1, k3)
     }
+
+    func test_eventsOverlap_rules() {
+        // [0,10) vs [10,20) touch at the edge → NO overlap
+        XCTAssertFalse(eventsOverlap(0, 10, 10, 20))
+        // [0,10) vs [5,15) → overlap
+        XCTAssertTrue(eventsOverlap(0, 10, 5, 15))
+        // nested [0,100) vs [10,20) → overlap
+        XCTAssertTrue(eventsOverlap(0, 100, 10, 20))
+        // identical → overlap
+        XCTAssertTrue(eventsOverlap(5, 6, 5, 6))
+        // disjoint → no overlap
+        XCTAssertFalse(eventsOverlap(0, 5, 100, 200))
+    }
 }
