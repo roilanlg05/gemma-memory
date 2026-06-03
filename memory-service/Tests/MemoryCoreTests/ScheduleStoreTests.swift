@@ -2,6 +2,22 @@ import XCTest
 @testable import MemoryCore
 
 final class ScheduleStoreTests: XCTestCase {
+    private func makeStore() throws -> MemoryStore { try MemoryStore(path: ":memory:", embeddingDim: 8) }
+
+    @discardableResult
+    private func addEvent(_ store: MemoryStore, _ title: String, _ start: Double, _ end: Double,
+                          status: String = "scheduled", location: String? = nil) throws -> String {
+        let attrs = NodeAttributes(status: status, startAt: start, endAt: end, location: location,
+                                   canonicalKey: MemoryText.eventCanonicalKey(title: title, startAt: start))
+        let id = UUID().uuidString; let t = start
+        let node = Node(id: id, kind: NodeKind.event.rawValue, label: title, body: title, layer: .daily,
+                        createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3, decayRate: 0,
+                        confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                        origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
+        try store.upsert(node)
+        return id
+    }
+
     func test_nodeAttributes_roundtrip_eventFields() {
         var a = NodeAttributes()
         a.startAt = 1_000; a.endAt = 4_600; a.allDay = false
@@ -42,5 +58,26 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertTrue(eventsOverlap(5, 6, 5, 6))
         // disjoint → no overlap
         XCTAssertFalse(eventsOverlap(0, 5, 100, 200))
+    }
+
+    func test_scheduleWindow_returnsScheduledInRange_sortedByStart() throws {
+        let s = try makeStore()
+        try addEvent(s, "B", 200, 260)
+        try addEvent(s, "A", 100, 160)
+        try addEvent(s, "Out", 10_000, 10_060)
+        try addEvent(s, "Cancelled", 120, 180, status: "cancelled")
+        let win = try s.scheduleWindow(from: 0, to: 1_000, includeCancelled: false)
+        XCTAssertEqual(win.map { $0.label }, ["A", "B"])   // sorted by start, cancelled excluded, Out excluded
+        let withCancelled = try s.scheduleWindow(from: 0, to: 1_000, includeCancelled: true)
+        XCTAssertEqual(withCancelled.count, 3)
+    }
+
+    func test_scheduleConflicts_findsOverlappingScheduledOnly() throws {
+        let s = try makeStore()
+        try addEvent(s, "Trip", 0, 1_000)
+        try addEvent(s, "CancelledTrip", 0, 1_000, status: "cancelled")
+        let conflicts = try s.scheduleConflicts(start: 500, end: 600)
+        XCTAssertEqual(conflicts.map { $0.label }, ["Trip"])   // cancelled not a conflict
+        XCTAssertEqual(try s.scheduleConflicts(start: 2_000, end: 2_100).count, 0)
     }
 }
