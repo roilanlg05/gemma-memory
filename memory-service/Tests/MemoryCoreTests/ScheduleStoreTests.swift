@@ -103,4 +103,19 @@ final class ScheduleStoreTests: XCTestCase {
         let still = try s.allNodes().filter { $0.kind == NodeKind.event.rawValue }
         XCTAssertEqual(still.count, 2, "cancelled is retained, not deleted")
     }
+
+    func test_cancelEvents_idempotent_onAlreadyCancelled() throws {
+        let s = try makeStore()
+        try addEvent(s, "A", 100, 160)
+        XCTAssertEqual(try s.cancelEvents(from: 0, to: 1_000), 1)
+        XCTAssertEqual(try s.cancelEvents(from: 0, to: 1_000), 0)
+    }
+
+    func test_cancelEvents_byId_ignoresNonEventNodes() throws {
+        let s = try makeStore()
+        let eventId = try addEvent(s, "A", 100, 160)
+        // a non-event id (random) and... nothing else; only the event id should be cancellable
+        XCTAssertEqual(try s.cancelEvents(ids: ["does-not-exist"]), 0)
+        XCTAssertEqual(try s.cancelEvents(ids: [eventId]), 1)
+    }
 }
