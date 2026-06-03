@@ -176,6 +176,7 @@ public func buildApp(services: Services, port: Int) async throws -> some Applica
     TranscriptHandlers(services: services).register(on: v1)
     MemoryHandlers(services: services).register(on: v1)
     ConsolidationHandlers(services: services).register(on: v1)
+    ScheduleHandlers(services: services).register(on: v1)
     InspectorHandlers(services: services).register(on: v1)
     v1.get("/echo") { _, _ -> Response in
         return Response(
