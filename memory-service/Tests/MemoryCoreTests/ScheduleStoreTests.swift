@@ -80,4 +80,27 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertEqual(conflicts.map { $0.label }, ["Trip"])   // cancelled not a conflict
         XCTAssertEqual(try s.scheduleConflicts(start: 2_000, end: 2_100).count, 0)
     }
+
+    func test_upsertEvent_dedupsByCanonicalKey() throws {
+        let s = try makeStore()
+        let id1 = try s.upsertEvent(title: "dentist", start: 1_780_653_600, end: 1_780_657_200,
+                                    allDay: false, location: nil, origin: .explicit)
+        let id2 = try s.upsertEvent(title: "  Dentist ", start: 1_780_653_630, end: 1_780_657_200,
+                                    allDay: false, location: "clinic", origin: .explicit)
+        XCTAssertEqual(id1, id2, "same canonicalKey → update, not duplicate")
+        let events = try s.allNodes().filter { $0.kind == NodeKind.event.rawValue }
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(NodeAttributes.from(events[0].extra).location, "clinic", "update applied")
+    }
+
+    func test_cancelEvents_byWindow_softCancels() throws {
+        let s = try makeStore()
+        try addEvent(s, "A", 100, 160)
+        try addEvent(s, "Out", 10_000, 10_060)
+        let n = try s.cancelEvents(from: 0, to: 1_000)
+        XCTAssertEqual(n, 1)
+        XCTAssertEqual(try s.scheduleConflicts(start: 100, end: 160).count, 0, "cancelled no longer conflicts")
+        let still = try s.allNodes().filter { $0.kind == NodeKind.event.rawValue }
+        XCTAssertEqual(still.count, 2, "cancelled is retained, not deleted")
+    }
 }

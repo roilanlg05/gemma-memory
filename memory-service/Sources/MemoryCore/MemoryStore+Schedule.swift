@@ -32,4 +32,57 @@ extension MemoryStore {
             return eventsOverlap(s, e, start, end)
         }
     }
+
+    /// Create or update an event, deduping by canonicalKey. Returns the node id.
+    @discardableResult
+    public func upsertEvent(title: String, start: Double, end: Double, allDay: Bool,
+                            location: String?, origin: Origin) throws -> String {
+        let key = MemoryText.eventCanonicalKey(title: title, startAt: start)
+        let existing = try allNodes().first { node in
+            node.kind == NodeKind.event.rawValue && NodeAttributes.from(node.extra).canonicalKey == key
+        }
+        let now = Date().timeIntervalSince1970
+        let attrs = NodeAttributes(status: "scheduled", startAt: start, endAt: end,
+                                   allDay: allDay, location: location, canonicalKey: key)
+        if let existing {
+            var node = existing
+            node.label = title; node.body = title; node.updatedAt = now; node.lastSeenAt = now
+            node.extra = attrs.toJSON(); node.dirty = true
+            try upsert(node)
+            return existing.id
+        } else {
+            let id = UUID().uuidString
+            let node = Node(id: id, kind: NodeKind.event.rawValue, label: title, body: title, layer: .daily,
+                            createdAt: now, updatedAt: now, lastSeenAt: now, salience: 3, decayRate: 0,
+                            confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                            origin: origin, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
+            try upsert(node)
+            return id
+        }
+    }
+
+    /// Soft-cancel: set status="cancelled" on the given ids, or on all scheduled events in [from,to).
+    /// Returns the count changed. Cancelled events are retained (for future notifications).
+    @discardableResult
+    public func cancelEvents(ids: [String]? = nil, from: Double? = nil, to: Double? = nil) throws -> Int {
+        let targets: [Node]
+        if let ids {
+            targets = try ids.compactMap { try node(id: $0) }.filter { $0.kind == NodeKind.event.rawValue }
+        } else if let from, let to {
+            targets = try scheduleWindow(from: from, to: to, includeCancelled: false)
+        } else {
+            return 0
+        }
+        var changed = 0
+        let now = Date().timeIntervalSince1970
+        for var node in targets {
+            var a = NodeAttributes.from(node.extra)
+            guard a.status != "cancelled" else { continue }
+            a.status = "cancelled"
+            node.extra = a.toJSON(); node.updatedAt = now; node.dirty = true
+            try upsert(node)
+            changed += 1
+        }
+        return changed
+    }
 }
