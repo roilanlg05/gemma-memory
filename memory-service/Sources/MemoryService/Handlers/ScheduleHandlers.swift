@@ -17,8 +17,11 @@ struct ScheduleHandlers {
 
     private func eventJSON(_ n: Node) -> [String: Any] {
         let a = NodeAttributes.from(n.extra)
-        return ["id": n.id, "title": n.label, "start": a.startAt ?? 0, "end": a.endAt ?? 0,
-                "allDay": a.allDay ?? false, "location": a.location as Any, "status": a.status ?? "scheduled"]
+        var d: [String: Any] = ["id": n.id, "title": n.label, "start": a.startAt ?? 0,
+                                "end": a.endAt ?? 0, "allDay": a.allDay ?? false,
+                                "status": a.status ?? "scheduled"]
+        if let loc = a.location { d["location"] = loc }
+        return d
     }
 
     private func json(_ obj: Any, _ status: HTTPResponse.Status = .ok) -> Response {
@@ -32,7 +35,7 @@ struct ScheduleHandlers {
         return try? JSONDecoder().decode(T.self, from: Data(buf.readableBytesView))
     }
 
-    struct CheckBody: Decodable { let start: Double; let end: Double }
+    struct CheckBody: Decodable, Sendable { let start: Double; let end: Double }
 
     @Sendable func check(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
         guard let b = await body(req, CheckBody.self) else {
@@ -42,7 +45,7 @@ struct ScheduleHandlers {
         return json(["conflicts": conflicts.map(eventJSON)])
     }
 
-    struct CreateBody: Decodable {
+    struct CreateBody: Decodable, Sendable {
         let title: String; let start: Double; let end: Double
         let allDay: Bool?; let location: String?; let origin: String?; let force: Bool?
     }
@@ -51,7 +54,9 @@ struct ScheduleHandlers {
         guard let b = await body(req, CreateBody.self) else {
             return jsonError(.badRequest, "bad_request", "title/start/end required")
         }
-        let conflicts = (try? services.store.scheduleConflicts(start: b.start, end: b.end)) ?? []
+        let conflicts: [Node]
+        do { conflicts = try services.store.scheduleConflicts(start: b.start, end: b.end) }
+        catch { return jsonError(.internalServerError, "store_error", "\(error)") }
         if !conflicts.isEmpty, b.force != true {
             return json(["created": false, "conflicts": conflicts.map(eventJSON)])
         }
@@ -71,10 +76,13 @@ struct ScheduleHandlers {
         return json(["events": events.map(eventJSON)])
     }
 
-    struct CancelBody: Decodable { let ids: [String]?; let from: Double?; let to: Double? }
+    struct CancelBody: Decodable, Sendable { let ids: [String]?; let from: Double?; let to: Double? }
 
     @Sendable func cancel(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
         guard let b = await body(req, CancelBody.self) else {
+            return jsonError(.badRequest, "bad_request", "ids or from/to required")
+        }
+        guard b.ids != nil || (b.from != nil && b.to != nil) else {
             return jsonError(.badRequest, "bad_request", "ids or from/to required")
         }
         let n = (try? services.store.cancelEvents(ids: b.ids, from: b.from, to: b.to)) ?? 0
