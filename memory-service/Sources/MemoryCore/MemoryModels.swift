@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 
-public enum NodeKind: String, Codable, CaseIterable, Sendable { case person, place, fact, preference, topic, trait, task, plan, summary, insight, day, episode, conversation, followUp = "follow_up", clarification }
+public enum NodeKind: String, Codable, CaseIterable, Sendable { case person, place, fact, preference, topic, trait, task, plan, event, summary, insight, day, episode, conversation, followUp = "follow_up", clarification }
 public enum MemoryLayer: String, Codable, CaseIterable, Sendable { case live, daily, identity, episodic } // episodic reservado (S11)
 public enum Confidence: String, Codable, CaseIterable, Sendable { case sure, probable, maybe }
 public enum Origin: String, Codable, CaseIterable, Sendable { case explicit, extracted }
@@ -34,6 +34,7 @@ public extension NodeKind {
         case .trait: return "Traits"
         case .task: return "Tasks"
         case .plan: return "Plans"
+        case .event: return "Events"
         case .summary: return "Summaries"
         case .insight: return "Insights"
         case .day: return "Days"
