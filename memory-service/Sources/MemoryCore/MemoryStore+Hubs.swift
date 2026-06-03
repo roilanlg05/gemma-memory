@@ -114,6 +114,7 @@ public extension MemoryStore {
     func nodesByEntity(label: String, limit: Int = 100) throws -> [Node] {
         try dbQueue.read { db in
             // entity may be the src OR dst — collect both directions, dedupe.
+            // Exclude hub anchors (they appear via belongsToHub but are structural, not memory).
             try Node.fetchAll(db, sql: """
                 SELECT DISTINCT n.* FROM node n
                 JOIN edge e ON (e.dstId = n.id OR e.srcId = n.id)
@@ -121,9 +122,10 @@ public extension MemoryStore {
                               OR (e.dstId = ent.id AND e.srcId = n.id))
                 WHERE ent.label = ? AND ent.deleted = 0
                   AND n.deleted = 0 AND n.id != ent.id
+                  AND n.kind != ?
                   AND e.deleted = 0
                 ORDER BY n.updatedAt DESC LIMIT ?
-                """, arguments: [label, limit])
+                """, arguments: [label, HubKind.hub.rawValue, limit])
         }
     }
 }
