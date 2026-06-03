@@ -56,7 +56,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
     private struct EntitiesOut: Decodable {
         struct E: Decodable { let entity: String; let kind: String?; let detail: String?; let permanent: Bool?
-            struct Attr: Decodable { let status: String?; let horizon: String?; let date: String? }
+            struct Attr: Decodable { let status: String?; let horizon: String?; let date: String?; let start: Double?; let end: Double? }
             let attributes: Attr? }
         let entities: [E]
     }
@@ -71,7 +71,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         preference, fact, trait (personality), task (something to do — set attributes.status "pending"), \
         plan (an intention — set attributes.horizon "short" or "long"), or another short lowercase kind if \
         none fit. Put context in `detail`. Never invent; only what the user actually stated.
-        Schema: {"entities":[{"entity":"...","kind":"...","detail":"...","permanent":false,"attributes":{"status":"pending|done","horizon":"short|long","date":"yyyy-MM-dd"}}]}
+        For appointments/meetings/trips (things with a time), also fill attributes.start and attributes.end as Unix epoch seconds (UTC) for the resolved date+time; assume 1 hour duration if only a start time is given.
+        Schema: {"entities":[{"entity":"...","kind":"...","detail":"...","permanent":false,"attributes":{"status":"pending|done","horizon":"short|long","date":"yyyy-MM-dd","start":0,"end":0}}]}
         Conversation:
         \(convo)
         JSON:
@@ -79,6 +80,16 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         guard let out = parse(await generate(prompt, maxTokens: 512), EntitiesOut.self) else { return }
         var added = 0
         for e in out.entities {
+            // Structured event: a timed entity with epoch start/end → first-class `event`.
+            if let st = e.attributes?.start, let en = e.attributes?.end, en > st {
+                let evLabel = MemoryText.canonicalEntityLabel(e.entity)
+                if !MemoryText.isJunkLabel(evLabel) {
+                    _ = try? store.upsertEvent(title: evLabel, start: st, end: en,
+                                               allDay: false, location: e.detail, origin: .extracted)
+                    added += 1
+                }
+                continue
+            }
             let rawKind = (e.kind?.isEmpty == false) ? e.kind! : NodeKind.fact.rawValue
             let entityKinds: Set<String> = [NodeKind.person.rawValue, NodeKind.place.rawValue,
                                             NodeKind.preference.rawValue, NodeKind.fact.rawValue]

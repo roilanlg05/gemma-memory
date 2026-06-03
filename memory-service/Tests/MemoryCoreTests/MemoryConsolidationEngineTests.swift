@@ -260,6 +260,24 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(tasks.count, 2, "two distinct meetings (different dates) must NOT collapse into one")
     }
 
+    func test_consolidate_emitsStructuredEvent_whenStartEndPresent() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 8)
+        // Fake runtime returns one event-like entity with epoch start/end.
+        final class EventRuntime: ModelTextClient, @unchecked Sendable {
+            func generate(prompt: String, options: ModelTextOptions) async throws -> String {
+                #"{"entities":[{"entity":"dentist appointment","kind":"task","detail":"dentist","attributes":{"status":"pending","date":"2026-06-04","start":1780653600,"end":1780657200}}]}"#
+            }
+        }
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 8),
+                                               runtime: EventRuntime(), transcriptStore: TranscriptStore(dbQueue: store.dbQueue))
+        await engine.consolidate(episodeTexts: ["User: dentista jueves 10am"])
+        let events = try store.allNodes().filter { $0.kind == NodeKind.event.rawValue }
+        XCTAssertEqual(events.count, 1)
+        let a = NodeAttributes.from(events[0].extra)
+        XCTAssertEqual(a.startAt, 1_780_653_600)
+        XCTAssertEqual(a.endAt, 1_780_657_200)
+    }
+
     func test_clarify_emits_clarification_node_when_unsure() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 8)
         let ts = TranscriptStore(dbQueue: store.dbQueue)
