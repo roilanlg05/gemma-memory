@@ -144,19 +144,33 @@ public final class MemoryStore: @unchecked Sendable {
             try db.execute(sql: "INSERT INTO node_fts(node_id, label, body) VALUES (?, ?, ?)",
                            arguments: [node.id, node.label, node.body])
         }
+        // Auto-link to kind hub so the graph stays navigable from a single anchor per kind.
+        // Skips hub-kind nodes themselves and free-form kinds outside the NodeKind enum.
+        // Failures are swallowed: a missing hub link is not worth aborting an upsert.
+        try? linkToHub(nodeId: node.id, kindRaw: node.kind)
     }
     public func upsert(_ edge: Edge) throws { try dbQueue.write { try edge.save($0) } }
     public func node(id: String) throws -> Node? { try dbQueue.read { try Node.fetchOne($0, key: id) } }
-    public func allNodes(includeDeleted: Bool = false) throws -> [Node] {
+    /// Returns live, non-hub nodes by default. Pass `includeHubs: true` for the graph view
+    /// (where structural anchors should be visible). Pass `includeDeleted: true` for sweep
+    /// inspection. Most callers (recall, coreMemories, dedup) want semantic nodes only.
+    public func allNodes(includeDeleted: Bool = false, includeHubs: Bool = false) throws -> [Node] {
         try dbQueue.read { db in
-            includeDeleted ? try Node.fetchAll(db) : try Node.filter(Column("deleted") == false).fetchAll(db)
+            var q = Node.all()
+            if !includeDeleted { q = q.filter(Column("deleted") == false) }
+            if !includeHubs    { q = q.filter(Column("kind") != HubKind.hub.rawValue) }
+            return try q.fetchAll(db)
         }
     }
 
-    /// Total live node count — used by `/healthz` and tests.
-    public func nodeCount() throws -> Int {
+    /// Total live non-hub node count — used by `/v1/consolidation/state` and tests.
+    /// Excludes structural hub anchors so the count reflects actual memory items.
+    public func nodeCount(includeHubs: Bool = false) throws -> Int {
         try dbQueue.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM node WHERE deleted = 0") ?? 0
+            let sql = includeHubs
+                ? "SELECT COUNT(*) FROM node WHERE deleted = 0"
+                : "SELECT COUNT(*) FROM node WHERE deleted = 0 AND kind != '\(HubKind.hub.rawValue)'"
+            return try Int.fetchOne(db, sql: sql) ?? 0
         }
     }
 

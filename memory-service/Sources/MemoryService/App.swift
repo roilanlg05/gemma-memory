@@ -63,6 +63,9 @@ public final class Services: @unchecked Sendable {
     public init(config: AppConfig) throws {
         let store = try MemoryStore(path: config.dbPath, embeddingDim: 1024)
         self.store = store
+        // Ensure kind hubs + backfill belongsToHub edges on every startup (idempotent).
+        // Keeps the graph navigable even after a restart against an older DB.
+        try store.ensureKindHubs()
         let transcript = TranscriptStore(dbQueue: store.dbQueue)
         self.transcript = transcript
         let embedder = RemoteEmbedder(baseURL: URL(string: config.embedderURL)!)

@@ -6,7 +6,43 @@ public enum MemoryLayer: String, Codable, CaseIterable, Sendable { case live, da
 public enum Confidence: String, Codable, CaseIterable, Sendable { case sure, probable, maybe }
 public enum Origin: String, Codable, CaseIterable, Sendable { case explicit, extracted }
 public enum Relation: String, Codable, CaseIterable, Sendable {
+    // Domain (model-emitted via associate phase)
     case knows, worksWith, family, likes, dislikes, locatedAt, visited, happenedOn, mentionedIn, partOfEpisode, relatedTo
+    // Structural (engine-managed, never model-emitted)
+    case belongsToHub   // src = kind-hub, dst = item of that kind
+    case derivesFrom    // src = insight/summary, dst = source (task / transcript ref)
+    case clarifies      // src = clarification, dst = ambiguous node it's about
+    case sameAs         // src/dst are dedup-equivalent (kept when merge is non-destructive)
+}
+
+/// Reserved label for synthetic "kind hub" nodes — one per `NodeKind`. Holds `belongsToHub`
+/// edges into every live node of that kind, so queries like "all pending tasks ordered by
+/// date" or "all summaries" can navigate from a single anchor instead of full-table scan.
+public enum HubKind: String, CaseIterable, Sendable {
+    case hub = "hub"
+}
+
+public extension NodeKind {
+    /// Canonical label for the kind hub. e.g. `.task` → "Tasks", `.followUp` → "Follow-ups".
+    var hubLabel: String {
+        switch self {
+        case .person: return "People"
+        case .place: return "Places"
+        case .fact: return "Facts"
+        case .preference: return "Preferences"
+        case .topic: return "Topics"
+        case .trait: return "Traits"
+        case .task: return "Tasks"
+        case .plan: return "Plans"
+        case .summary: return "Summaries"
+        case .insight: return "Insights"
+        case .day: return "Days"
+        case .episode: return "Episodes"
+        case .conversation: return "Conversations"
+        case .followUp: return "Follow-ups"
+        case .clarification: return "Clarifications"
+        }
+    }
 }
 
 public struct Node: Codable, FetchableRecord, PersistableRecord, Identifiable, Equatable, Sendable {
