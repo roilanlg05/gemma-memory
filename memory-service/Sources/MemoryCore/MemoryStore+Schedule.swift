@@ -42,10 +42,14 @@ extension MemoryStore {
             node.kind == NodeKind.event.rawValue && NodeAttributes.from(node.extra).canonicalKey == key
         }
         let now = Date().timeIntervalSince1970
-        let attrs = NodeAttributes(status: "scheduled", startAt: start, endAt: end,
+        var attrs = NodeAttributes(status: "scheduled", startAt: start, endAt: end,
                                    allDay: allDay, location: location, canonicalKey: key)
         if let existing {
             var node = existing
+            let existingStatus = NodeAttributes.from(existing.extra).status
+            if existingStatus == "cancelled" || existingStatus == "done" {
+                attrs.status = existingStatus   // don't resurrect a cancelled/done event
+            }
             node.label = title; node.body = title; node.updatedAt = now; node.lastSeenAt = now
             node.extra = attrs.toJSON(); node.dirty = true
             try upsert(node)
@@ -66,7 +70,7 @@ extension MemoryStore {
     @discardableResult
     public func cancelEvents(ids: [String]? = nil, from: Double? = nil, to: Double? = nil) throws -> Int {
         let targets: [Node]
-        if let ids {
+        if let ids, !ids.isEmpty {
             targets = try ids.compactMap { try node(id: $0) }.filter { $0.kind == NodeKind.event.rawValue }
         } else if let from, let to {
             targets = try scheduleWindow(from: from, to: to, includeCancelled: false)

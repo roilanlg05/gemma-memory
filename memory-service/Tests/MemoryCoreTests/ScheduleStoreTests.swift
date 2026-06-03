@@ -118,4 +118,16 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertEqual(try s.cancelEvents(ids: ["does-not-exist"]), 0)
         XCTAssertEqual(try s.cancelEvents(ids: [eventId]), 1)
     }
+
+    func test_upsertEvent_doesNotResurrectCancelled() throws {
+        let s = try makeStore()
+        let id = try s.upsertEvent(title: "dentist", start: 1000, end: 4600,
+                                   allDay: false, location: nil, origin: .explicit)
+        XCTAssertEqual(try s.cancelEvents(ids: [id]), 1)
+        // re-upsert same canonicalKey (e.g. consolidate sees the appointment again)
+        _ = try s.upsertEvent(title: "dentist", start: 1000, end: 4600,
+                              allDay: false, location: "clinic", origin: .extracted)
+        XCTAssertEqual(try s.scheduleConflicts(start: 1000, end: 4600).count, 0,
+                       "a cancelled event must stay cancelled after re-upsert")
+    }
 }

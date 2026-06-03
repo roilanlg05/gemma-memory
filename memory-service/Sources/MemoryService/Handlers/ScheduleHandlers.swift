@@ -41,7 +41,9 @@ struct ScheduleHandlers {
         guard let b = await body(req, CheckBody.self) else {
             return jsonError(.badRequest, "bad_request", "start/end required")
         }
-        let conflicts = (try? services.store.scheduleConflicts(start: b.start, end: b.end)) ?? []
+        let conflicts: [Node]
+        do { conflicts = try services.store.scheduleConflicts(start: b.start, end: b.end) }
+        catch { return jsonError(.internalServerError, "store_error", "\(error)") }
         return json(["conflicts": conflicts.map(eventJSON)])
     }
 
@@ -82,7 +84,7 @@ struct ScheduleHandlers {
         guard let b = await body(req, CancelBody.self) else {
             return jsonError(.badRequest, "bad_request", "ids or from/to required")
         }
-        guard b.ids != nil || (b.from != nil && b.to != nil) else {
+        guard (b.ids?.isEmpty == false) || (b.from != nil && b.to != nil) else {
             return jsonError(.badRequest, "bad_request", "ids or from/to required")
         }
         let n = (try? services.store.cancelEvents(ids: b.ids, from: b.from, to: b.to)) ?? 0
