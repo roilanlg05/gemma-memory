@@ -276,6 +276,8 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         let a = NodeAttributes.from(events[0].extra)
         XCTAssertEqual(a.startAt, 1_780_653_600)
         XCTAssertEqual(a.endAt, 1_780_657_200)
+        XCTAssertTrue(try store.allNodes().filter { $0.kind == NodeKind.task.rawValue }.isEmpty,
+                      "a timed entity must become an event, not also a task")
     }
 
     func test_clarify_emits_clarification_node_when_unsure() async throws {
