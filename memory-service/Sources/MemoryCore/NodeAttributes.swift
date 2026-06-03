@@ -13,7 +13,7 @@ public struct NodeAttributes: Codable, Sendable {
     public var endAt: Double?        // epoch seconds (UTC)
     public var allDay: Bool?
     public var location: String?
-    public var canonicalKey: String? // dedup key for events
+    public var canonicalKey: String? // cached dedup key recomputed from title+startAt on each event upsert; not authoritative if title/startAt change independently
 
     public init(status: String? = nil, horizon: String? = nil, date: String? = nil,
                 startAt: Double? = nil, endAt: Double? = nil, allDay: Bool? = nil,

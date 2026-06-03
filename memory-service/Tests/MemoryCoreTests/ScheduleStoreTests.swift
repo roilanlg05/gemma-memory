@@ -17,6 +17,11 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertEqual(back.canonicalKey, "k1")
     }
 
+    func test_nodeAttributes_toJSON_nonNil_whenOnlyOneEventFieldSet() {
+        var a = NodeAttributes(); a.allDay = true
+        XCTAssertNotNil(a.toJSON())
+    }
+
     func test_eventCanonicalKey_collapsesSameStartAndTitle() {
         // 2026-06-04 10:00 and 10:00:30 round to the same minute; title normalized.
         let k1 = MemoryText.eventCanonicalKey(title: "Dentist Appointment", startAt: 1_780_653_600)
