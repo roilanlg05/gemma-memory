@@ -51,6 +51,14 @@ public enum MemoryText {
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Canonical dedup key for an event: normalized title + start rounded to the minute.
+    /// Collapses "10am"/"10:00"/"10:00:30" on the same title into one key.
+    public static func eventCanonicalKey(title: String, startAt: Double) -> String {
+        let minute = Int((startAt / 60.0).rounded(.down))
+        let normTitle = dedupKey(title)   // existing lowercase/whitespace/punct normalizer
+        return "\(minute)|\(normTitle)"
+    }
+
     /// Fillers / non-facts that should never be stored as a memory on their own.
     public static func isJunkLabel(_ raw: String) -> Bool {
         let k = dedupKey(raw)
