@@ -59,7 +59,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
     private struct EntitiesOut: Decodable {
         struct E: Decodable { let entity: String; let kind: String?; let detail: String?; let permanent: Bool?
-            struct Attr: Decodable { let status: String?; let horizon: String?; let date: String?; let start: Double?; let end: Double?; let location: String? }
+            struct Attr: Decodable { let status: String?; let horizon: String?; let date: String?
+                let startTime: String?; let endTime: String?; let allDay: Bool?; let location: String? }
             let attributes: Attr? }
         let entities: [E]
     }
@@ -74,8 +75,12 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         preference, fact, trait (personality), task (something to do — set attributes.status "pending"), \
         plan (an intention — set attributes.horizon "short" or "long"), or another short lowercase kind if \
         none fit. Put context in `detail`. Never invent; only what the user actually stated.
-        For appointments/meetings/trips (things with a time), also fill attributes.start and attributes.end as Unix epoch seconds (UTC) for the resolved date+time; assume 1 hour duration if only a start time is given. If the event has a place (venue, address, city), fill attributes.location with a short place name only (not prose).
-        Schema: {"entities":[{"entity":"...","kind":"...","detail":"...","permanent":false,"attributes":{"status":"pending|done","horizon":"short|long","date":"yyyy-MM-dd","start":0,"end":0,"location":"..."}}]}
+        For appointments/meetings/trips (things with a time), put the LOCAL calendar date in attributes.date \
+        ("yyyy-MM-dd"), the local start time in attributes.startTime ("HH:mm", 24-hour), and the end time in \
+        attributes.endTime ("HH:mm"). If only a start is given, omit endTime (1 hour is assumed). Set \
+        attributes.allDay true for all-day/multi-day events. NEVER output epoch numbers. If the event has a \
+        place (venue, address, city), fill attributes.location with a short place name only (not prose).
+        Schema: {"entities":[{"entity":"...","kind":"...","detail":"...","permanent":false,"attributes":{"status":"pending|done","horizon":"short|long","date":"yyyy-MM-dd","startTime":"HH:mm","endTime":"HH:mm","allDay":false,"location":"..."}}]}
         Conversation:
         \(convo)
         JSON:
@@ -83,14 +88,21 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         guard let out = parse(await generate(prompt, maxTokens: 512), EntitiesOut.self) else { return }
         var added = 0
         for e in out.entities {
-            // Structured event: a timed entity with epoch start/end → first-class `event`.
-            if let st = e.attributes?.start, let en = e.attributes?.end, en > st {
+            // Structured event: a timed entity with a local date+time → first-class `event`, conflict-checked.
+            if let date = e.attributes?.date, let startTime = e.attributes?.startTime,
+               let st = ScheduleTime.epoch(date: date, time: startTime, tz: currentTimeZone) {
+                let en = e.attributes?.endTime.flatMap { ScheduleTime.epoch(date: date, time: $0, tz: currentTimeZone) } ?? (st + 3600)
                 let evLabel = MemoryText.canonicalEntityLabel(e.entity)
-                if !MemoryText.isJunkLabel(evLabel) {
-                    if let evId = try? store.upsertEvent(title: evLabel, start: st, end: en,
-                                                         allDay: false, location: e.attributes?.location, origin: .extracted) {
-                        if let emb = (try? embedder?.embed(evLabel)) ?? nil { try? store.setEmbedding(nodeId: evId, emb) }
-                        added += 1
+                if !MemoryText.isJunkLabel(evLabel), en > st {
+                    let allDay = e.attributes?.allDay ?? false
+                    if let result = try? store.createEventChecked(title: evLabel, start: st, end: en, allDay: allDay,
+                                                                  location: e.attributes?.location, origin: .extracted, force: false) {
+                        if let evId = result.id {
+                            if let emb = (try? embedder?.embed(evLabel)) ?? nil { try? store.setEmbedding(nodeId: evId, emb) }
+                            added += 1
+                        } else {
+                            emitConflictClarification(title: evLabel, date: date, time: startTime, conflicts: result.conflicts)
+                        }
                     }
                 }
                 continue
@@ -381,6 +393,30 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             try? store.upsert(node); added += 1
         }
         if added > 0 { onProgress?("+\(added) question\(added == 1 ? "" : "s")") }
+    }
+
+    /// A consolidated event collides with an existing one → don't create it; ask the user (reuses the
+    /// existing clarification surfacing). Dedups against existing clarification bodies.
+    private func emitConflictClarification(title: String, date: String, time: String, conflicts: [Node]) {
+        let others = conflicts.map { $0.label }.joined(separator: ", ")
+        let body = "Mencionaste «\(title)» el \(date) a las \(time), pero choca con \(others). ¿Lo agendo igual, lo reprogramo, o cancelo el otro?"
+        let existing = Set(((try? store.allNodes()) ?? [])
+            .filter { $0.kind == NodeKind.clarification.rawValue }.map { MemoryText.dedupKey($0.body) })
+        if existing.contains(MemoryText.dedupKey(body)) { return }
+        var attrs = NodeAttributes(); attrs.status = "pending"
+        let t = now(); let id = UUID().uuidString
+        let node = Node(id: id, kind: NodeKind.clarification.rawValue, label: String(body.prefix(60)),
+                        body: body, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 4,
+                        decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
+                        ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true,
+                        deleted: false, extra: attrs.toJSON())
+        try? store.upsert(node)
+        for c in conflicts {
+            try? store.upsert(Edge(id: UUID().uuidString, srcId: id, dstId: c.id, relation: .clarifies,
+                                   weight: 1, confidence: .probable, createdAt: t, updatedAt: t,
+                                   dirty: true, deleted: false, extra: nil))
+        }
+        onProgress?("+1 conflict question")
     }
 
     // MARK: Curate — fold synonym kinds into a canonical vocabulary
