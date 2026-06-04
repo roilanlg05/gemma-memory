@@ -130,4 +130,24 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertEqual(try s.scheduleConflicts(start: 1000, end: 4600).count, 0,
                        "a cancelled event must stay cancelled after re-upsert")
     }
+
+    func testScheduleTimeEpochLocalExact() {
+        let ny = TimeZone(identifier: "America/New_York")!
+        // 2026-06-09 06:00 local → exact, minute-aligned (no 06:13:20 UTC drift)
+        let e = ScheduleTime.epoch(date: "2026-06-09", time: "06:00", tz: ny)!
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = ny
+        let comps = cal.dateComponents([.hour, .minute, .second], from: Date(timeIntervalSince1970: e))
+        XCTAssertEqual(comps.hour, 6); XCTAssertEqual(comps.minute, 0); XCTAssertEqual(comps.second, 0)
+    }
+
+    func testScheduleTimeDateOnlyIsMidnight() {
+        let ny = TimeZone(identifier: "America/New_York")!
+        let e = ScheduleTime.epoch(date: "2026-06-09", time: nil, tz: ny)!
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = ny
+        XCTAssertEqual(cal.dateComponents([.hour], from: Date(timeIntervalSince1970: e)).hour, 0)
+    }
+
+    func testScheduleTimeBadInputIsNil() {
+        XCTAssertNil(ScheduleTime.epoch(date: "not-a-date", time: "06:00", tz: .current))
+    }
 }
