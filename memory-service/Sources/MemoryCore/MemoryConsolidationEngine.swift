@@ -471,6 +471,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             return tag
         }
         var tagged = 0
+        var taggedIds = Set<String>()
         for cluster in clusters {
             let memberIds = ((try? store.edges(from: cluster.id)) ?? []).filter { $0.relation == .belongsToCluster }.map { $0.dstId }
             let members = memberIds.compactMap { try? store.node(id: $0) }
@@ -485,9 +486,14 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             guard let out = parse(await generate(prompt, maxTokens: 128), TagsOut.self) else { continue }
             let tags = Array(out.tags.compactMap(canonical).prefix(3))
             guard !tags.isEmpty else { continue }
-            for m in members { try? store.setTags(nodeId: m.id, tags) }
+            for m in members { try? store.setTags(nodeId: m.id, tags); taggedIds.insert(m.id) }
             if var c = try? store.node(id: cluster.id) { c.label = tags[0]; c.updatedAt = now(); c.dirty = true; try? store.upsert(c) }
             tagged += 1
+        }
+        // Tags reflect CURRENT clustering: clear stale tags from clusterable nodes that dropped out
+        // of every cluster this cycle (so a node's tags never outlive its cluster membership).
+        for n in ((try? store.allNodes()) ?? []) where Self.clusterableKinds.contains(n.kind) && !taggedIds.contains(n.id) {
+            if !((try? store.tagsFor(nodeId: n.id)) ?? []).isEmpty { try? store.setTags(nodeId: n.id, []) }
         }
         onProgress?("tagged \(tagged)/\(clusters.count) clusters")
     }

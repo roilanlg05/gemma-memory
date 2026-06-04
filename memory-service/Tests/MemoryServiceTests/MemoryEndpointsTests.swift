@@ -131,6 +131,37 @@ final class MemoryEndpointsTests: XCTestCase {
         }
     }
 
+    func test_recall_attaches_tags_and_filters_by_tag() async throws {
+        let (app, services) = try await makeAppWithServices()
+        func seed(_ id: String, _ label: String, tags: [String]) throws {
+            let n = Node(id: id, kind: NodeKind.preference.rawValue, label: label, body: label, layer: .daily,
+                         createdAt: 1, updatedAt: 1, lastSeenAt: 1, salience: 5, decayRate: 0, confidence: .probable,
+                         mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
+                         dirty: true, deleted: false, extra: nil)
+            try services.store.upsert(n)
+            try services.store.setEmbedding(nodeId: id, services.embedder.embed(label))
+            try services.store.setTags(nodeId: id, tags)
+        }
+        try seed("n1", "opciones", tags: ["trading"])
+        try seed("n2", "yoga", tags: ["salud"])
+        struct Out: Decodable {
+            struct N: Decodable { let label: String; let tags: [String] }
+            let recall: [N]
+        }
+        try await app.test(.live) { client in
+            try await client.execute(uri: "/v1/memory/recall", method: .post,
+                headers: [.authorization: "Bearer test-token", .contentType: "application/json"],
+                body: ByteBuffer(string: #"{"query":"opciones","tag":"trading"}"#)) { res in
+                XCTAssertEqual(res.status, .ok)
+                let out = try JSONDecoder().decode(Out.self, from: Data(buffer: res.body))
+                XCTAssertTrue(out.recall.contains { $0.label == "opciones" && $0.tags == ["trading"] },
+                              "recall must contain opciones with [trading]")
+                XCTAssertFalse(out.recall.contains { $0.label == "yoga" },
+                               "yoga must be filtered out by tag=trading")
+            }
+        }
+    }
+
     func test_expand_returns_transcript_for_known_summary() async throws {
         let app = try await makeApp()
         try await app.test(.live) { client in

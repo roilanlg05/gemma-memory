@@ -445,6 +445,26 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(try store.node(id: "clusterA")?.label, "trading")      // anchor renamed to primary tag
     }
 
+    func test_tagClusters_clears_stale_tags_on_cluster_dropout() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 64)
+        func mk(_ id: String, _ kind: String) -> Node {
+            Node(id: id, kind: kind, label: id, body: id, layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1,
+                 salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                 origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        try store.upsert(mk("m1", NodeKind.preference.rawValue))
+        try store.upsert(mk("dropout", NodeKind.preference.rawValue))
+        try store.setTags(nodeId: "dropout", ["old"])                        // previously tagged, now in no cluster
+        var anchor = mk("clusterA", NodeKind.cluster.rawValue); anchor.label = "cluster"; try store.upsert(anchor)
+        try store.upsert(Edge(id: UUID().uuidString, srcId: "clusterA", dstId: "m1", relation: .belongsToCluster,
+                              weight: 1, confidence: .probable, createdAt: 1, updatedAt: 1, dirty: true, deleted: false, extra: nil))
+        let engine = MemoryConsolidationEngine(store: store, embedder: SynonymStubEmbedder(near: [:], dim: 64),
+                                               runtime: CannedRuntime([#"{"tags":["salud"]}"#]))
+        await engine.tagClusters()
+        XCTAssertEqual(try store.tagsFor(nodeId: "m1"), ["salud"])            // current member tagged
+        XCTAssertEqual(try store.tagsFor(nodeId: "dropout"), [])              // stale tag cleared (no longer clustered)
+    }
+
     // MARK: Phase order
 
     func test_runCycle_order_is_machine_native() {
