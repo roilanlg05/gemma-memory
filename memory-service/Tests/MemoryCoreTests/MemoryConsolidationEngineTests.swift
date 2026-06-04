@@ -356,6 +356,25 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(familyEdges.first?.dstId, "m1")
     }
 
+    func test_embedMissing_embeds_only_unembedded_clusterable_nodes() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        func mk(_ id: String, _ kind: String) -> Node {
+            Node(id: id, kind: kind, label: id, body: id, layer: .daily, createdAt: 1, updatedAt: 1,
+                 lastSeenAt: 1, salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1,
+                 ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        try store.upsert(mk("p1", NodeKind.preference.rawValue))   // clusterable, no embedding
+        try store.upsert(mk("e1", NodeKind.event.rawValue))        // NOT clusterable → skipped
+        XCTAssertTrue(try store.allEmbeddings().isEmpty)
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: CannedRuntime([]))
+        await engine.embedMissing()
+        let embedded = Set(try store.allEmbeddings().map { $0.id })
+        XCTAssertEqual(embedded, ["p1"])                            // only the clusterable, un-embedded node
+        // idempotent: a second run embeds nothing new
+        await engine.embedMissing()
+        XCTAssertEqual(try store.allEmbeddings().count, 1)
+    }
+
     func test_clarify_emits_clarification_node_when_unsure() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 8)
         let ts = TranscriptStore(dbQueue: store.dbQueue)

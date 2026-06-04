@@ -381,6 +381,31 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         if n > 0 { onProgress?("-\(n) duplicate insight\(n == 1 ? "" : "s")") }
     }
 
+    // MARK: Embeddings stage — ensure every clusterable node has a vector
+
+    /// Clusterable node kinds (durable atomic memories + summaries). Excludes self, hubs, events,
+    /// conversation, insight, cluster, follow_up, clarification, day, episode, task.
+    private static let clusterableKinds: Set<String> = [
+        NodeKind.person.rawValue, NodeKind.place.rawValue, NodeKind.fact.rawValue,
+        NodeKind.preference.rawValue, NodeKind.topic.rawValue, NodeKind.trait.rawValue,
+        NodeKind.plan.rawValue, NodeKind.summary.rawValue,
+    ]
+
+    /// Idempotent: embed every clusterable node that lacks a vector. The substrate for clustering.
+    public func embedMissing() async {
+        guard let embedder else { return }
+        let embedded = Set(((try? store.allEmbeddings()) ?? []).map { $0.id })
+        let nodes = ((try? store.allNodes()) ?? []).filter {
+            Self.clusterableKinds.contains($0.kind) && !embedded.contains($0.id)
+        }
+        var done = 0
+        for n in nodes {
+            let text = n.body.isEmpty ? n.label : n.label + " " + n.body
+            if let v = try? embedder.embed(text), (try? store.setEmbedding(nodeId: n.id, v)) != nil { done += 1 }
+        }
+        if done > 0 { onProgress?("+\(done) embeddings") }
+    }
+
     // MARK: Clarify — ask the user when consolidation is genuinely unsure about event identity
     private struct ClarifyOut: Decodable { let questions: [String] }
 
@@ -486,7 +511,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             state = SleepCycleState(phase: .nrem, episodeIds: batch, startedAt: now(), focus: focus)
             try? store.saveSleepCycle(state)
         }
-        let order: [SleepPhase] = [.nrem, .summarize, .detect, .rem, .reflect, .compress, .clarify, .curate, .shy]
+        let order: [SleepPhase] = [.nrem, .summarize, .detect, .embeddings, .rem, .reflect, .compress, .clarify, .curate, .shy]
         guard let startIdx = order.firstIndex(of: state.phase) else { return }
         for phase in order[startIdx...] {
             if isCancelled() { return }   // leave persisted phase for resume
@@ -515,6 +540,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 }
             case .detect:
                 await detectFollowUps(episodeTexts: episodeTexts(ids: state.episodeIds))
+            case .embeddings: await embedMissing()
             case .rem: await associate()
             case .reflect: await reflect()
             case .compress: await compress()
