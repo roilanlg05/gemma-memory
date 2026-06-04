@@ -356,6 +356,12 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         onProgress?("+\(added) insights")
     }
 
+    // MARK: Compress — merge near-duplicate insights into one canonical node
+    public func compress() async {
+        let n = (try? store.compressInsights(embedder: embedder)) ?? 0
+        if n > 0 { onProgress?("-\(n) duplicate insight\(n == 1 ? "" : "s")") }
+    }
+
     // MARK: Clarify — ask the user when consolidation is genuinely unsure about event identity
     private struct ClarifyOut: Decodable { let questions: [String] }
 
@@ -461,7 +467,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             state = SleepCycleState(phase: .nrem, episodeIds: batch, startedAt: now(), focus: focus)
             try? store.saveSleepCycle(state)
         }
-        let order: [SleepPhase] = [.nrem, .summarize, .detect, .rem, .reflect, .clarify, .curate, .shy]
+        let order: [SleepPhase] = [.nrem, .summarize, .detect, .rem, .reflect, .compress, .clarify, .curate, .shy]
         guard let startIdx = order.firstIndex(of: state.phase) else { return }
         for phase in order[startIdx...] {
             if isCancelled() { return }   // leave persisted phase for resume
@@ -499,6 +505,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 await detectFollowUps(episodeTexts: episodeTexts(ids: state.episodeIds))
             case .rem: await associate()
             case .reflect: await reflect()
+            case .compress: await compress()
             case .clarify: await clarify()
             case .curate: await curateKinds()
             case .shy: await forget()

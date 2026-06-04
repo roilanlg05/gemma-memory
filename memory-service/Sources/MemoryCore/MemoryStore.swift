@@ -1,7 +1,7 @@
 import Foundation
 import GRDB
 
-public enum SleepPhase: String, Codable, CaseIterable, Sendable { case nrem, summarize, detect, rem, reflect, clarify, curate, shy }
+public enum SleepPhase: String, Codable, CaseIterable, Sendable { case nrem, summarize, detect, rem, reflect, compress, clarify, curate, shy }
 public struct SleepCycleState: Equatable, Sendable {
     public var phase: SleepPhase
     public var episodeIds: [String]
