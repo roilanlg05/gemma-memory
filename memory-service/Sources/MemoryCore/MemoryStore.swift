@@ -203,10 +203,18 @@ public final class MemoryStore: @unchecked Sendable {
     /// Always-relevant "identity core": who the user is and their permanent identity-layer
     /// facts, regardless of the current query. Identity-ONLY (no top-salience union) so the
     /// injected core stays small — query-relevant nodes (from MemoryRetriever) carry the rest.
+    /// The singleton self:user node (kind == "self") is always returned first when present.
     public func coreMemories(limit: Int = 6) throws -> [Node] {
         try dbQueue.read { db in
-            try Node.filter(Column("layer") == MemoryLayer.identity.rawValue && Column("deleted") == false)
-                .order(Column("salience").desc).limit(limit).fetchAll(db)
+            let selfN = try Node.fetchOne(db, key: selfUserID).flatMap { $0.deleted ? nil : $0 }
+            let cap = selfN != nil ? max(0, limit - 1) : limit
+            let others = try Node
+                .filter(Column("layer") == MemoryLayer.identity.rawValue
+                        && Column("deleted") == false
+                        && Column("kind") != HubKind.hub.rawValue
+                        && Column("id") != selfUserID)
+                .order(Column("salience").desc).limit(cap).fetchAll(db)
+            return selfN.map { [$0] + others } ?? others
         }
     }
     public func edges(from id: String) throws -> [Edge] {

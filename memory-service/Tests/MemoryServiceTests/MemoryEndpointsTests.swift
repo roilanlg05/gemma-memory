@@ -86,6 +86,21 @@ final class MemoryEndpointsTests: XCTestCase {
         }
     }
 
+    func test_save_self_kind_routes_to_singleton() async throws {
+        let (app, services) = try await makeAppWithServices()
+        try await app.test(.live) { client in
+            try await client.execute(uri: "/v1/memory/save", method: .post,
+                                     headers: [.authorization: "Bearer test-token", .contentType: "application/json"],
+                                     body: ByteBuffer(string: #"{"kind":"self","label":"Roilan","body":"el usuario"}"#)) { res in
+                XCTAssertEqual(res.status, .ok)
+            }
+        }
+        XCTAssertEqual(try services.store.selfNode()?.label, "Roilan")
+        XCTAssertEqual(try services.store.selfNode()?.kind, NodeKind.selfUser.rawValue)
+        let selves = try services.store.allNodes().filter { $0.kind == NodeKind.selfUser.rawValue }
+        XCTAssertEqual(selves.count, 1)   // singleton — no generic duplicate
+    }
+
     func test_expand_returns_transcript_for_known_summary() async throws {
         let app = try await makeApp()
         try await app.test(.live) { client in

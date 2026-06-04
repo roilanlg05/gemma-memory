@@ -38,6 +38,20 @@ struct MemoryHandlers {
             return jsonError(.badRequest, "bad_request", "invalid save body")
         }
 
+        // The user's own identity is a singleton — route to the self node, never a generic merge.
+        if body.kind == "self" {
+            let id: String
+            do {
+                id = try services.store.upsertSelf(name: body.label, detail: body.body, embedder: services.embedder)
+            } catch {
+                return jsonError(.internalServerError, "save_failed", "\(error)")
+            }
+            struct SelfOut: Encodable { let id: String; let mergedInto: String? }
+            let data = try JSONEncoder().encode(SelfOut(id: id, mergedInto: nil))
+            return Response(status: .ok, headers: [.contentType: "application/json"],
+                            body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+        }
+
         let now = Date().timeIntervalSince1970
         let layer: MemoryLayer = body.layer.flatMap { MemoryLayer(rawValue: $0) }
             ?? (body.kind == "identity" ? .identity : .daily)

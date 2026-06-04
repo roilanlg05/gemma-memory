@@ -71,7 +71,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         let prompt = """
         Today is \(todayString()). Resolve any relative date (today/tomorrow/a weekday) to an absolute date and put it in attributes.date as "yyyy-MM-dd".
         Extract durable facts the USER stated about themselves from this conversation. Output JSON only.
-        Use a short canonical `entity` (a noun/name, not a sentence). The "entity" MUST be a short canonical noun/name (1-3 words), NEVER a sentence (e.g. "Roilan", not "the user's name is Roilan"). Choose a `kind`: person, place, \
+        Use a short canonical `entity` (a noun/name, not a sentence). The "entity" MUST be a short canonical noun/name (1-3 words), NEVER a sentence (e.g. "Roilan", not "the user's name is Roilan"). Choose a `kind`: self (the USER's OWN name/identity — the person speaking; there is exactly ONE user, never a third party), person (OTHER people the user mentions — put their relationship role in `detail`, e.g. "esposa", "hija", "amigo", "jefe"), place, \
         preference, fact, trait (personality), task (something to do — set attributes.status "pending"), \
         plan (an intention — set attributes.horizon "short" or "long"), or another short lowercase kind if \
         none fit. Put context in `detail`. Never invent; only what the user actually stated.
@@ -104,6 +104,15 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             emitConflictClarification(title: evLabel, date: date, time: startTime, conflicts: result.conflicts)
                         }
                     }
+                }
+                continue
+            }
+            // The user's own identity → the singleton self node (never a generic person/fact).
+            if e.kind == "self" {
+                let selfLabel = MemoryText.canonicalEntityLabel(e.entity)
+                if !MemoryText.isJunkLabel(selfLabel) {
+                    _ = try? store.upsertSelf(name: selfLabel, detail: e.detail, embedder: embedder)
+                    added += 1
                 }
                 continue
             }
@@ -273,9 +282,9 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         let relations = Relation.allCases.map { $0.rawValue }.joined(separator: ", ")
         let prompt = """
         These memory entities are all facts about ONE person (the user). Propose meaningful relationships between them. Output JSON only.
-        The `person` node is usually the user; connect the user to their preferences (likes/dislikes), places they work or go (locatedAt/worksWith), people they know (knows/worksWith/family), and link genuinely related items (relatedTo). Don't invent entities not listed.
+        The `self` node is the USER (the person you're talking to); connect the user (self) to their preferences (likes/dislikes), places they work or go (locatedAt/worksWith), and the people they know (knows/worksWith/family). Other `person` nodes are third parties — link each to the self with the right relation (family for relatives, knows for friends, worksWith for colleagues). Link genuinely related items with relatedTo. Don't invent entities not listed.
         Use ONLY these relation types: \(relations).
-        Example: entities `person: Ana`, `preference: pizza`, `place: office` → {"edges":[{"from":"Ana","relation":"likes","to":"pizza"},{"from":"Ana","relation":"locatedAt","to":"office"}]}
+        Example: entities `self: Ana`, `preference: pizza`, `person: María` → {"edges":[{"from":"Ana","relation":"likes","to":"pizza"},{"from":"Ana","relation":"family","to":"María"}]}
         Schema: {"edges":[{"from":"<entity label>","relation":"<one of the types>","to":"<entity label>"}]}
         Entities:
         \(labels)

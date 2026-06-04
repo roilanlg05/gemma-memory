@@ -138,6 +138,35 @@ extension MemoryStore {
         return try embedder?.embed(label)
     }
 
+    /// Upsert the singleton self/user identity node (fixed id "self:user"). Always exactly one.
+    /// Subsequent calls reinforce the existing node; the id never changes.
+    @discardableResult
+    public func upsertSelf(name: String, detail: String? = nil, embedder: Embedder? = nil,
+                           now: Double = Date().timeIntervalSince1970) throws -> String {
+        let id = selfUserID
+        let label = MemoryText.canonicalEntityLabel(name)
+        if var existing = try node(id: id) {
+            if !label.isEmpty { existing.label = label }
+            if let detail, !detail.isEmpty { existing.body = detail }
+            existing.updatedAt = now; existing.lastSeenAt = now; existing.deleted = false; existing.dirty = true
+            existing.mentionCount += 1   // reinforce like every other "seen again" path
+            try upsert(existing)
+        } else {
+            let newNode = Node(id: id, kind: NodeKind.selfUser.rawValue, label: label,
+                               body: detail ?? "", layer: .identity, createdAt: now,
+                               updatedAt: now, lastSeenAt: now, salience: 10, decayRate: 0,
+                               confidence: .sure, mentionCount: 1, ttlExpiresAt: nil,
+                               sourceRef: nil, origin: .explicit, serverId: nil,
+                               dirty: true, deleted: false, extra: nil)
+            try upsert(newNode)
+        }
+        if let embedder, let emb = try? embedder.embed(label) { try? setEmbedding(nodeId: id, emb) }
+        return id
+    }
+
+    /// Returns the singleton self/user identity node, or nil if not yet created.
+    public func selfNode() throws -> Node? { try node(id: selfUserID) }
+
     /// Forgetting sweep: soft-delete nodes whose effective salience fell below the floor
     /// or whose TTL expired (identity is never forgotten).
     public func sweep(now: Double = Date().timeIntervalSince1970) throws {

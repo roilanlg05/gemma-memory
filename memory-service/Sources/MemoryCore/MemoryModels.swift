@@ -1,7 +1,10 @@
 import Foundation
 import GRDB
 
-public enum NodeKind: String, Codable, CaseIterable, Sendable { case person, place, fact, preference, topic, trait, task, plan, event, summary, insight, day, episode, conversation, followUp = "follow_up", clarification }
+/// Fixed id of the singleton self/user identity node.
+public let selfUserID = "self:user"
+
+public enum NodeKind: String, Codable, CaseIterable, Sendable { case person, place, fact, preference, topic, trait, task, plan, event, summary, insight, day, episode, conversation, followUp = "follow_up", clarification, selfUser = "self" }
 public enum MemoryLayer: String, Codable, CaseIterable, Sendable { case live, daily, identity, episodic } // episodic reservado (S11)
 public enum Confidence: String, Codable, CaseIterable, Sendable { case sure, probable, maybe }
 public enum Origin: String, Codable, CaseIterable, Sendable { case explicit, extracted }
@@ -42,6 +45,7 @@ public extension NodeKind {
         case .conversation: return "Conversations"
         case .followUp: return "Follow-ups"
         case .clarification: return "Clarifications"
+        case .selfUser: return "Self"
         }
     }
 }
