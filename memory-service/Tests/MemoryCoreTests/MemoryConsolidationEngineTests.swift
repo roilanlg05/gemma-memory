@@ -356,6 +356,25 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(familyEdges.first?.dstId, "m1")
     }
 
+    func test_embedMissing_embeds_only_unembedded_clusterable_nodes() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        func mk(_ id: String, _ kind: String) -> Node {
+            Node(id: id, kind: kind, label: id, body: id, layer: .daily, createdAt: 1, updatedAt: 1,
+                 lastSeenAt: 1, salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1,
+                 ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        try store.upsert(mk("p1", NodeKind.preference.rawValue))   // clusterable, no embedding
+        try store.upsert(mk("e1", NodeKind.event.rawValue))        // NOT clusterable → skipped
+        XCTAssertTrue(try store.allEmbeddings().isEmpty)
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: CannedRuntime([]))
+        await engine.embedMissing()
+        let embedded = Set(try store.allEmbeddings().map { $0.id })
+        XCTAssertEqual(embedded, ["p1"])                            // only the clusterable, un-embedded node
+        // idempotent: a second run embeds nothing new
+        await engine.embedMissing()
+        XCTAssertEqual(try store.allEmbeddings().count, 1)
+    }
+
     func test_clarify_emits_clarification_node_when_unsure() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 8)
         let ts = TranscriptStore(dbQueue: store.dbQueue)
@@ -374,5 +393,109 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         let q = try XCTUnwrap(try store.allNodes().first { $0.kind == NodeKind.clarification.rawValue })
         XCTAssertTrue(q.body.contains("Carlos"))
         XCTAssertEqual(NodeAttributes.from(q.extra).status, "pending")
+    }
+
+    func test_cluster_builds_anchors_and_belongsTo_edges() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let seeds: [(String, [Float])] = [
+            ("a", [1, 0, 0, 0]), ("b", [0.98, 0.02, 0, 0]), ("c", [0.97, 0.03, 0, 0]),
+            ("x", [0, 0, 1, 0]), ("y", [0, 0, 0.98, 0.02]), ("z", [0, 0, 0.97, 0.03]),
+        ]
+        for (id, vec) in seeds {
+            let n = Node(id: id, kind: NodeKind.preference.rawValue, label: id, body: id, layer: .daily,
+                         createdAt: 1, updatedAt: 1, lastSeenAt: 1, salience: 3, decayRate: 0,
+                         confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                         origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+            try store.upsert(n); try store.setEmbedding(nodeId: id, vec)
+        }
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: CannedRuntime([]))
+        await engine.cluster()
+        let clusters = try store.clusterNodes()            // allNodes() excludes cluster kind — use clusterNodes()
+        XCTAssertEqual(clusters.count, 2)
+        for c in clusters {
+            let members = (try store.edges(from: c.id)).filter { $0.relation == .belongsToCluster }
+            XCTAssertEqual(members.count, 3)
+        }
+        // re-running rebuilds globally (still 2, no duplicate anchors)
+        await engine.cluster()
+        XCTAssertEqual(try store.clusterNodes().count, 2)
+    }
+
+    func test_tagClusters_writes_tags_to_members_and_collapses_synonyms() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 64)
+        func mk(_ id: String, _ kind: String) -> Node {
+            Node(id: id, kind: kind, label: id, body: id, layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1,
+                 salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                 origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        try store.upsert(mk("m1", NodeKind.preference.rawValue))
+        try store.upsert(mk("m2", NodeKind.preference.rawValue))
+        try store.setTags(nodeId: "old", ["trading"])                       // seed the vocabulary
+        var anchor = mk("clusterA", NodeKind.cluster.rawValue); anchor.label = "cluster"; try store.upsert(anchor)
+        for m in ["m1", "m2"] {
+            try store.upsert(Edge(id: UUID().uuidString, srcId: "clusterA", dstId: m, relation: .belongsToCluster,
+                                  weight: 1, confidence: .probable, createdAt: 1, updatedAt: 1, dirty: true, deleted: false, extra: nil))
+        }
+        let stub = SynonymStubEmbedder(near: ["inversión": "trading"], dim: 64)   // "inversión" embeds == "trading"
+        let json = #"{"tags":["inversión"]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: stub, runtime: CannedRuntime([json]))
+        await engine.tagClusters()
+        XCTAssertEqual(try store.tagsFor(nodeId: "m1"), ["trading"])          // synonym collapsed
+        XCTAssertEqual(try store.tagsFor(nodeId: "m2"), ["trading"])
+        XCTAssertEqual(try store.node(id: "clusterA")?.label, "trading")      // anchor renamed to primary tag
+    }
+
+    func test_tagClusters_clears_stale_tags_on_cluster_dropout() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 64)
+        func mk(_ id: String, _ kind: String) -> Node {
+            Node(id: id, kind: kind, label: id, body: id, layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1,
+                 salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                 origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        try store.upsert(mk("m1", NodeKind.preference.rawValue))
+        try store.upsert(mk("dropout", NodeKind.preference.rawValue))
+        try store.setTags(nodeId: "dropout", ["old"])                        // previously tagged, now in no cluster
+        var anchor = mk("clusterA", NodeKind.cluster.rawValue); anchor.label = "cluster"; try store.upsert(anchor)
+        try store.upsert(Edge(id: UUID().uuidString, srcId: "clusterA", dstId: "m1", relation: .belongsToCluster,
+                              weight: 1, confidence: .probable, createdAt: 1, updatedAt: 1, dirty: true, deleted: false, extra: nil))
+        let engine = MemoryConsolidationEngine(store: store, embedder: SynonymStubEmbedder(near: [:], dim: 64),
+                                               runtime: CannedRuntime([#"{"tags":["salud"]}"#]))
+        await engine.tagClusters()
+        XCTAssertEqual(try store.tagsFor(nodeId: "m1"), ["salud"])            // current member tagged
+        XCTAssertEqual(try store.tagsFor(nodeId: "dropout"), [])              // stale tag cleared (no longer clustered)
+    }
+
+    // MARK: Phase order
+
+    func test_runCycle_order_is_machine_native() {
+        XCTAssertEqual(MemoryConsolidationEngine.cycleOrder,
+                       [.nrem, .summarize, .detect, .embeddings, .cluster, .tag,
+                        .reflect, .compress, .curate, .rem, .clarify, .shy])
+    }
+}
+
+/// Test embedder: strings in `near` map to the SAME vector as their target (cosine distance 0 →
+/// collapse). Other strings get a deterministic collision-free one-hot vector via a counter.
+final class SynonymStubEmbedder: Embedder, @unchecked Sendable {
+    let near: [String: String]
+    let dim: Int
+    private var registry: [String: Int] = [:]
+    private var nextSlot: Int = 0
+    init(near: [String: String], dim: Int) { self.near = near; self.dim = dim }
+    public var dimension: Int { dim }
+    func embed(_ text: String) throws -> [Float] {
+        let key = near[text] ?? text
+        // Assign a unique slot to each unique key (first time seen)
+        let slot: Int
+        if let existing = registry[key] {
+            slot = existing
+        } else {
+            slot = nextSlot % dim
+            registry[key] = slot
+            nextSlot += 1
+        }
+        var v = [Float](repeating: 0, count: dim)
+        v[slot] = 1
+        return v
     }
 }

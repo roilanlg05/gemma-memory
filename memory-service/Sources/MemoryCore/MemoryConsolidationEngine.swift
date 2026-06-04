@@ -50,6 +50,13 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         return try? JSONDecoder().decode(T.self, from: d)
     }
 
+    /// Machine-native consolidation phase order (SP-B): embed → cluster → tag → reflect/compress/
+    /// curate (hygiene) → graph-linking LAST (on clean, clustered, deduped nodes) → clarify → forget.
+    static let cycleOrder: [SleepPhase] = [
+        .nrem, .summarize, .detect, .embeddings, .cluster, .tag,
+        .reflect, .compress, .curate, .rem, .clarify, .shy,
+    ]
+
     // MARK: NREM — Consolidate
 
     private func todayString() -> String {
@@ -381,6 +388,116 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         if n > 0 { onProgress?("-\(n) duplicate insight\(n == 1 ? "" : "s")") }
     }
 
+    // MARK: Embeddings stage — ensure every clusterable node has a vector
+
+    /// Clusterable node kinds (durable atomic memories + summaries). Excludes self, hubs, events,
+    /// conversation, insight, cluster, follow_up, clarification, day, episode, task.
+    private static let clusterableKinds: Set<String> = [
+        NodeKind.person.rawValue, NodeKind.place.rawValue, NodeKind.fact.rawValue,
+        NodeKind.preference.rawValue, NodeKind.topic.rawValue, NodeKind.trait.rawValue,
+        NodeKind.plan.rawValue, NodeKind.summary.rawValue,
+    ]
+
+    /// Idempotent: embed every clusterable node that lacks a vector. The substrate for clustering.
+    public func embedMissing() async {
+        guard let embedder else { return }
+        let embedded = Set(((try? store.allEmbeddings()) ?? []).map { $0.id })
+        let nodes = ((try? store.allNodes()) ?? []).filter {
+            Self.clusterableKinds.contains($0.kind) && !embedded.contains($0.id)
+        }
+        var done = 0
+        for n in nodes {
+            let text = n.body.isEmpty ? n.label : n.label + " " + n.body
+            if let v = try? embedder.embed(text), (try? store.setEmbedding(nodeId: n.id, v)) != nil { done += 1 }
+        }
+        if done > 0 { onProgress?("+\(done) embeddings") }
+    }
+
+    // MARK: Clustering stage — k-NN communities → ephemeral cluster anchors + belongsToCluster edges
+
+    /// Recompute clusters globally: build a k-NN graph over clusterable embeddings, run
+    /// label-propagation, and rebuild ephemeral `cluster` anchors + `belongsToCluster` edges.
+    public func cluster() async {
+        let nodes = (try? store.allNodes()) ?? []
+        let clusterableIds = Set(nodes.filter { Self.clusterableKinds.contains($0.kind) }.map { $0.id })
+        let embs = ((try? store.allEmbeddings()) ?? []).filter { clusterableIds.contains($0.id) }
+        try? store.clearClusters()
+        guard embs.count >= 2 else { return }
+        let adj = Clustering.knnGraph(embs.map { (id: $0.id, vec: $0.vec) }, k: 8, maxDistance: 0.25)
+        let communities = Clustering.labelPropagation(adj, minSize: 2)
+        let t = now()
+        var made = 0
+        for community in communities {
+            let anchorId = UUID().uuidString
+            let anchor = Node(id: anchorId, kind: NodeKind.cluster.rawValue, label: "cluster", body: "",
+                              layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t,
+                              salience: Double(community.count), decayRate: 0, confidence: .probable,
+                              mentionCount: community.count, ttlExpiresAt: nil, sourceRef: nil,
+                              origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+            try? store.upsert(anchor)
+            for memberId in community {
+                try? store.upsert(Edge(id: UUID().uuidString, srcId: anchorId, dstId: memberId,
+                                       relation: .belongsToCluster, weight: 1, confidence: .probable,
+                                       createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+            }
+            made += 1
+        }
+        onProgress?("+\(made) clusters")
+    }
+
+    // MARK: Tagging stage — cluster→tag with embedding synonym-collapse
+
+    private struct TagsOut: Decodable { let tags: [String] }
+
+    /// Label each cluster with 1-3 canonical thematic tags (cluster→tag) and write them onto the
+    /// member nodes. A new tag is collapsed onto an existing near-synonym (embedding ≤ 0.15) so the
+    /// vocabulary stays clean without an LLM curation pass.
+    public func tagClusters() async {
+        let clusters = (try? store.clusterNodes()) ?? []
+        guard !clusters.isEmpty else { return }
+        var vocab: [(tag: String, vec: [Float])] = []
+        for tag in (try? store.distinctTags()) ?? [] {
+            if let v = (try? embedder?.embed(tag)) ?? nil { vocab.append((tag, v)) }
+        }
+        func canonical(_ raw: String) -> String? {
+            let tag = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !tag.isEmpty else { return nil }
+            if let existing = vocab.first(where: { $0.tag == tag }) { return existing.tag }   // exact reuse
+            if let v = (try? embedder?.embed(tag)) ?? nil {
+                if let hit = vocab.min(by: { MemoryStore.cosineDistance($0.vec, v) < MemoryStore.cosineDistance($1.vec, v) }),
+                   MemoryStore.cosineDistance(hit.vec, v) <= 0.15 { return hit.tag }           // synonym collapse
+                vocab.append((tag, v))                                                         // new canonical
+            }
+            return tag
+        }
+        var tagged = 0
+        var taggedIds = Set<String>()
+        for cluster in clusters {
+            let memberIds = ((try? store.edges(from: cluster.id)) ?? []).filter { $0.relation == .belongsToCluster }.map { $0.dstId }
+            let members = memberIds.compactMap { try? store.node(id: $0) }
+            guard !members.isEmpty else { continue }
+            let labels = members.map { $0.label }.joined(separator: ", ")
+            let prompt = """
+            These memories form ONE thematic group about the user: \(labels).
+            Give 1-3 short canonical lowercase thematic tags (a single word or two-word phrase each). Output JSON only.
+            Schema: {"tags":["..."]}
+            JSON:
+            """
+            guard let out = parse(await generate(prompt, maxTokens: 128), TagsOut.self) else { continue }
+            let tags = Array(out.tags.compactMap(canonical).prefix(3))
+            guard !tags.isEmpty else { continue }
+            for m in members { try? store.setTags(nodeId: m.id, tags); taggedIds.insert(m.id) }
+            if var c = try? store.node(id: cluster.id) { c.label = tags[0]; c.updatedAt = now(); c.dirty = true; try? store.upsert(c) }
+            tagged += 1
+        }
+        // Tags reflect CURRENT clustering: clear stale tags from clusterable nodes that dropped out
+        // of every cluster this cycle (so a node's tags never outlive its cluster membership).
+        for n in ((try? store.allNodes()) ?? []) where Self.clusterableKinds.contains(n.kind) && !taggedIds.contains(n.id) {
+            if !((try? store.tagsFor(nodeId: n.id)) ?? []).isEmpty { try? store.setTags(nodeId: n.id, []) }
+        }
+        onProgress?("tagged \(tagged)/\(clusters.count) clusters")
+    }
+
     // MARK: Clarify — ask the user when consolidation is genuinely unsure about event identity
     private struct ClarifyOut: Decodable { let questions: [String] }
 
@@ -486,7 +603,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             state = SleepCycleState(phase: .nrem, episodeIds: batch, startedAt: now(), focus: focus)
             try? store.saveSleepCycle(state)
         }
-        let order: [SleepPhase] = [.nrem, .summarize, .detect, .rem, .reflect, .compress, .clarify, .curate, .shy]
+        let order = MemoryConsolidationEngine.cycleOrder
         guard let startIdx = order.firstIndex(of: state.phase) else { return }
         for phase in order[startIdx...] {
             if isCancelled() { return }   // leave persisted phase for resume
@@ -515,6 +632,9 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 }
             case .detect:
                 await detectFollowUps(episodeTexts: episodeTexts(ids: state.episodeIds))
+            case .embeddings: await embedMissing()
+            case .cluster: await cluster()
+            case .tag: await tagClusters()
             case .rem: await associate()
             case .reflect: await reflect()
             case .compress: await compress()

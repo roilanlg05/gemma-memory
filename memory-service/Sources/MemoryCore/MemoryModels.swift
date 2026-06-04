@@ -4,7 +4,7 @@ import GRDB
 /// Fixed id of the singleton self/user identity node.
 public let selfUserID = "self:user"
 
-public enum NodeKind: String, Codable, CaseIterable, Sendable { case person, place, fact, preference, topic, trait, task, plan, event, summary, insight, day, episode, conversation, followUp = "follow_up", clarification, selfUser = "self" }
+public enum NodeKind: String, Codable, CaseIterable, Sendable { case person, place, fact, preference, topic, trait, task, plan, event, summary, insight, day, episode, conversation, followUp = "follow_up", clarification, selfUser = "self", cluster }
 public enum MemoryLayer: String, Codable, CaseIterable, Sendable { case live, daily, identity, episodic } // episodic reservado (S11)
 public enum Confidence: String, Codable, CaseIterable, Sendable { case sure, probable, maybe }
 public enum Origin: String, Codable, CaseIterable, Sendable { case explicit, extracted }
@@ -16,6 +16,7 @@ public enum Relation: String, Codable, CaseIterable, Sendable {
     case derivesFrom    // src = insight/summary, dst = source (task / transcript ref)
     case clarifies      // src = clarification, dst = ambiguous node it's about
     case sameAs         // src/dst are dedup-equivalent (kept when merge is non-destructive)
+    case belongsToCluster   // src = cluster anchor, dst = member (ephemeral, rebuilt each cycle)
 }
 
 /// Reserved label for synthetic "kind hub" nodes — one per `NodeKind`. Holds `belongsToHub`
@@ -46,6 +47,7 @@ public extension NodeKind {
         case .followUp: return "Follow-ups"
         case .clarification: return "Clarifications"
         case .selfUser: return "Self"
+        case .cluster: return "Cluster"
         }
     }
 }

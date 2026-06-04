@@ -27,7 +27,7 @@ struct MemoryHandlers {
         let origin: String?
     }
     struct ForgetBody: Decodable, Sendable { let id: String?; let label: String? }
-    struct RecallBody: Decodable, Sendable { let query: String; let scope: String?; let limit: Int?; let threadId: String? }
+    struct RecallBody: Decodable, Sendable { let query: String; let scope: String?; let limit: Int?; let threadId: String?; let tag: String? }
 
     @Sendable func save(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
         let buf: ByteBuffer
@@ -150,16 +150,23 @@ struct MemoryHandlers {
 
         let coreNodes = (try? services.store.coreMemories(limit: limit)) ?? []
         let coreIds = Set(coreNodes.map { $0.id })
-        let recallNodes = retrieved.filter { !coreIds.contains($0.id) }
+        var recallNodes = retrieved.filter { !coreIds.contains($0.id) }
+        if let tag = body.tag, !tag.isEmpty {
+            let allowed = Set((try? services.store.nodesWithTag(tag)) ?? [])
+            recallNodes = recallNodes.filter { allowed.contains($0.id) }
+        }
         let summaryKind = NodeKind.summary.rawValue
         let atomicNodes = recallNodes.filter { $0.kind != summaryKind }
         let summaryNodes = recallNodes.filter { $0.kind == summaryKind }
 
-        struct OutNode: Encodable { let id: String; let kind: String; let label: String; let body: String; let extra: String? }
+        struct OutNode: Encodable { let id: String; let kind: String; let label: String; let body: String; let extra: String?; let tags: [String] }
         struct OutSummary: Encodable { let summaryId: String; let chatId: String; let messageRange: [Int]; let text: String }
         struct OutTurn: Encodable { let role: String; let text: String }
         struct Payload: Encodable { let core: [OutNode]; let recall: [OutNode]; let summaries: [OutSummary]; let recentTurns: [OutTurn] }
-        func toOut(_ n: Node) -> OutNode { OutNode(id: n.id, kind: n.kind, label: n.label, body: n.body, extra: n.extra) }
+        func toOut(_ n: Node) -> OutNode {
+            OutNode(id: n.id, kind: n.kind, label: n.label, body: n.body, extra: n.extra,
+                    tags: (try? services.store.tagsFor(nodeId: n.id)) ?? [])
+        }
         // NOTE: a summary node whose extra lacks parseable threadId/turnRange returns nil here and
         // is dropped from BOTH tiers (it's already excluded from `recall`) — no drill-down ref to surface.
         func toSummary(_ n: Node) -> OutSummary? {
