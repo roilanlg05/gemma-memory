@@ -260,24 +260,56 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(tasks.count, 2, "two distinct meetings (different dates) must NOT collapse into one")
     }
 
-    func test_consolidate_emitsStructuredEvent_whenStartEndPresent() async throws {
+    func test_consolidate_emitsStructuredEvent_whenDateTimePresent() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 8)
-        // Fake runtime returns one event-like entity with epoch start/end.
-        final class EventRuntime: ModelTextClient, @unchecked Sendable {
-            func generate(prompt: String, options: ModelTextOptions) async throws -> String {
-                #"{"entities":[{"entity":"dentist appointment","kind":"task","detail":"dentist","attributes":{"status":"pending","date":"2026-06-04","start":1780653600,"end":1780657200}}]}"#
-            }
-        }
+        // Fake runtime returns one event-like entity with a local date + start/end time.
+        let rt = CannedRuntime([#"{"entities":[{"entity":"dentist appointment","kind":"event","detail":"dentist","attributes":{"date":"2026-06-04","startTime":"10:00","endTime":"11:00"}}]}"#])
         let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 8),
-                                               runtime: EventRuntime(), transcriptStore: TranscriptStore(dbQueue: store.dbQueue))
+                                               runtime: rt, transcriptStore: TranscriptStore(dbQueue: store.dbQueue))
         await engine.consolidate(episodeTexts: ["User: dentista jueves 10am"])
         let events = try store.allNodes().filter { $0.kind == NodeKind.event.rawValue }
         XCTAssertEqual(events.count, 1)
         let a = NodeAttributes.from(events[0].extra)
-        XCTAssertEqual(a.startAt, 1_780_653_600)
-        XCTAssertEqual(a.endAt, 1_780_657_200)
+        let expectStart = ScheduleTime.epoch(date: "2026-06-04", time: "10:00", tz: .current)!
+        let expectEnd = ScheduleTime.epoch(date: "2026-06-04", time: "11:00", tz: .current)!
+        XCTAssertEqual(a.startAt, expectStart)
+        XCTAssertEqual(a.endAt, expectEnd)
         XCTAssertTrue(try store.allNodes().filter { $0.kind == NodeKind.task.rawValue }.isEmpty,
                       "a timed entity must become an event, not also a task")
+    }
+
+    func testConsolidateCleanEventUsesExactLocalEpoch() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 8)
+        let json = #"{"entities":[{"entity":"Dentist","kind":"event","attributes":{"date":"2026-06-11","startTime":"09:00","endTime":"10:00","location":"Clinic"}}]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: CannedRuntime([json]),
+                                               transcriptStore: TranscriptStore(dbQueue: store.dbQueue))
+        await engine.consolidate(episodeTexts: ["User: dentist June 11 9am"])
+        let evs = try store.scheduleWindow(from: 0, to: 1e11)
+        XCTAssertEqual(evs.count, 1)
+        let a = NodeAttributes.from(evs[0].extra)
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = .current
+        let c = cal.dateComponents([.hour, .minute], from: Date(timeIntervalSince1970: a.startAt!))
+        XCTAssertEqual(c.hour, 9); XCTAssertEqual(c.minute, 0)
+        XCTAssertEqual(a.location, "Clinic")
+    }
+
+    func testConsolidateConflictingEventEmitsClarificationNotEvent() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 8)
+        // Seed the trip in TimeZone.current so it deterministically overlaps the consolidated
+        // meeting (consolidate() resolves the new event in currentTimeZone, which defaults to .current).
+        let st = ScheduleTime.epoch(date: "2026-06-09", time: "06:00", tz: .current)!
+        let en = ScheduleTime.epoch(date: "2026-06-13", time: "06:00", tz: .current)!
+        _ = try store.createEventChecked(title: "Varadero trip", start: st, end: en, allDay: true,
+                                         location: "Varadero", origin: .explicit, force: true)
+        let json = #"{"entities":[{"entity":"Miami meeting","kind":"event","attributes":{"date":"2026-06-09","startTime":"08:00","endTime":"09:00","location":"Miami"}}]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: CannedRuntime([json]),
+                                               transcriptStore: TranscriptStore(dbQueue: store.dbQueue))
+        await engine.consolidate(episodeTexts: ["User: meeting in Miami June 9 8am"])
+        XCTAssertEqual(try store.scheduleWindow(from: 0, to: 1e11).count, 1) // no 2nd event
+        let clar = try store.allNodes().filter { $0.kind == NodeKind.clarification.rawValue }
+        XCTAssertEqual(clar.count, 1)
+        let edges = try store.edges(from: clar[0].id).filter { $0.relation == .clarifies }
+        XCTAssertEqual(edges.count, 1)
     }
 
     func test_clarify_emits_clarification_node_when_unsure() async throws {

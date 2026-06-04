@@ -138,6 +138,32 @@ final class MemoryStoreDedupTests: XCTestCase {
                        "embedder fallback must drive semantic dedup when no precomputed embedding is passed")
     }
 
+    func testCompressInsightsMergesNearDuplicates() throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 1024)
+        func ins(_ id: String, _ label: String, _ vec: [Float], salience: Double) throws {
+            let n = Node(id: id, kind: NodeKind.insight.rawValue, label: label, body: label, layer: .daily,
+                         createdAt: 1, updatedAt: 1, lastSeenAt: 1, salience: salience, decayRate: 0,
+                         confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                         origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+            try store.upsert(n); try store.setEmbedding(nodeId: id, vec)
+        }
+        var a = [Float](repeating: 0, count: 1024); a[0] = 1
+        var aPrime = [Float](repeating: 0, count: 1024); aPrime[0] = 0.999; aPrime[1] = 0.044 // ~identical
+        var b = [Float](repeating: 0, count: 1024); b[500] = 1                                 // distinct
+        try ins("i1", "manages appointments", a, salience: 5)
+        try ins("i2", "uses the assistant for schedule management", aPrime, salience: 3)
+        try ins("i3", "likes sushi", b, salience: 4)
+
+        let merged = try store.compressInsights(embedder: nil, threshold: 0.15)
+        XCTAssertEqual(merged, 1)
+        let live = try store.allNodes().filter { $0.kind == NodeKind.insight.rawValue }
+        XCTAssertEqual(live.count, 2)                                   // i1 (canonical) + i3
+        XCTAssertTrue(live.contains { $0.id == "i1" && $0.mentionCount == 2 })
+        XCTAssertNil(live.first { $0.id == "i2" })                      // soft-deleted
+        XCTAssertTrue(try store.edges(from: "i2").contains { $0.relation == .sameAs && $0.dstId == "i1" })
+        XCTAssertEqual(try store.compressInsights(embedder: nil, threshold: 0.15), 0) // idempotent
+    }
+
     func testSweepForgetsExpiredDailyKeepsIdentity() throws {
         let store = try makeStore()
         let daily = node(label: "tmp", ttl: 1, lastSeen: 1)

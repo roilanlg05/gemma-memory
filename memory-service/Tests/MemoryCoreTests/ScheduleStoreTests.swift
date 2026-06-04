@@ -130,4 +130,53 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertEqual(try s.scheduleConflicts(start: 1000, end: 4600).count, 0,
                        "a cancelled event must stay cancelled after re-upsert")
     }
+
+    func testScheduleTimeEpochLocalExact() {
+        let ny = TimeZone(identifier: "America/New_York")!
+        // 2026-06-09 06:00 local → exact, minute-aligned (no 06:13:20 UTC drift)
+        let e = ScheduleTime.epoch(date: "2026-06-09", time: "06:00", tz: ny)!
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = ny
+        let comps = cal.dateComponents([.hour, .minute, .second], from: Date(timeIntervalSince1970: e))
+        XCTAssertEqual(comps.hour, 6); XCTAssertEqual(comps.minute, 0); XCTAssertEqual(comps.second, 0)
+    }
+
+    func testScheduleTimeDateOnlyIsMidnight() {
+        let ny = TimeZone(identifier: "America/New_York")!
+        let e = ScheduleTime.epoch(date: "2026-06-09", time: nil, tz: ny)!
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = ny
+        XCTAssertEqual(cal.dateComponents([.hour], from: Date(timeIntervalSince1970: e)).hour, 0)
+    }
+
+    func testScheduleTimeBadInputIsNil() {
+        XCTAssertNil(ScheduleTime.epoch(date: "not-a-date", time: "06:00", tz: .current))
+    }
+
+    func testCreateEventCheckedBlocksOnConflict() throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 1024)
+        _ = try store.upsertEvent(title: "Trip", start: 1000, end: 5000, allDay: true,
+                                  location: "Varadero", origin: .explicit)
+        let r = try store.createEventChecked(title: "Meeting", start: 2000, end: 3000, allDay: false,
+                                             location: "Miami", origin: .explicit, force: false)
+        XCTAssertNil(r.id)
+        XCTAssertEqual(r.conflicts.map(\.label), ["Trip"])
+        XCTAssertEqual(try store.scheduleWindow(from: 0, to: 9999).count, 1) // meeting NOT written
+    }
+
+    func testCreateEventCheckedForceWritesAndReturnsConflicts() throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 1024)
+        _ = try store.upsertEvent(title: "Trip", start: 1000, end: 5000, allDay: true,
+                                  location: "Varadero", origin: .explicit)
+        let r = try store.createEventChecked(title: "Meeting", start: 2000, end: 3000, allDay: false,
+                                             location: "Miami", origin: .explicit, force: true)
+        XCTAssertNotNil(r.id)
+        XCTAssertEqual(r.conflicts.map(\.label), ["Trip"])
+        XCTAssertEqual(try store.scheduleWindow(from: 0, to: 9999).count, 2)
+    }
+
+    func testCreateEventCheckedNoConflictWrites() throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 1024)
+        let r = try store.createEventChecked(title: "Solo", start: 2000, end: 3000, allDay: false,
+                                             location: nil, origin: .explicit, force: false)
+        XCTAssertNotNil(r.id); XCTAssertTrue(r.conflicts.isEmpty)
+    }
 }

@@ -94,6 +94,50 @@ extension MemoryStore {
         return merged
     }
 
+    /// Sweep existing insight nodes and merge near-duplicates (cosine distance <= threshold).
+    /// Keeps the highest-salience node as canonical, sums mentionCount, soft-deletes the rest with a
+    /// `sameAs` edge to the canonical. Non-destructive. Idempotent. Returns the number merged.
+    @discardableResult
+    public func compressInsights(embedder: Embedder?, threshold: Double = 0.15) throws -> Int {
+        let insights = try allNodes()
+            .filter { $0.kind == NodeKind.insight.rawValue }
+            .sorted { ($0.salience, Double($0.mentionCount)) > ($1.salience, Double($1.mentionCount)) }
+        var kept: [(id: String, emb: [Float])] = []
+        var merged = 0
+        let t = Date().timeIntervalSince1970
+        for n in insights {
+            guard let emb = try embeddingFor(nodeId: n.id, label: n.label, embedder: embedder) else { continue }
+            if let hit = kept.first(where: { Self.cosineDistance($0.emb, emb) <= threshold }) {
+                if var canon = try node(id: hit.id) {
+                    canon.mentionCount += n.mentionCount
+                    canon.salience = max(canon.salience, n.salience)
+                    canon.updatedAt = t; canon.dirty = true
+                    try upsert(canon)
+                }
+                try softDelete(nodeId: n.id)
+                try upsert(Edge(id: UUID().uuidString, srcId: n.id, dstId: hit.id, relation: .sameAs,
+                                weight: 1, confidence: .probable, createdAt: t, updatedAt: t,
+                                dirty: true, deleted: false, extra: nil))
+                merged += 1
+            } else {
+                try setEmbedding(nodeId: n.id, emb)
+                kept.append((n.id, emb))
+            }
+        }
+        return merged
+    }
+
+    /// Stored embedding for a node, else freshly embedded from its label, else nil.
+    private func embeddingFor(nodeId: String, label: String, embedder: Embedder?) throws -> [Float]? {
+        let stored: Data? = try dbQueue.read { db -> Data? in
+            guard let row = try Row.fetchOne(db, sql: "SELECT embedding FROM node_embedding WHERE node_id = ?",
+                                             arguments: [nodeId]) else { return nil }
+            return row["embedding"] as Data
+        }
+        if let stored { return Self.blobToFloats(stored) }
+        return try embedder?.embed(label)
+    }
+
     /// Forgetting sweep: soft-delete nodes whose effective salience fell below the floor
     /// or whose TTL expired (identity is never forgotten).
     public func sweep(now: Double = Date().timeIntervalSince1970) throws {

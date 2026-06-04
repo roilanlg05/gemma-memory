@@ -34,6 +34,15 @@ extension MemoryStore {
             .map { $0 }
     }
 
+    /// Cosine distance (1 - cosine) between two equal-length vectors. 2.0 if mismatched/zero.
+    public static func cosineDistance(_ a: [Float], _ b: [Float]) -> Double {
+        guard a.count == b.count, !a.isEmpty else { return 2 }
+        var dot: Float = 0, na: Float = 0, nb: Float = 0
+        for i in 0..<a.count { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+        let denom = Double(sqrt(na)) * Double(sqrt(nb))
+        return denom > 0 ? 1.0 - Double(dot) / denom : 2.0
+    }
+
     public static func blobToFloats(_ data: Data) -> [Float] {
         data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
     }
