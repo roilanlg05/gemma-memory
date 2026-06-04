@@ -33,6 +33,19 @@ extension MemoryStore {
         }
     }
 
+    /// The ONLY supported way to create an event. Always runs scheduleConflicts.
+    /// Returns (id, conflicts) on create; (nil, conflicts) when blocked by a conflict and !force.
+    @discardableResult
+    public func createEventChecked(title: String, start: Double, end: Double, allDay: Bool,
+                                   location: String?, origin: Origin, force: Bool)
+        throws -> (id: String?, conflicts: [Node]) {
+        let conflicts = try scheduleConflicts(start: start, end: end)
+        if !conflicts.isEmpty && !force { return (nil, conflicts) }
+        let id = try upsertEvent(title: title, start: start, end: end,
+                                 allDay: allDay, location: location, origin: origin)
+        return (id, conflicts)
+    }
+
     /// Create or update an event, deduping by canonicalKey. Returns the node id.
     @discardableResult
     public func upsertEvent(title: String, start: Double, end: Double, allDay: Bool,

@@ -150,4 +150,33 @@ final class ScheduleStoreTests: XCTestCase {
     func testScheduleTimeBadInputIsNil() {
         XCTAssertNil(ScheduleTime.epoch(date: "not-a-date", time: "06:00", tz: .current))
     }
+
+    func testCreateEventCheckedBlocksOnConflict() throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 1024)
+        _ = try store.upsertEvent(title: "Trip", start: 1000, end: 5000, allDay: true,
+                                  location: "Varadero", origin: .explicit)
+        let r = try store.createEventChecked(title: "Meeting", start: 2000, end: 3000, allDay: false,
+                                             location: "Miami", origin: .explicit, force: false)
+        XCTAssertNil(r.id)
+        XCTAssertEqual(r.conflicts.map(\.label), ["Trip"])
+        XCTAssertEqual(try store.scheduleWindow(from: 0, to: 9999).count, 1) // meeting NOT written
+    }
+
+    func testCreateEventCheckedForceWritesAndReturnsConflicts() throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 1024)
+        _ = try store.upsertEvent(title: "Trip", start: 1000, end: 5000, allDay: true,
+                                  location: "Varadero", origin: .explicit)
+        let r = try store.createEventChecked(title: "Meeting", start: 2000, end: 3000, allDay: false,
+                                             location: "Miami", origin: .explicit, force: true)
+        XCTAssertNotNil(r.id)
+        XCTAssertEqual(r.conflicts.map(\.label), ["Trip"])
+        XCTAssertEqual(try store.scheduleWindow(from: 0, to: 9999).count, 2)
+    }
+
+    func testCreateEventCheckedNoConflictWrites() throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 1024)
+        let r = try store.createEventChecked(title: "Solo", start: 2000, end: 3000, allDay: false,
+                                             location: nil, origin: .explicit, force: false)
+        XCTAssertNotNil(r.id); XCTAssertTrue(r.conflicts.isEmpty)
+    }
 }
