@@ -35,6 +35,16 @@ public extension MemoryStore {
                                    extra: #"{"managesKind":"\#(kind.rawValue)","hub":true}"#)
                     try hub.insert(db)
                     created += 1
+                } else if existing!.kind != HubKind.hub.rawValue {
+                    // Self-heal: an older build created this hub with the wrong kind (e.g. "place").
+                    var fixed = existing!
+                    fixed.kind = HubKind.hub.rawValue
+                    fixed.dirty = false
+                    try fixed.save(db)
+                    // Remove any belongsToHub edge that wrongly treated this hub as a spoke node.
+                    try db.execute(sql: "DELETE FROM edge WHERE dstId = ? AND relation = ?",
+                                   arguments: [hubID, Relation.belongsToHub.rawValue])
+                    created += 1
                 }
             }
 

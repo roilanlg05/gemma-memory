@@ -70,4 +70,19 @@ final class MemoryStoreHubsTests: XCTestCase {
         XCTAssertTrue(ids.contains("t-cita"))
         XCTAssertFalse(ids.contains("ent-roilan"), "entity itself excluded from its own neighborhood")
     }
+
+    func testEnsureKindHubsRepairsMisKindedHub() throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 1024)
+        try store.ensureKindHubs()
+        // Corrupt: force the person hub to kind="place" (the production bug we observed).
+        try store.dbQueue.write { db in
+            try db.execute(sql: "UPDATE node SET kind = 'place' WHERE id = 'hub:person'")
+        }
+        _ = try store.ensureKindHubs()  // idempotent re-run must repair
+        let hub = try store.node(id: "hub:person")
+        XCTAssertEqual(hub?.kind, HubKind.hub.rawValue)
+        // A place query must not surface the hub.
+        let places = try store.allNodes().filter { $0.kind == NodeKind.place.rawValue }
+        XCTAssertFalse(places.contains { $0.id == "hub:person" })
+    }
 }
