@@ -1,4 +1,4 @@
-FROM swift:6.0-jammy AS build
+FROM swift:6.2-jammy AS build
 
 # Ubuntu's libsqlite3-dev is built without SQLITE_ENABLE_SNAPSHOT, which GRDB.swift requires
 # (DatabaseSnapshotPool / WALSnapshot reference sqlite3_snapshot_* symbols). Build SQLite
@@ -30,7 +30,7 @@ RUN swift build -c release --static-swift-stdlib --product memory-service \
     -Xlinker -L/usr/local/lib \
     -Xlinker -rpath -Xlinker /usr/local/lib
 
-FROM swift:6.0-jammy-slim AS runtime
+FROM swift:6.2-jammy-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
  && rm -rf /var/lib/apt/lists/*
