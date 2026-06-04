@@ -50,9 +50,18 @@ final class MemoryConsolidationEngineTests: XCTestCase {
 
     func test_reflect_creates_grounded_insight_and_drops_ungrounded() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 4)
-        let now = Date().timeIntervalSince1970
-        for (id,l) in [("a","sushi"),("b","ramen")] {
-            try store.upsert(Node(id: id, kind: "preference", label: l, body: l, layer: .daily, createdAt: now, updatedAt: now, lastSeenAt: now, salience: 3, decayRate: 0.001, confidence: .sure, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .explicit, serverId: nil, dirty: true, deleted: false, extra: nil))
+        let t = Date().timeIntervalSince1970
+        func mkNode(_ id: String, _ kind: String, _ label: String) -> Node {
+            Node(id: id, kind: kind, label: label, body: label, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3, decayRate: 0.001, confidence: .sure, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .explicit, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        // Seed 3 preference members so the cluster meets the ≥3-member threshold.
+        for (id, l) in [("a","sushi"),("b","ramen"),("c","tempura")] {
+            try store.upsert(mkNode(id, NodeKind.preference.rawValue, l))
+        }
+        try store.upsert(mkNode("cl", NodeKind.cluster.rawValue, "japanese"))
+        for m in ["a","b","c"] {
+            try store.upsert(Edge(id: UUID().uuidString, srcId: "cl", dstId: m, relation: .belongsToCluster,
+                                  weight: 1, confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
         }
         let rt = CannedRuntime([#"{"insights":[{"text":"likes Japanese food","sourceEntities":["sushi","ramen"],"confidence":"probable"},{"text":"is a pilot","sourceEntities":["sushi"],"confidence":"maybe"}]}"#])
         let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: rt)
@@ -60,16 +69,26 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         let insights = try store.allNodes().filter { $0.kind == NodeKind.insight.rawValue }
         XCTAssertEqual(insights.count, 1, "only the ≥2-source insight is kept")
         XCTAssertEqual(insights.first?.body, "likes Japanese food")
-        XCTAssertGreaterThanOrEqual(try store.allEdges().count, 2, "insight linked to ≥2 sources")
+        let ins = try XCTUnwrap(insights.first)
+        let provEdges = try store.edges(from: ins.id).filter { $0.relation == .derivesFrom }
+        XCTAssertGreaterThanOrEqual(provEdges.count, 2, "insight linked to ≥2 sources via derivesFrom")
     }
 
     func test_reflect_is_idempotent_no_duplicate_insights() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 4)
-        let now = Date().timeIntervalSince1970
-        for (id,l) in [("a","sushi"),("b","ramen")] {
-            try store.upsert(Node(id: id, kind: "preference", label: l, body: l, layer: .daily, createdAt: now, updatedAt: now, lastSeenAt: now, salience: 3, decayRate: 0.001, confidence: .sure, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .explicit, serverId: nil, dirty: true, deleted: false, extra: nil))
+        let t = Date().timeIntervalSince1970
+        func mkNode(_ id: String, _ kind: String, _ label: String) -> Node {
+            Node(id: id, kind: kind, label: label, body: label, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3, decayRate: 0.001, confidence: .sure, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .explicit, serverId: nil, dirty: true, deleted: false, extra: nil)
         }
-        // Same insight returned twice; second reflect() must find the existing node and skip it.
+        for (id, l) in [("a","sushi"),("b","ramen"),("c","tempura")] {
+            try store.upsert(mkNode(id, NodeKind.preference.rawValue, l))
+        }
+        try store.upsert(mkNode("cl", NodeKind.cluster.rawValue, "japanese"))
+        for m in ["a","b","c"] {
+            try store.upsert(Edge(id: UUID().uuidString, srcId: "cl", dstId: m, relation: .belongsToCluster,
+                                  weight: 1, confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+        }
+        // Same insight returned on both reflect() calls (one call per cluster per reflect() invocation).
         let same = #"{"insights":[{"text":"likes Japanese food","sourceEntities":["sushi","ramen"],"confidence":"probable"}]}"#
         let rt = CannedRuntime([same, same])
         let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: rt)
@@ -471,6 +490,31 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(MemoryConsolidationEngine.cycleOrder,
                        [.nrem, .summarize, .detect, .embeddings, .cluster, .tag,
                         .reflect, .compress, .curate, .rem, .clarify, .shy])
+    }
+
+    func test_reflect_per_cluster_uses_derivesFrom_to_members() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        func mk(_ id: String, _ kind: String) -> Node {
+            Node(id: id, kind: kind, label: id, body: id, layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1,
+                 salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                 origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        for id in ["sushi", "ramen", "tempura"] { try store.upsert(mk(id, NodeKind.preference.rawValue)) }
+        var anchor = mk("cl", NodeKind.cluster.rawValue); anchor.label = "comida"; try store.upsert(anchor)
+        for m in ["sushi", "ramen", "tempura"] {
+            try store.upsert(Edge(id: UUID().uuidString, srcId: "cl", dstId: m, relation: .belongsToCluster,
+                                  weight: 1, confidence: .probable, createdAt: 1, updatedAt: 1, dirty: true, deleted: false, extra: nil))
+        }
+        let json = #"{"insights":[{"text":"enjoys Japanese food","sourceEntities":["sushi","ramen"],"confidence":"probable"}]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: CannedRuntime([json]))
+        await engine.reflect()
+        let insights = try store.allNodes().filter { $0.kind == NodeKind.insight.rawValue }
+        XCTAssertEqual(insights.count, 1)
+        let ins = try XCTUnwrap(insights.first)
+        XCTAssertEqual(ins.layer, .daily)                                  // only 3 members → not promoted (Task 2)
+        let prov = try store.edges(from: ins.id).filter { $0.relation == .derivesFrom }
+        XCTAssertEqual(Set(prov.map { $0.dstId }), ["sushi", "ramen"])     // derivesFrom the 2 cited sources
+        XCTAssertTrue(try store.edges(from: ins.id).allSatisfy { $0.relation != .relatedTo })  // no relatedTo
     }
 }
 
