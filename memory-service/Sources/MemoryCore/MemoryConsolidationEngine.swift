@@ -159,6 +159,21 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
     // MARK: Summarize — distill segment into a structured summary node
 
+    /// Group consolidated transcript rows into one summary unit per thread, with the seq-based
+    /// message range and role-prefixed texts. Pure (testable without a model/db). Threads are
+    /// ordered by their earliest message so summaries are produced in chronological order.
+    static func summaryGroups(_ rows: [TranscriptRow]) -> [(threadId: String, range: ClosedRange<Int>, texts: [String])] {
+        Dictionary(grouping: rows, by: { $0.threadId })
+            .sorted { ($0.value.map(\.createdAt).min() ?? 0) < ($1.value.map(\.createdAt).min() ?? 0) }
+            .map { threadId, tRows in
+                let ordered = tRows.sorted { $0.seq < $1.seq }   // seq is the canonical per-chat order
+                let seqs = ordered.map { $0.seq }
+                let range = (seqs.min() ?? 0)...(seqs.max() ?? 0)
+                let texts = ordered.map { "\($0.role == "assistant" ? "Gemma" : "User"): \($0.text)" }
+                return (threadId, range, texts)
+            }
+    }
+
     private struct SummaryOut: Decodable {
         let topic: String; let concepts: [String]
         let intent: String?; let decisions: [String]?; let importance: Double?; let summary: String?
@@ -213,13 +228,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         let alreadySummarized = Set(((try? store.allNodes()) ?? [])
             .filter { $0.kind == NodeKind.summary.rawValue }
             .compactMap { $0.sourceRef })
-        let groups = Dictionary(grouping: rows, by: { $0.threadId })
-            .sorted { ($0.value.map(\.createdAt).min() ?? 0) < ($1.value.map(\.createdAt).min() ?? 0) }
-        for (threadId, tRows) in groups where !alreadySummarized.contains(threadId) {
-            let turns = tRows.map { $0.turnIndex }
-            let range = (turns.min() ?? 0)...(turns.max() ?? 0)
-            let texts = tRows.map { "\($0.role == "assistant" ? "Gemma" : "User"): \($0.text)" }
-            await summarize(episodeTexts: texts, threadId: threadId, turnRange: range)
+        for g in MemoryConsolidationEngine.summaryGroups(rows) where !alreadySummarized.contains(g.threadId) {
+            await summarize(episodeTexts: g.texts, threadId: g.threadId, turnRange: g.range)
         }
     }
 
@@ -500,15 +510,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 }
             case .summarize:
                 let rows = (try? transcriptStore.rows(ids: state.episodeIds)) ?? []
-                // One summary per session (threadId). user+assistant of a turn share a turnIndex
-                // by design, so a single-turn group yields turnRange i...i.
-                let groups = Dictionary(grouping: rows, by: { $0.threadId })
-                    .sorted { ($0.value.map(\.createdAt).min() ?? 0) < ($1.value.map(\.createdAt).min() ?? 0) }
-                for (threadId, tRows) in groups {
-                    let turns = tRows.map { $0.turnIndex }
-                    let range = (turns.min() ?? 0)...(turns.max() ?? 0)
-                    let texts = tRows.map { "\($0.role == "assistant" ? "Gemma" : "User"): \($0.text)" }
-                    await summarize(episodeTexts: texts, threadId: threadId, turnRange: range)
+                for g in MemoryConsolidationEngine.summaryGroups(rows) {
+                    await summarize(episodeTexts: g.texts, threadId: g.threadId, turnRange: g.range)
                 }
             case .detect:
                 await detectFollowUps(episodeTexts: episodeTexts(ids: state.episodeIds))

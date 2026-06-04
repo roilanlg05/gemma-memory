@@ -151,14 +151,26 @@ struct MemoryHandlers {
         let coreNodes = (try? services.store.coreMemories(limit: limit)) ?? []
         let coreIds = Set(coreNodes.map { $0.id })
         let recallNodes = retrieved.filter { !coreIds.contains($0.id) }
+        let summaryKind = NodeKind.summary.rawValue
+        let atomicNodes = recallNodes.filter { $0.kind != summaryKind }
+        let summaryNodes = recallNodes.filter { $0.kind == summaryKind }
 
         struct OutNode: Encodable { let id: String; let kind: String; let label: String; let body: String; let extra: String? }
+        struct OutSummary: Encodable { let summaryId: String; let chatId: String; let messageRange: [Int]; let text: String }
         struct OutTurn: Encodable { let role: String; let text: String }
-        struct Payload: Encodable { let core: [OutNode]; let recall: [OutNode]; let recentTurns: [OutTurn] }
-        func toOut(_ n: Node) -> OutNode {
-            OutNode(id: n.id, kind: n.kind, label: n.label, body: n.body, extra: n.extra)
+        struct Payload: Encodable { let core: [OutNode]; let recall: [OutNode]; let summaries: [OutSummary]; let recentTurns: [OutTurn] }
+        func toOut(_ n: Node) -> OutNode { OutNode(id: n.id, kind: n.kind, label: n.label, body: n.body, extra: n.extra) }
+        // NOTE: a summary node whose extra lacks parseable threadId/turnRange returns nil here and
+        // is dropped from BOTH tiers (it's already excluded from `recall`) — no drill-down ref to surface.
+        func toSummary(_ n: Node) -> OutSummary? {
+            guard let raw = n.extra?.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: raw) as? [String: Any],
+                  let chatId = obj["threadId"] as? String,
+                  let tr = obj["turnRange"] as? [Int], tr.count == 2 else { return nil }
+            return OutSummary(summaryId: n.id, chatId: chatId, messageRange: tr, text: n.body.isEmpty ? n.label : n.body)
         }
-        let payload = Payload(core: coreNodes.map(toOut), recall: recallNodes.map(toOut),
+        let payload = Payload(core: coreNodes.map(toOut), recall: atomicNodes.map(toOut),
+                              summaries: summaryNodes.compactMap(toSummary),
                               recentTurns: recentTurns.map { OutTurn(role: $0.role, text: $0.text) })
         let data = try JSONEncoder().encode(payload)
         return Response(status: .ok, headers: [.contentType: "application/json"],

@@ -226,7 +226,7 @@ extension Services {
               let tr = any["turnRange"] as? [Int], tr.count == 2 else {
             return ExpandResult(rows: [], summaryLabel: match?.label)
         }
-        let rows = (try? transcript.range(threadId: threadId, fromTurn: tr[0], toTurn: tr[1])) ?? []
+        let rows = (try? transcript.range(threadId: threadId, from: tr[0], to: tr[1])) ?? []
         return ExpandResult(rows: rows, summaryLabel: node.label)
     }
 }

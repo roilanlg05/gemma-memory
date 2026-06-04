@@ -101,6 +101,36 @@ final class MemoryEndpointsTests: XCTestCase {
         XCTAssertEqual(selves.count, 1)   // singleton — no generic duplicate
     }
 
+    func test_recall_returns_summaries_tier_with_refs() async throws {
+        let (app, services) = try await makeAppWithServices()
+        let extra = #"{"concepts":["opciones"],"intent":"","decisions":[],"importance":0.6,"threadId":"g7y","turnRange":[21,56]}"#
+        let summary = Node(id: "sum1", kind: NodeKind.summary.rawValue, label: "trading opciones",
+                           body: "El usuario hace trading de opciones", layer: .daily,
+                           createdAt: 1, updatedAt: 1, lastSeenAt: 1,
+                           salience: 4, decayRate: 0, confidence: .probable, mentionCount: 1,
+                           ttlExpiresAt: nil, sourceRef: "g7y", origin: .extracted, serverId: nil,
+                           dirty: true, deleted: false, extra: extra)
+        try services.store.upsert(summary)
+        try services.store.setEmbedding(nodeId: "sum1", services.embedder.embed("trading opciones"))
+        struct Out: Decodable {
+            struct S: Decodable { let summaryId: String; let chatId: String; let messageRange: [Int]; let text: String }
+            struct N: Decodable { let kind: String }
+            let recall: [N]; let summaries: [S]
+        }
+        try await app.test(.live) { client in
+            try await client.execute(uri: "/v1/memory/recall", method: .post,
+                headers: [.authorization: "Bearer test-token", .contentType: "application/json"],
+                body: ByteBuffer(string: #"{"query":"trading opciones"}"#)) { res in
+                XCTAssertEqual(res.status, .ok)
+                let out = try JSONDecoder().decode(Out.self, from: Data(buffer: res.body))
+                XCTAssertEqual(out.summaries.first?.summaryId, "sum1")
+                XCTAssertEqual(out.summaries.first?.chatId, "g7y")
+                XCTAssertEqual(out.summaries.first?.messageRange, [21, 56])
+                XCTAssertFalse(out.recall.contains { $0.kind == "summary" }, "summaries must be split out of recall")
+            }
+        }
+    }
+
     func test_expand_returns_transcript_for_known_summary() async throws {
         let app = try await makeApp()
         try await app.test(.live) { client in

@@ -3,7 +3,7 @@ import XCTest
 
 final class ConversationWindowTests: XCTestCase {
     private func row(_ role: String, _ text: String, _ t: Double) -> TranscriptRow {
-        TranscriptRow(id: "\(t)", threadId: "x", turnIndex: Int(t), role: role, text: text, createdAt: t, consolidated: false)
+        TranscriptRow(id: "\(t)", threadId: "x", turnIndex: Int(t), seq: Int(t), role: role, text: text, createdAt: t, consolidated: false)
     }
 
     func test_maps_rows_to_chat_messages_in_order() {
