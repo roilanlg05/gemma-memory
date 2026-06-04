@@ -323,6 +323,22 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertTrue(people.contains { $0.label == "María" && $0.body.contains("esposa") })
     }
 
+    func test_associate_links_self_to_people() async throws {
+        let store = try makeStore()
+        _ = try store.upsertSelf(name: "Roilan", detail: nil, embedder: nil)
+        let now = Date().timeIntervalSince1970
+        let maria = Node(id: "m1", kind: NodeKind.person.rawValue, label: "María", body: "esposa",
+                         layer: .daily, createdAt: now, updatedAt: now, lastSeenAt: now, salience: 3, decayRate: 0.001,
+                         confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                         origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        try store.upsert(maria)
+        let rt = CannedRuntime([#"{"edges":[{"from":"Roilan","relation":"family","to":"María"}]}"#])
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: rt)
+        await engine.associate()
+        let familyEdges = try store.edges(from: selfUserID).filter { $0.relation == .family }
+        XCTAssertEqual(familyEdges.first?.dstId, "m1")
+    }
+
     func test_clarify_emits_clarification_node_when_unsure() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 8)
         let ts = TranscriptStore(dbQueue: store.dbQueue)

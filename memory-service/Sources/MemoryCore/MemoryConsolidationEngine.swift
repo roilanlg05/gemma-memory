@@ -282,9 +282,9 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         let relations = Relation.allCases.map { $0.rawValue }.joined(separator: ", ")
         let prompt = """
         These memory entities are all facts about ONE person (the user). Propose meaningful relationships between them. Output JSON only.
-        The `person` node is usually the user; connect the user to their preferences (likes/dislikes), places they work or go (locatedAt/worksWith), people they know (knows/worksWith/family), and link genuinely related items (relatedTo). Don't invent entities not listed.
+        The `self` node is the USER (the person you're talking to); connect the user (self) to their preferences (likes/dislikes), places they work or go (locatedAt/worksWith), and the people they know (knows/worksWith/family). Other `person` nodes are third parties — link each to the self with the right relation (family for relatives, knows for friends, worksWith for colleagues). Link genuinely related items with relatedTo. Don't invent entities not listed.
         Use ONLY these relation types: \(relations).
-        Example: entities `person: Ana`, `preference: pizza`, `place: office` → {"edges":[{"from":"Ana","relation":"likes","to":"pizza"},{"from":"Ana","relation":"locatedAt","to":"office"}]}
+        Example: entities `self: Ana`, `preference: pizza`, `person: María` → {"edges":[{"from":"Ana","relation":"likes","to":"pizza"},{"from":"Ana","relation":"family","to":"María"}]}
         Schema: {"edges":[{"from":"<entity label>","relation":"<one of the types>","to":"<entity label>"}]}
         Entities:
         \(labels)
