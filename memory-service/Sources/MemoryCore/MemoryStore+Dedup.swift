@@ -149,6 +149,7 @@ extension MemoryStore {
             if !label.isEmpty { existing.label = label }
             if let detail, !detail.isEmpty { existing.body = detail }
             existing.updatedAt = now; existing.lastSeenAt = now; existing.deleted = false; existing.dirty = true
+            existing.mentionCount += 1   // reinforce like every other "seen again" path
             try upsert(existing)
         } else {
             let newNode = Node(id: id, kind: NodeKind.selfUser.rawValue, label: label,
