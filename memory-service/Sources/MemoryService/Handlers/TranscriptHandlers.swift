@@ -29,9 +29,12 @@ struct TranscriptHandlers {
               ["user", "assistant"].contains(body.role) else {
             return jsonError(.badRequest, "bad_request", "invalid append body")
         }
-        try services.transcript.append(threadId: body.threadId, turnIndex: body.turnIndex,
-                                       role: body.role, text: body.text,
-                                       now: Date().timeIntervalSince1970)
+        let id = try services.transcript.append(threadId: body.threadId, turnIndex: body.turnIndex,
+                                               role: body.role, text: body.text,
+                                               now: Date().timeIntervalSince1970)
+        if let vec = try? services.embedder.embed(body.text) {
+            try? services.store.setTranscriptEmbedding(turnId: id, vec)
+        }
         return Response(status: .ok, headers: [.contentType: "application/json"],
                         body: ResponseBody(byteBuffer: ByteBuffer(string: "{}")))
     }
