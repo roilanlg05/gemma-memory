@@ -166,7 +166,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         Dictionary(grouping: rows, by: { $0.threadId })
             .sorted { ($0.value.map(\.createdAt).min() ?? 0) < ($1.value.map(\.createdAt).min() ?? 0) }
             .map { threadId, tRows in
-                let ordered = tRows.sorted { $0.createdAt < $1.createdAt }
+                let ordered = tRows.sorted { $0.seq < $1.seq }   // seq is the canonical per-chat order
                 let seqs = ordered.map { $0.seq }
                 let range = (seqs.min() ?? 0)...(seqs.max() ?? 0)
                 let texts = ordered.map { "\($0.role == "assistant" ? "Gemma" : "User"): \($0.text)" }
