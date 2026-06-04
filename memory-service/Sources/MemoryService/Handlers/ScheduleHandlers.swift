@@ -56,17 +56,17 @@ struct ScheduleHandlers {
         guard let b = await body(req, CreateBody.self) else {
             return jsonError(.badRequest, "bad_request", "title/start/end required")
         }
-        let conflicts: [Node]
-        do { conflicts = try services.store.scheduleConflicts(start: b.start, end: b.end) }
-        catch { return jsonError(.internalServerError, "store_error", "\(error)") }
-        if !conflicts.isEmpty, b.force != true {
-            return json(["created": false, "conflicts": conflicts.map(eventJSON)])
-        }
         let origin: Origin = (b.origin == "extracted") ? .extracted : .explicit
-        let id = try services.store.upsertEvent(title: b.title, start: b.start, end: b.end,
-                                                allDay: b.allDay ?? false, location: b.location,
-                                                origin: origin)
-        return json(["created": true, "id": id, "conflicts": conflicts.map(eventJSON)])
+        let result: (id: String?, conflicts: [Node])
+        do {
+            result = try services.store.createEventChecked(title: b.title, start: b.start, end: b.end,
+                                                           allDay: b.allDay ?? false, location: b.location,
+                                                           origin: origin, force: b.force == true)
+        } catch { return jsonError(.internalServerError, "store_error", "\(error)") }
+        if let id = result.id {
+            return json(["created": true, "id": id, "conflicts": result.conflicts.map(eventJSON)])
+        }
+        return json(["created": false, "conflicts": result.conflicts.map(eventJSON)])
     }
 
     @Sendable func window(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
