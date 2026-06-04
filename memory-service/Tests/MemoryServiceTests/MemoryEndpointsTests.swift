@@ -9,11 +9,17 @@ import Foundation
 
 final class MemoryEndpointsTests: XCTestCase {
     private func makeApp() async throws -> some ApplicationProtocol {
+        try await makeAppWithServices().0
+    }
+
+    /// Like `makeApp()` but also returns the `Services` so tests can seed `transcript`/`store`/`embedder` directly.
+    private func makeAppWithServices() async throws -> (some ApplicationProtocol, Services) {
         let store = try MemoryStore(path: ":memory:", embeddingDim: 8)
         let ts = TranscriptStore(dbQueue: store.dbQueue)
         let services = await Services(store: store, transcript: ts, embedder: FakeEmbedder(dimension: 8),
                                        bearerToken: "test-token")
-        return try await buildApp(services: services, port: 0)
+        let app = try await buildApp(services: services, port: 0)
+        return (app, services)
     }
 
     func test_save_then_forget_works() async throws {
@@ -54,6 +60,28 @@ final class MemoryEndpointsTests: XCTestCase {
                 let s = String(buffer: res.body)
                 XCTAssertTrue(s.contains("\"core\""))
                 XCTAssertTrue(s.contains("\"recall\""))
+            }
+        }
+    }
+
+    func test_recall_returns_recent_turns_from_other_threads_only() async throws {
+        let (app, services) = try await makeAppWithServices()
+        // Seed thread A (a relevant turn) and thread B (the current thread). Embed each turn so
+        // nearestTranscript can rank them.
+        let aId = try services.transcript.append(threadId: "A", turnIndex: 0, role: "user",
+                                                 text: "voy a Varadero la próxima semana")
+        try services.store.setTranscriptEmbedding(turnId: aId, services.embedder.embed("voy a Varadero la próxima semana"))
+        let bId = try services.transcript.append(threadId: "B", turnIndex: 0, role: "user", text: "hola")
+        try services.store.setTranscriptEmbedding(turnId: bId, services.embedder.embed("hola"))
+        try await app.test(.live) { client in
+            try await client.execute(uri: "/v1/memory/recall", method: .post,
+                                     headers: [.authorization: "Bearer test-token", .contentType: "application/json"],
+                                     body: ByteBuffer(string: #"{"query":"qué planes tengo","threadId":"B"}"#)) { res in
+                XCTAssertEqual(res.status, .ok)
+                let body = String(buffer: res.body)
+                XCTAssertTrue(body.contains("recentTurns"))
+                XCTAssertTrue(body.contains("Varadero"), body)              // from thread A
+                XCTAssertFalse(body.contains("\"text\":\"hola\""), body)     // current thread B excluded
             }
         }
     }
