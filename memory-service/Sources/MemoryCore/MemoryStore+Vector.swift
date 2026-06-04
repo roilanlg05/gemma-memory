@@ -66,6 +66,14 @@ extension MemoryStore {
             .prefix(k).map { $0 }
     }
 
+    /// All stored node embeddings (one query) — input for clustering.
+    public func allEmbeddings() throws -> [(id: String, vec: [Float])] {
+        try dbQueue.read { db in
+            try Row.fetchAll(db, sql: "SELECT node_id, embedding FROM node_embedding")
+                .map { (id: $0["node_id"] as String, vec: Self.blobToFloats($0["embedding"] as Data)) }
+        }
+    }
+
     public func deleteTranscriptEmbeddings(turnIds: [String]) throws {
         guard !turnIds.isEmpty else { return }
         try dbQueue.write { db in

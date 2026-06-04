@@ -166,6 +166,14 @@ public final class MemoryStore: @unchecked Sendable {
                 """)
             try db.create(indexOn: "transcript", columns: ["threadId", "seq"])
         }
+        m.registerMigration("v9-node-tags") { db in
+            try db.create(table: "node_tags") { t in
+                t.column("node_id", .text).notNull()
+                t.column("tag", .text).notNull()
+                t.primaryKey(["node_id", "tag"])
+            }
+            try db.create(indexOn: "node_tags", columns: ["tag"])
+        }
         return m
     }
 
@@ -184,15 +192,26 @@ public final class MemoryStore: @unchecked Sendable {
     }
     public func upsert(_ edge: Edge) throws { try dbQueue.write { try edge.save($0) } }
     public func node(id: String) throws -> Node? { try dbQueue.read { try Node.fetchOne($0, key: id) } }
-    /// Returns live, non-hub nodes by default. Pass `includeHubs: true` for the graph view
-    /// (where structural anchors should be visible). Pass `includeDeleted: true` for sweep
-    /// inspection. Most callers (recall, coreMemories, dedup) want semantic nodes only.
+    /// Returns live, non-structural nodes by default. Pass `includeHubs: true` for the graph view
+    /// (where structural anchors — hubs AND cluster anchors — should be visible). Pass
+    /// `includeDeleted: true` for sweep inspection. Most callers (recall, coreMemories, dedup,
+    /// reflect, associate) want semantic memory nodes only, so cluster anchors are excluded too.
     public func allNodes(includeDeleted: Bool = false, includeHubs: Bool = false) throws -> [Node] {
         try dbQueue.read { db in
             var q = Node.all()
             if !includeDeleted { q = q.filter(Column("deleted") == false) }
-            if !includeHubs    { q = q.filter(Column("kind") != HubKind.hub.rawValue) }
+            if !includeHubs {
+                q = q.filter(Column("kind") != HubKind.hub.rawValue && Column("kind") != NodeKind.cluster.rawValue)
+            }
             return try q.fetchAll(db)
+        }
+    }
+
+    /// Live cluster anchor nodes (ephemeral, rebuilt each cycle). Excluded from `allNodes()`
+    /// (structural, not memories), so the tagging stage + graph view fetch them here.
+    public func clusterNodes() throws -> [Node] {
+        try dbQueue.read { db in
+            try Node.filter(Column("kind") == NodeKind.cluster.rawValue && Column("deleted") == false).fetchAll(db)
         }
     }
 
