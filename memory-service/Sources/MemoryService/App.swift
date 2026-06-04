@@ -73,8 +73,12 @@ public final class Services: @unchecked Sendable {
         self.embedder = embedder
         self.retriever = MemoryRetriever(store: store, embedder: embedder)
         self.bearerToken = config.bearerToken
-        let modelClient = RemoteModelClient(baseURL: URL(string: config.modelURL)!,
-                                            model: config.modelName)
+        let modelConfig = ModelConfigStore(dbQueue: store.dbQueue,
+                                           crypto: ConfigCrypto(bearerToken: config.bearerToken))
+        self.modelConfig = modelConfig
+        let modelClient = RemoteModelClient(configStore: modelConfig,
+                                            defaultBaseURL: URL(string: config.modelURL)!.appendingPathComponent("v1"),
+                                            defaultModel: config.modelName)
         self.modelClient = modelClient
         let engine = MemoryConsolidationEngine(store: store, embedder: embedder,
                                                runtime: modelClient, transcriptStore: transcript)
@@ -86,8 +90,6 @@ public final class Services: @unchecked Sendable {
             isReady: { true },
             hasPendingCycle: { (try? store.loadSleepCycle()) != nil }
         )
-        self.modelConfig = ModelConfigStore(dbQueue: store.dbQueue,
-                                            crypto: ConfigCrypto(bearerToken: config.bearerToken))
     }
 
     /// Test-only injection point. `modelClient` defaults to a NoOp so older tests (Task 7/8)
