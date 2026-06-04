@@ -16,20 +16,26 @@ struct ConsolidationHandlers {
         group.get ("/consolidation/state",    use: state)
     }
 
-    struct TurnEndBody: Decodable, Sendable { let threadId: String }
+    struct TurnEndBody: Decodable, Sendable { let threadId: String; let timezone: String? }
 
     @Sendable func turnEnd(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
         let buf = (try? await req.body.collect(upTo: 4_000)) ?? ByteBuffer()
         guard let body = try? JSONDecoder().decode(TurnEndBody.self, from: Data(buf.readableBytesView)) else {
             return jsonError(.badRequest, "bad_request", "threadId required")
         }
-        await services.scheduler.armTurnEnd(threadId: body.threadId)
+        let tz = body.timezone.flatMap { TimeZone(identifier: $0) } ?? .current
+        await services.scheduler.armTurnEnd(threadId: body.threadId, timeZone: tz)
         return Response(status: .ok, headers: [.contentType: "application/json"],
                         body: ResponseBody(byteBuffer: ByteBuffer(string: "{}")))
     }
 
+    struct ReflectBody: Decodable, Sendable { let timezone: String? }
+
     @Sendable func reflect(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
-        let id = await services.scheduler.runReflectAdHoc() ?? ""
+        let buf = (try? await req.body.collect(upTo: 1_000)) ?? ByteBuffer()
+        let tz = (try? JSONDecoder().decode(ReflectBody.self, from: Data(buf.readableBytesView)))?
+            .timezone.flatMap { TimeZone(identifier: $0) } ?? .current
+        let id = await services.scheduler.runReflectAdHoc(timeZone: tz) ?? ""
         let payload = #"{"cycleId":"\#(id)"}"#
         return Response(status: .ok, headers: [.contentType: "application/json"],
                         body: ResponseBody(byteBuffer: ByteBuffer(string: payload)))

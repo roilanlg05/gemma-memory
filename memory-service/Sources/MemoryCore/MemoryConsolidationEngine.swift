@@ -10,6 +10,9 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     private let runtime: any ModelTextClient
     private let transcriptStore: TranscriptStore
     private let now: () -> Double
+    /// Timezone for the in-flight cycle (set by runCycle/runLight). Cycles are serialized by the
+    /// scheduler, so a single instance var is safe. Defaults to server tz for direct phase tests.
+    private var currentTimeZone: TimeZone = .current
     public var onProgress: ((String) -> Void)?   // e.g. "+2 entities", "+1 edge"
 
     public init(store: MemoryStore, embedder: Embedder?, runtime: any ModelTextClient,
@@ -50,7 +53,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     // MARK: NREM — Consolidate
 
     private func todayString() -> String {
-        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd (EEEE)"
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd (EEEE)"; f.timeZone = currentTimeZone
         return f.string(from: Date(timeIntervalSince1970: now()))
     }
 
@@ -407,7 +410,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     }
 
     // MARK: Cycle driver (resumable). `@escaping` to match the ConsolidationRunning protocol (Task 6).
-    public func runCycle(isCancelled: @escaping () -> Bool) async {
+    public func runCycle(isCancelled: @escaping () -> Bool, timeZone: TimeZone = .current) async {
+        currentTimeZone = timeZone
         // Load or start a cycle.
         var state: SleepCycleState
         if let existing = (try? store.loadSleepCycle()) ?? nil {
@@ -478,7 +482,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
     /// Awake light reflection: summarize the current session promptly, then associate + reflect
     /// over current memory, no replay/curate/forget.
-    public func runLight(isCancelled: @escaping () -> Bool) async {
+    public func runLight(isCancelled: @escaping () -> Bool, timeZone: TimeZone = .current) async {
+        currentTimeZone = timeZone
         if isCancelled() { return }
         await summarizeRecent()
         if isCancelled() { return }

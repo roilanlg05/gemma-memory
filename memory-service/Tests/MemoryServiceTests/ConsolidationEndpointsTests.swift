@@ -9,13 +9,19 @@ import Foundation
 
 final class ConsolidationEndpointsTests: XCTestCase {
     private func makeApp() async throws -> some ApplicationProtocol {
+        let (app, _) = try await makeAppWithServices()
+        return app
+    }
+
+    private func makeAppWithServices() async throws -> (some ApplicationProtocol, Services) {
         let store = try MemoryStore(path: ":memory:", embeddingDim: 8)
         let services = await Services(store: store,
                                       transcript: TranscriptStore(dbQueue: store.dbQueue),
                                       embedder: FakeEmbedder(dimension: 8),
                                       bearerToken: "test-token",
                                       modelClient: NoOpModelClient())
-        return try await buildApp(services: services, port: 0)
+        let app = try await buildApp(services: services, port: 0)
+        return (app, services)
     }
 
     func test_state_endpoint_reports_counts() async throws {
@@ -41,6 +47,19 @@ final class ConsolidationEndpointsTests: XCTestCase {
                 XCTAssertEqual(res.status, .ok)
             }
         }
+    }
+
+    func testTurnEndAcceptsTimezone() async throws {
+        let (app, services) = try await makeAppWithServices()
+        try await app.test(.live) { client in
+            try await client.execute(uri: "/v1/consolidation/turn-end", method: .post,
+                                     headers: [.authorization: "Bearer test-token", .contentType: "application/json"],
+                                     body: ByteBuffer(string: #"{"threadId":"t1","timezone":"America/New_York"}"#)) { res in
+                XCTAssertEqual(res.status, .ok)
+            }
+        }
+        let tz = await services.scheduler.lastTimeZone
+        XCTAssertEqual(tz.identifier, "America/New_York")
     }
 }
 

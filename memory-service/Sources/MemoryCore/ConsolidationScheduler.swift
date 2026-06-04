@@ -2,8 +2,8 @@ import Foundation
 
 /// Abstraction over the engine so the scheduler is testable with a spy.
 public protocol ConsolidationRunning: AnyObject, Sendable {
-    func runLight(isCancelled: @escaping () -> Bool) async
-    func runCycle(isCancelled: @escaping () -> Bool) async
+    func runLight(isCancelled: @escaping () -> Bool, timeZone: TimeZone) async
+    func runCycle(isCancelled: @escaping () -> Bool, timeZone: TimeZone) async
 }
 
 /// Server-side scheduler: drives the consolidation engine on pause/idle timers. Unlike the app
@@ -19,6 +19,9 @@ public final class ConsolidationScheduler {
     public var isRunning: Bool { running != nil }
     /// Tracks the most recent `armTurnEnd(threadId:)` invocation for diagnostics.
     public private(set) var lastTurnEndThread: String?
+    /// Most recent timezone reported by the app (turn-end/reflect). Used for date resolution in
+    /// cycles that fire from timers or resume after restart. Defaults to the server tz.
+    public private(set) var lastTimeZone: TimeZone = .current
 
     private let runner: ConsolidationRunning
     private let isReady: () -> Bool
@@ -64,8 +67,9 @@ public final class ConsolidationScheduler {
     /// HTTP-facing alias for `noteTurnEnded()`: records the thread and arms the pause/idle timers
     /// that drive light/full consolidation. Mirrors the macOS-side semantics so server callers
     /// (the new `/v1/consolidation/turn-end` endpoint) can drive the scheduler the same way.
-    public func armTurnEnd(threadId: String) {
+    public func armTurnEnd(threadId: String, timeZone: TimeZone = .current) {
         lastTurnEndThread = threadId
+        lastTimeZone = timeZone
         noteTurnEnded()
     }
 
@@ -73,8 +77,9 @@ public final class ConsolidationScheduler {
     /// awake-light pass if nothing is running and returns a synthetic cycle id (timestamp-based)
     /// so callers can correlate the request with the response. Returns nil when the scheduler is
     /// not ready or already running.
-    public func runReflectAdHoc() -> String? {
+    public func runReflectAdHoc(timeZone: TimeZone = .current) -> String? {
         guard isReady(), running == nil, !isUserBusy() else { return nil }
+        lastTimeZone = timeZone
         let cycleId = "reflect-\(Int(Date().timeIntervalSince1970 * 1000))"
         launch(light: true)
         return cycleId
@@ -100,10 +105,11 @@ public final class ConsolidationScheduler {
         let isCancelled: @Sendable () -> Bool = { [cancelFlag] in
             cancelFlag.get()
         }
+        let tz = lastTimeZone
         state = light ? .reflecting : .sleeping("nrem")
         running = Task { [weak self, runner] in
-            if light { await runner.runLight(isCancelled: isCancelled) }
-            else { await runner.runCycle(isCancelled: isCancelled) }
+            if light { await runner.runLight(isCancelled: isCancelled, timeZone: tz) }
+            else { await runner.runCycle(isCancelled: isCancelled, timeZone: tz) }
             await MainActor.run {
                 guard let self else { return }
                 self.running = nil
