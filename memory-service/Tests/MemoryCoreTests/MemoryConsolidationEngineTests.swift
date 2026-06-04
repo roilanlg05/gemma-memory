@@ -420,4 +420,54 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         await engine.cluster()
         XCTAssertEqual(try store.clusterNodes().count, 2)
     }
+
+    func test_tagClusters_writes_tags_to_members_and_collapses_synonyms() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 64)
+        func mk(_ id: String, _ kind: String) -> Node {
+            Node(id: id, kind: kind, label: id, body: id, layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1,
+                 salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                 origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        try store.upsert(mk("m1", NodeKind.preference.rawValue))
+        try store.upsert(mk("m2", NodeKind.preference.rawValue))
+        try store.setTags(nodeId: "old", ["trading"])                       // seed the vocabulary
+        var anchor = mk("clusterA", NodeKind.cluster.rawValue); anchor.label = "cluster"; try store.upsert(anchor)
+        for m in ["m1", "m2"] {
+            try store.upsert(Edge(id: UUID().uuidString, srcId: "clusterA", dstId: m, relation: .belongsToCluster,
+                                  weight: 1, confidence: .probable, createdAt: 1, updatedAt: 1, dirty: true, deleted: false, extra: nil))
+        }
+        let stub = SynonymStubEmbedder(near: ["inversión": "trading"], dim: 64)   // "inversión" embeds == "trading"
+        let json = #"{"tags":["inversión"]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: stub, runtime: CannedRuntime([json]))
+        await engine.tagClusters()
+        XCTAssertEqual(try store.tagsFor(nodeId: "m1"), ["trading"])          // synonym collapsed
+        XCTAssertEqual(try store.tagsFor(nodeId: "m2"), ["trading"])
+        XCTAssertEqual(try store.node(id: "clusterA")?.label, "trading")      // anchor renamed to primary tag
+    }
+}
+
+/// Test embedder: strings in `near` map to the SAME vector as their target (cosine distance 0 →
+/// collapse). Other strings get a deterministic collision-free one-hot vector via a counter.
+final class SynonymStubEmbedder: Embedder, @unchecked Sendable {
+    let near: [String: String]
+    let dim: Int
+    private var registry: [String: Int] = [:]
+    private var nextSlot: Int = 0
+    init(near: [String: String], dim: Int) { self.near = near; self.dim = dim }
+    public var dimension: Int { dim }
+    func embed(_ text: String) throws -> [Float] {
+        let key = near[text] ?? text
+        // Assign a unique slot to each unique key (first time seen)
+        let slot: Int
+        if let existing = registry[key] {
+            slot = existing
+        } else {
+            slot = nextSlot % dim
+            registry[key] = slot
+            nextSlot += 1
+        }
+        var v = [Float](repeating: 0, count: dim)
+        v[slot] = 1
+        return v
+    }
 }

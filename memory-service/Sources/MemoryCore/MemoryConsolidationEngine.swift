@@ -438,6 +438,53 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         onProgress?("+\(made) clusters")
     }
 
+    // MARK: Tagging stage — cluster→tag with embedding synonym-collapse
+
+    private struct TagsOut: Decodable { let tags: [String] }
+
+    /// Label each cluster with 1-3 canonical thematic tags (cluster→tag) and write them onto the
+    /// member nodes. A new tag is collapsed onto an existing near-synonym (embedding ≤ 0.15) so the
+    /// vocabulary stays clean without an LLM curation pass.
+    public func tagClusters() async {
+        let clusters = (try? store.clusterNodes()) ?? []
+        guard !clusters.isEmpty else { return }
+        var vocab: [(tag: String, vec: [Float])] = []
+        for tag in (try? store.distinctTags()) ?? [] {
+            if let v = (try? embedder?.embed(tag)) ?? nil { vocab.append((tag, v)) }
+        }
+        func canonical(_ raw: String) -> String? {
+            let tag = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !tag.isEmpty else { return nil }
+            if let existing = vocab.first(where: { $0.tag == tag }) { return existing.tag }   // exact reuse
+            if let v = (try? embedder?.embed(tag)) ?? nil {
+                if let hit = vocab.min(by: { MemoryStore.cosineDistance($0.vec, v) < MemoryStore.cosineDistance($1.vec, v) }),
+                   MemoryStore.cosineDistance(hit.vec, v) <= 0.15 { return hit.tag }           // synonym collapse
+                vocab.append((tag, v))                                                         // new canonical
+            }
+            return tag
+        }
+        var tagged = 0
+        for cluster in clusters {
+            let memberIds = ((try? store.edges(from: cluster.id)) ?? []).filter { $0.relation == .belongsToCluster }.map { $0.dstId }
+            let members = memberIds.compactMap { try? store.node(id: $0) }
+            guard !members.isEmpty else { continue }
+            let labels = members.map { $0.label }.joined(separator: ", ")
+            let prompt = """
+            These memories form ONE thematic group about the user: \(labels).
+            Give 1-3 short canonical lowercase thematic tags (a single word or two-word phrase each). Output JSON only.
+            Schema: {"tags":["..."]}
+            JSON:
+            """
+            guard let out = parse(await generate(prompt, maxTokens: 128), TagsOut.self) else { continue }
+            let tags = Array(out.tags.compactMap(canonical).prefix(3))
+            guard !tags.isEmpty else { continue }
+            for m in members { try? store.setTags(nodeId: m.id, tags) }
+            if var c = try? store.node(id: cluster.id) { c.label = tags[0]; c.updatedAt = now(); c.dirty = true; try? store.upsert(c) }
+            tagged += 1
+        }
+        onProgress?("tagged \(tagged)/\(clusters.count) clusters")
+    }
+
     // MARK: Clarify — ask the user when consolidation is genuinely unsure about event identity
     private struct ClarifyOut: Decodable { let questions: [String] }
 
@@ -543,7 +590,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             state = SleepCycleState(phase: .nrem, episodeIds: batch, startedAt: now(), focus: focus)
             try? store.saveSleepCycle(state)
         }
-        let order: [SleepPhase] = [.nrem, .summarize, .detect, .embeddings, .cluster, .rem, .reflect, .compress, .clarify, .curate, .shy]
+        let order: [SleepPhase] = [.nrem, .summarize, .detect, .embeddings, .cluster, .tag, .rem, .reflect, .compress, .clarify, .curate, .shy]
         guard let startIdx = order.firstIndex(of: state.phase) else { return }
         for phase in order[startIdx...] {
             if isCancelled() { return }   // leave persisted phase for resume
@@ -574,6 +621,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 await detectFollowUps(episodeTexts: episodeTexts(ids: state.episodeIds))
             case .embeddings: await embedMissing()
             case .cluster: await cluster()
+            case .tag: await tagClusters()
             case .rem: await associate()
             case .reflect: await reflect()
             case .compress: await compress()
