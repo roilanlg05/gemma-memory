@@ -133,6 +133,17 @@ public final class MemoryStore: @unchecked Sendable {
         m.registerMigration("v5-purge-conversation-nodes") { db in
             try MemoryStore.deleteConversationNodes(db)
         }
+        m.registerMigration("v6-service-config") { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS service_config (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    provider TEXT NOT NULL,
+                    baseURL TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    apiKeyCipher BLOB
+                )
+                """)
+        }
         return m
     }
 

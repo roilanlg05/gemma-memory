@@ -58,6 +58,7 @@ public final class Services: @unchecked Sendable {
     public let modelClient: any ModelTextClient
     public let engine: MemoryConsolidationEngine
     public let scheduler: ConsolidationScheduler
+    public let modelConfig: ModelConfigStore
 
     @MainActor
     public init(config: AppConfig) throws {
@@ -72,8 +73,12 @@ public final class Services: @unchecked Sendable {
         self.embedder = embedder
         self.retriever = MemoryRetriever(store: store, embedder: embedder)
         self.bearerToken = config.bearerToken
-        let modelClient = RemoteModelClient(baseURL: URL(string: config.modelURL)!,
-                                            model: config.modelName)
+        let modelConfig = ModelConfigStore(dbQueue: store.dbQueue,
+                                           crypto: ConfigCrypto(bearerToken: config.bearerToken))
+        self.modelConfig = modelConfig
+        let modelClient = RemoteModelClient(configStore: modelConfig,
+                                            defaultBaseURL: URL(string: config.modelURL)!.appendingPathComponent("v1"),
+                                            defaultModel: config.modelName)
         self.modelClient = modelClient
         let engine = MemoryConsolidationEngine(store: store, embedder: embedder,
                                                runtime: modelClient, transcriptStore: transcript)
@@ -107,6 +112,8 @@ public final class Services: @unchecked Sendable {
             isReady: { true },
             hasPendingCycle: { (try? store.loadSleepCycle()) != nil }
         )
+        self.modelConfig = ModelConfigStore(dbQueue: store.dbQueue,
+                                            crypto: ConfigCrypto(bearerToken: bearerToken))
     }
 }
 
@@ -178,6 +185,7 @@ public func buildApp(services: Services, port: Int) async throws -> some Applica
     ConsolidationHandlers(services: services).register(on: v1)
     ScheduleHandlers(services: services).register(on: v1)
     InspectorHandlers(services: services).register(on: v1)
+    ConfigHandlers(services: services).register(on: v1)
     v1.get("/echo") { _, _ -> Response in
         return Response(
             status: .ok,
