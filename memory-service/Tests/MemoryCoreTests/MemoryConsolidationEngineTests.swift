@@ -312,6 +312,17 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(edges.count, 1)
     }
 
+    func test_consolidate_routes_self_kind_to_singleton() async throws {
+        let store = try makeStore()
+        let json = #"{"entities":[{"entity":"Roilan","kind":"self","detail":"el usuario"},{"entity":"María","kind":"person","detail":"esposa"}]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: CannedRuntime([json]))
+        await engine.consolidate(episodeTexts: ["User: me llamo Roilan, mi esposa es María"])
+        XCTAssertEqual(try store.selfNode()?.label, "Roilan")
+        XCTAssertEqual(try store.selfNode()?.kind, NodeKind.selfUser.rawValue)
+        let people = try store.allNodes().filter { $0.kind == NodeKind.person.rawValue }
+        XCTAssertTrue(people.contains { $0.label == "María" && $0.body.contains("esposa") })
+    }
+
     func test_clarify_emits_clarification_node_when_unsure() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 8)
         let ts = TranscriptStore(dbQueue: store.dbQueue)

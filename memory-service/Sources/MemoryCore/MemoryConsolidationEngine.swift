@@ -71,7 +71,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         let prompt = """
         Today is \(todayString()). Resolve any relative date (today/tomorrow/a weekday) to an absolute date and put it in attributes.date as "yyyy-MM-dd".
         Extract durable facts the USER stated about themselves from this conversation. Output JSON only.
-        Use a short canonical `entity` (a noun/name, not a sentence). The "entity" MUST be a short canonical noun/name (1-3 words), NEVER a sentence (e.g. "Roilan", not "the user's name is Roilan"). Choose a `kind`: person, place, \
+        Use a short canonical `entity` (a noun/name, not a sentence). The "entity" MUST be a short canonical noun/name (1-3 words), NEVER a sentence (e.g. "Roilan", not "the user's name is Roilan"). Choose a `kind`: self (the USER's OWN name/identity — the person speaking; there is exactly ONE user, never a third party), person (OTHER people the user mentions — put their relationship role in `detail`, e.g. "esposa", "hija", "amigo", "jefe"), place, \
         preference, fact, trait (personality), task (something to do — set attributes.status "pending"), \
         plan (an intention — set attributes.horizon "short" or "long"), or another short lowercase kind if \
         none fit. Put context in `detail`. Never invent; only what the user actually stated.
@@ -104,6 +104,15 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             emitConflictClarification(title: evLabel, date: date, time: startTime, conflicts: result.conflicts)
                         }
                     }
+                }
+                continue
+            }
+            // The user's own identity → the singleton self node (never a generic person/fact).
+            if e.kind == "self" {
+                let selfLabel = MemoryText.canonicalEntityLabel(e.entity)
+                if !MemoryText.isJunkLabel(selfLabel) {
+                    _ = try? store.upsertSelf(name: selfLabel, detail: e.detail, embedder: embedder)
+                    added += 1
                 }
                 continue
             }
