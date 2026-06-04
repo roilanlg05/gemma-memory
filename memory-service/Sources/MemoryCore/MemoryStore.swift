@@ -144,6 +144,14 @@ public final class MemoryStore: @unchecked Sendable {
                 )
                 """)
         }
+        m.registerMigration("v7-transcript-embedding") { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS transcript_embedding (
+                    turn_id TEXT PRIMARY KEY NOT NULL,
+                    embedding BLOB NOT NULL
+                )
+                """)
+        }
         return m
     }
 

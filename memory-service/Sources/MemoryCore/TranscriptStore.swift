@@ -26,11 +26,14 @@ public final class TranscriptStore: @unchecked Sendable {
     private let dbQueue: DatabaseQueue
     public init(dbQueue: DatabaseQueue) { self.dbQueue = dbQueue }
 
+    @discardableResult
     public func append(threadId: String, turnIndex: Int, role: String, text: String,
-                       now: Double = Date().timeIntervalSince1970) throws {
-        let row = TranscriptRow(id: UUID().uuidString, threadId: threadId, turnIndex: turnIndex,
+                       now: Double = Date().timeIntervalSince1970) throws -> String {
+        let id = UUID().uuidString
+        let row = TranscriptRow(id: id, threadId: threadId, turnIndex: turnIndex,
                                 role: role, text: text, createdAt: now, consolidated: false)
         try dbQueue.write { try row.insert($0) }
+        return id
     }
 
     /// Recent turns for the short-term window, oldest-first, capped by BOTH turn count and a
@@ -106,6 +109,9 @@ public final class TranscriptStore: @unchecked Sendable {
         try dbQueue.write { db in
             try TranscriptRow.filter(ids.contains(Column("id")))
                 .updateAll(db, Column("consolidated").set(to: true))
+            let ph = ids.map { _ in "?" }.joined(separator: ",")
+            try db.execute(sql: "DELETE FROM transcript_embedding WHERE turn_id IN (\(ph))",
+                           arguments: StatementArguments(ids))
         }
     }
 }
