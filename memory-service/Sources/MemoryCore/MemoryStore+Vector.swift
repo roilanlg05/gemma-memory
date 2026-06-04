@@ -46,4 +46,32 @@ extension MemoryStore {
     public static func blobToFloats(_ data: Data) -> [Float] {
         data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
     }
+
+    public func setTranscriptEmbedding(turnId: String, _ vector: [Float]) throws {
+        precondition(vector.count == embeddingDim, "embedding dim mismatch")
+        try dbQueue.write { db in
+            try db.execute(sql: "INSERT OR REPLACE INTO transcript_embedding(turn_id, embedding) VALUES (?, ?)",
+                           arguments: [turnId, Self.floatsToBlob(vector)])
+        }
+    }
+
+    /// KNN over recent transcript-turn embeddings. distance = 1 - cosine, ascending.
+    public func nearestTranscript(to vector: [Float], k: Int) throws -> [(turnId: String, distance: Double)] {
+        let rows: [(String, [Float])] = try dbQueue.read { db in
+            try Row.fetchAll(db, sql: "SELECT turn_id, embedding FROM transcript_embedding")
+                .map { ($0["turn_id"] as String, Self.blobToFloats($0["embedding"] as Data)) }
+        }
+        return rows.map { (turnId: $0.0, distance: Self.cosineDistance($0.1, vector)) }
+            .sorted { $0.distance < $1.distance }
+            .prefix(k).map { $0 }
+    }
+
+    public func deleteTranscriptEmbeddings(turnIds: [String]) throws {
+        guard !turnIds.isEmpty else { return }
+        try dbQueue.write { db in
+            let ph = turnIds.map { _ in "?" }.joined(separator: ",")
+            try db.execute(sql: "DELETE FROM transcript_embedding WHERE turn_id IN (\(ph))",
+                           arguments: StatementArguments(turnIds))
+        }
+    }
 }

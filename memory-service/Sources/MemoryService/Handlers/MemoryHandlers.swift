@@ -27,7 +27,7 @@ struct MemoryHandlers {
         let origin: String?
     }
     struct ForgetBody: Decodable, Sendable { let id: String?; let label: String? }
-    struct RecallBody: Decodable, Sendable { let query: String; let scope: String?; let limit: Int? }
+    struct RecallBody: Decodable, Sendable { let query: String; let scope: String?; let limit: Int?; let threadId: String? }
 
     @Sendable func save(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
         let buf: ByteBuffer
@@ -112,19 +112,40 @@ struct MemoryHandlers {
 
         // MemoryRetriever.retrieve() already unions identity-core; split the returned set so
         // the client can render "always-on identity facts" separately from query-relevant recall.
+        // Embed the query ONCE and reuse it for both node retrieval and recent-turn selection
+        // (avoids a second embedder HTTP round-trip).
+        let qv = try? services.embedder.embed(body.query)
         let retrieved: [Node]
-        do { retrieved = try services.retriever.retrieve(query: body.query, k: limit) }
+        do { retrieved = try services.retriever.retrieve(query: body.query, k: limit, queryVector: qv) }
         catch { return jsonError(.internalServerError, "recall_failed", "\(error)") }
+
+        // Recent relevant turns from OTHER threads that haven't consolidated yet — cross-chat
+        // memory for a chat opened seconds after another, before consolidation runs. The current
+        // thread's turns already ride the conversation window, so they're excluded.
+        var recentTurns: [(role: String, text: String)] = []
+        if let qv {
+            let hits = (try? services.store.nearestTranscript(to: qv, k: limit * 3)) ?? []
+            let turns = (try? services.transcript.rows(ids: hits.map { $0.turnId })) ?? []
+            let byId = Dictionary(turns.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            for hit in hits {
+                guard let t = byId[hit.turnId], !t.consolidated, t.threadId != body.threadId else { continue }
+                recentTurns.append((t.role, t.text))
+                if recentTurns.count >= 4 { break }
+            }
+        }
+
         let coreNodes = (try? services.store.coreMemories(limit: limit)) ?? []
         let coreIds = Set(coreNodes.map { $0.id })
         let recallNodes = retrieved.filter { !coreIds.contains($0.id) }
 
         struct OutNode: Encodable { let id: String; let kind: String; let label: String; let body: String; let extra: String? }
-        struct Payload: Encodable { let core: [OutNode]; let recall: [OutNode] }
+        struct OutTurn: Encodable { let role: String; let text: String }
+        struct Payload: Encodable { let core: [OutNode]; let recall: [OutNode]; let recentTurns: [OutTurn] }
         func toOut(_ n: Node) -> OutNode {
             OutNode(id: n.id, kind: n.kind, label: n.label, body: n.body, extra: n.extra)
         }
-        let payload = Payload(core: coreNodes.map(toOut), recall: recallNodes.map(toOut))
+        let payload = Payload(core: coreNodes.map(toOut), recall: recallNodes.map(toOut),
+                              recentTurns: recentTurns.map { OutTurn(role: $0.role, text: $0.text) })
         let data = try JSONEncoder().encode(payload)
         return Response(status: .ok, headers: [.contentType: "application/json"],
                         body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))

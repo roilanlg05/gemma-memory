@@ -45,6 +45,26 @@ final class TranscriptEndpointsTests: XCTestCase {
             }
         }
     }
+
+    func test_append_embeds_turn_for_recall() async throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 8)
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        let embedder = FakeEmbedder(dimension: 8)
+        let services = await Services(store: store, transcript: ts, embedder: embedder,
+                                      bearerToken: "test-token")
+        let app = try await buildApp(services: services, port: 0)
+        try await app.test(.live) { client in
+            let body = #"{"threadId":"t","role":"user","text":"voy a Varadero","turnIndex":0}"#
+            try await client.execute(uri: "/v1/transcript/append", method: .post,
+                                     headers: [.authorization: "Bearer test-token", .contentType: "application/json"],
+                                     body: ByteBuffer(string: body)) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        let qv = try embedder.embed("voy a Varadero")
+        let hits = try store.nearestTranscript(to: qv, k: 1)
+        XCTAssertEqual(hits.count, 1)
+    }
 }
 
 /// Builds an in-memory test app sharing Services across the suite.

@@ -14,12 +14,15 @@ public final class MemoryRetriever: @unchecked Sendable {
     }
 
     /// Retrieve up to `k` relevant nodes for a query.
-    public func retrieve(query: String, k: Int = 8, now: Double = Date().timeIntervalSince1970) throws -> [Node] {
+    public func retrieve(query: String, k: Int = 8, now: Double = Date().timeIntervalSince1970,
+                         queryVector: [Float]? = nil) throws -> [Node] {
         var pool: [String: Node] = [:]
         var sim: [String: Double] = [:]
 
-        // 1. Vector (semantic)
-        if let embedder, let qv = try? embedder.embed(query) {
+        // 1. Vector (semantic) — reuse a precomputed query vector when provided (avoids a second
+        // embedder round-trip when the caller already embedded the query).
+        let qv = queryVector ?? (embedder.flatMap { try? $0.embed(query) })
+        if let qv {
             for hit in (try? store.nearest(to: qv, k: k * 2)) ?? [] {
                 if let n = try store.node(id: hit.id), !n.deleted {
                     pool[n.id] = n

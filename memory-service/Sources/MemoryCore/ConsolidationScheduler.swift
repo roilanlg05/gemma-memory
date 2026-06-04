@@ -6,9 +6,13 @@ public protocol ConsolidationRunning: AnyObject, Sendable {
     func runCycle(isCancelled: @escaping () -> Bool, timeZone: TimeZone) async
 }
 
-/// Server-side scheduler: drives the consolidation engine on pause/idle timers. Unlike the app
-/// (which uses `@Observable` for SwiftUI), this version is plain `@MainActor` — the service has
+/// Server-side scheduler: drives the consolidation engine on a single debounce timer. Unlike the
+/// app (which uses `@Observable` for SwiftUI), this version is plain `@MainActor` — the service has
 /// no UI, but keeping the actor-bound mutable state model lets us reuse the same logic.
+///
+/// Cloud-model cost note: each cycle spends API tokens, so we no longer arm recurring pause/idle
+/// timers. Instead, after the user goes quiet for `debounceInterval`, we run ONE full cycle.
+/// `runCycle` already no-ops when there's no un-consolidated data.
 @MainActor
 public final class ConsolidationScheduler {
     public enum State: Equatable, Sendable { case idle, reflecting, sleeping(String), done(String) }
@@ -27,10 +31,8 @@ public final class ConsolidationScheduler {
     private let isReady: () -> Bool
     private let hasPendingCycle: () -> Bool
     private let isUserBusy: () -> Bool
-    private let pauseInterval: Duration
-    private let idleInterval: Duration
-    private var pauseTask: Task<Void, Never>?
-    private var idleTask: Task<Void, Never>?
+    private let debounceInterval: Duration
+    private var debounceTask: Task<Void, Never>?
     private var running: Task<Void, Never>?
     // Thread-safe storage instead of a @MainActor-isolated Bool: the engine's
     // `isCancelled` closure is called from the cooperative thread pool (engine
@@ -40,25 +42,32 @@ public final class ConsolidationScheduler {
 
     public init(runner: ConsolidationRunning, isReady: @escaping () -> Bool, hasPendingCycle: @escaping () -> Bool,
                 isUserBusy: @escaping () -> Bool = { false },
-                pauseInterval: Duration = .seconds(15), idleInterval: Duration = .seconds(180)) {
+                debounceInterval: Duration = .seconds(45)) {
         self.runner = runner; self.isReady = isReady; self.hasPendingCycle = hasPendingCycle
         self.isUserBusy = isUserBusy
-        self.pauseInterval = pauseInterval; self.idleInterval = idleInterval
+        self.debounceInterval = debounceInterval
     }
 
-    /// Called at the START of every user turn: cancel any running consolidation. Does NOT arm
-    /// timers — timers are armed at turn end via noteTurnEnded().
+    /// Called at the START of every user turn: cancel any running consolidation and any pending
+    /// debounce. Does NOT arm the debounce — that happens at turn end via noteTurnEnded().
     public func noteUserActivity() {
         cancelFlag.set(true)
         running?.cancel(); running = nil
-        pauseTask?.cancel(); idleTask?.cancel()
+        debounceTask?.cancel()
         state = .idle
     }
 
-    /// Called at the END of every user turn: arms the pause/idle countdown timers.
+    /// Called at the END of every user turn: (re)arms the single debounce timer. After the user
+    /// goes quiet for `debounceInterval`, ONE full cycle runs. Re-arming resets the countdown.
     public func noteTurnEnded() {
-        pauseTask?.cancel(); idleTask?.cancel()
-        scheduleTimers()
+        debounceTask?.cancel()
+        debounceTask = Task { [weak self, debounceInterval] in
+            try? await Task.sleep(for: debounceInterval)
+            guard let self, !Task.isCancelled else { return }
+            // One full cycle after the user goes quiet. runCycle() no-ops if there's no new data;
+            // hasPendingCycle resumes an interrupted cycle.
+            self.launch(light: false)
+        }
     }
 
     public func consolidateNow() { launch(light: false) }
@@ -83,20 +92,6 @@ public final class ConsolidationScheduler {
         let cycleId = "reflect-\(Int(Date().timeIntervalSince1970 * 1000))"
         launch(light: true)
         return cycleId
-    }
-
-    private func scheduleTimers() {
-        pauseTask = Task { [weak self, pauseInterval] in
-            try? await Task.sleep(for: pauseInterval)
-            guard let self, !Task.isCancelled else { return }
-            if self.hasPendingCycle() { self.launch(light: false) }  // resume the interrupted cycle promptly
-            else { self.launch(light: true) }                        // otherwise a light awake reflection
-        }
-        idleTask = Task { [weak self, idleInterval] in
-            try? await Task.sleep(for: idleInterval)
-            guard let self, !Task.isCancelled else { return }
-            self.launch(light: false)
-        }
     }
 
     private func launch(light: Bool) {
