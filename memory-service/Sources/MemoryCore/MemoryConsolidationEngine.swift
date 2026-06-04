@@ -370,13 +370,27 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 existingInsights.insert(key)
                 let t = now()
                 let conf = Confidence(rawValue: ins.confidence ?? "probable") ?? .probable
+                // Identity promotion (CAPA 4): an insight from a substantial cluster (≥4 members),
+                // confidently held, becomes always-injected identity knowledge linked to the self.
+                // KNOWN LIMITATION (B2): a promoted insight is never demoted if its cluster later
+                // shrinks below the threshold — dedup blocks re-mint, so the old identity node persists.
+                // A demotion pass (re-evaluate identity insights vs current cluster membership) is future work.
+                let promote = members.count >= 4 && conf != .maybe
+                let layer: MemoryLayer = promote ? .identity : .daily
+                // 7 (not 8): a derived identity insight ranks just BELOW an asserted permanent fact
+                // (extraction sets those to 8) when coreMemories orders by salience.
                 let node = Node(id: UUID().uuidString, kind: NodeKind.insight.rawValue, label: String(ins.text.prefix(60)),
-                                body: ins.text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3,
-                                decayRate: Decay.defaultDecayRate(for: .daily), confidence: conf, mentionCount: 1,
-                                ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+                                body: ins.text, layer: layer, createdAt: t, updatedAt: t, lastSeenAt: t,
+                                salience: promote ? 7 : 3, decayRate: Decay.defaultDecayRate(for: layer), confidence: conf,
+                                mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
+                                dirty: true, deleted: false, extra: nil)
                 try? store.upsert(node)
                 for s in sources {
                     try? store.upsert(Edge(id: UUID().uuidString, srcId: node.id, dstId: s.id, relation: .derivesFrom, weight: 1,
+                                           confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                }
+                if promote, (try? store.node(id: selfUserID)) != nil {
+                    try? store.upsert(Edge(id: UUID().uuidString, srcId: selfUserID, dstId: node.id, relation: .relatedTo, weight: 1,
                                            confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
                 }
                 added += 1

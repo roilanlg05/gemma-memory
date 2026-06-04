@@ -516,6 +516,31 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(Set(prov.map { $0.dstId }), ["sushi", "ramen"])     // derivesFrom the 2 cited sources
         XCTAssertTrue(try store.edges(from: ins.id).allSatisfy { $0.relation != .relatedTo })  // no relatedTo
     }
+
+    func test_reflect_promotes_large_confident_cluster_to_identity() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        _ = try store.upsertSelf(name: "Roilan", detail: nil, embedder: nil)
+        func mk(_ id: String) -> Node {
+            Node(id: id, kind: NodeKind.preference.rawValue, label: id, body: id, layer: .daily, createdAt: 1, updatedAt: 1,
+                 lastSeenAt: 1, salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1, ttlExpiresAt: nil,
+                 sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        for id in ["calls", "puts", "spreads", "ironcondor"] { try store.upsert(mk(id)) }   // 4 members
+        var anchor = mk("cl"); anchor.kind = NodeKind.cluster.rawValue; anchor.label = "trading"; try store.upsert(anchor)
+        for m in ["calls", "puts", "spreads", "ironcondor"] {
+            try store.upsert(Edge(id: UUID().uuidString, srcId: "cl", dstId: m, relation: .belongsToCluster,
+                                  weight: 1, confidence: .probable, createdAt: 1, updatedAt: 1, dirty: true, deleted: false, extra: nil))
+        }
+        let json = #"{"insights":[{"text":"trades options actively","sourceEntities":["calls","puts"],"confidence":"probable"}]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: CannedRuntime([json]))
+        await engine.reflect()
+        let ins = try XCTUnwrap(try store.allNodes().filter { $0.kind == NodeKind.insight.rawValue }.first)
+        XCTAssertEqual(ins.layer, .identity)                                   // promoted (≥4 members, conf≥probable)
+        XCTAssertEqual(ins.salience, 7)                                        // derived identity insight (below asserted facts at 8)
+        let selfLink = (try store.edges(from: selfUserID)).filter { $0.dstId == ins.id }
+        XCTAssertEqual(selfLink.count, 1)                                      // self → insight edge
+        XCTAssertTrue(try store.coreMemories(limit: 10).contains { $0.id == ins.id })   // injected as identity
+    }
 }
 
 /// Test embedder: strings in `near` map to the SAME vector as their target (cosine distance 0 →
