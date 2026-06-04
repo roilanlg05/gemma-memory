@@ -444,6 +444,14 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(try store.tagsFor(nodeId: "m2"), ["trading"])
         XCTAssertEqual(try store.node(id: "clusterA")?.label, "trading")      // anchor renamed to primary tag
     }
+
+    // MARK: Phase order
+
+    func test_runCycle_order_is_machine_native() {
+        XCTAssertEqual(MemoryConsolidationEngine.cycleOrder,
+                       [.nrem, .summarize, .detect, .embeddings, .cluster, .tag,
+                        .reflect, .compress, .curate, .rem, .clarify, .shy])
+    }
 }
 
 /// Test embedder: strings in `near` map to the SAME vector as their target (cosine distance 0 →

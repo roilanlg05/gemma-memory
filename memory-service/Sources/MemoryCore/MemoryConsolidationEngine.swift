@@ -50,6 +50,13 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         return try? JSONDecoder().decode(T.self, from: d)
     }
 
+    /// Machine-native consolidation phase order (SP-B): embed → cluster → tag → reflect/compress/
+    /// curate (hygiene) → graph-linking LAST (on clean, clustered, deduped nodes) → clarify → forget.
+    static let cycleOrder: [SleepPhase] = [
+        .nrem, .summarize, .detect, .embeddings, .cluster, .tag,
+        .reflect, .compress, .curate, .rem, .clarify, .shy,
+    ]
+
     // MARK: NREM — Consolidate
 
     private func todayString() -> String {
@@ -590,7 +597,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             state = SleepCycleState(phase: .nrem, episodeIds: batch, startedAt: now(), focus: focus)
             try? store.saveSleepCycle(state)
         }
-        let order: [SleepPhase] = [.nrem, .summarize, .detect, .embeddings, .cluster, .tag, .rem, .reflect, .compress, .clarify, .curate, .shy]
+        let order = MemoryConsolidationEngine.cycleOrder
         guard let startIdx = order.firstIndex(of: state.phase) else { return }
         for phase in order[startIdx...] {
             if isCancelled() { return }   // leave persisted phase for resume
