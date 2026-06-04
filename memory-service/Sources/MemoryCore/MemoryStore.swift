@@ -152,6 +152,20 @@ public final class MemoryStore: @unchecked Sendable {
                 )
                 """)
         }
+        m.registerMigration("v8-transcript-seq") { db in
+            try db.alter(table: "transcript") { t in
+                t.add(column: "seq", .integer).notNull().defaults(to: 0)
+            }
+            // Backfill per-thread 1..N (prod transcript is empty post-reset; this handles dev DBs).
+            try db.execute(sql: """
+                WITH ordered AS (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY threadId ORDER BY createdAt ASC, turnIndex ASC, id ASC) AS rn
+                    FROM transcript
+                )
+                UPDATE transcript SET seq = (SELECT rn FROM ordered WHERE ordered.id = transcript.id)
+                """)
+            try db.create(indexOn: "transcript", columns: ["threadId", "seq"])
+        }
         return m
     }
 

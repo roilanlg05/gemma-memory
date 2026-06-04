@@ -33,10 +33,11 @@ final class TranscriptStoreTests: XCTestCase {
         XCTAssertEqual(rows.map { $0.text }, ["bbbb"])
     }
 
-    func test_range_returnsInclusiveTurnSlice() throws {
+    func test_range_returnsInclusiveSeqSlice() throws {
         let s = try makeStore()
         for i in 0..<4 { try s.append(threadId: "t", turnIndex: i, role: "user", text: "m\(i)", now: Double(i)) }
-        let rows = try s.range(threadId: "t", fromTurn: 1, toTurn: 2)
+        // seq is server-assigned 1..N, so seq=2 is "m1" (second appended), seq=3 is "m2"
+        let rows = try s.range(threadId: "t", from: 2, to: 3)
         XCTAssertEqual(rows.map { $0.text }, ["m1", "m2"])
     }
 

@@ -8,14 +8,15 @@ public struct TranscriptRow: Codable, FetchableRecord, PersistableRecord, Equata
     public var id: String
     public var threadId: String
     public var turnIndex: Int
+    public var seq: Int
     public var role: String
     public var text: String
     public var createdAt: Double
     public var consolidated: Bool
 
-    public init(id: String, threadId: String, turnIndex: Int, role: String, text: String,
+    public init(id: String, threadId: String, turnIndex: Int, seq: Int, role: String, text: String,
                 createdAt: Double, consolidated: Bool) {
-        self.id = id; self.threadId = threadId; self.turnIndex = turnIndex
+        self.id = id; self.threadId = threadId; self.turnIndex = turnIndex; self.seq = seq
         self.role = role; self.text = text; self.createdAt = createdAt; self.consolidated = consolidated
     }
 }
@@ -30,9 +31,14 @@ public final class TranscriptStore: @unchecked Sendable {
     public func append(threadId: String, turnIndex: Int, role: String, text: String,
                        now: Double = Date().timeIntervalSince1970) throws -> String {
         let id = UUID().uuidString
-        let row = TranscriptRow(id: id, threadId: threadId, turnIndex: turnIndex,
-                                role: role, text: text, createdAt: now, consolidated: false)
-        try dbQueue.write { try row.insert($0) }
+        try dbQueue.write { db in
+            let maxSeq = try Int.fetchOne(db,
+                sql: "SELECT COALESCE(MAX(seq), 0) FROM transcript WHERE threadId = ?",
+                arguments: [threadId]) ?? 0
+            let row = TranscriptRow(id: id, threadId: threadId, turnIndex: turnIndex, seq: maxSeq + 1,
+                                    role: role, text: text, createdAt: now, consolidated: false)
+            try row.insert(db)
+        }
         return id
     }
 
@@ -59,13 +65,13 @@ public final class TranscriptStore: @unchecked Sendable {
         return kept.reversed()
     }
 
-    /// Inclusive slice of a thread by turnIndex — for N4 drill-down (M2d-3).
-    public func range(threadId: String, fromTurn: Int, toTurn: Int) throws -> [TranscriptRow] {
+    /// Inclusive slice of a thread by seq — for N4 drill-down (M2d-3) and summary expansion.
+    public func range(threadId: String, from: Int, to: Int) throws -> [TranscriptRow] {
         try dbQueue.read { db in
             try TranscriptRow
                 .filter(Column("threadId") == threadId)
-                .filter(Column("turnIndex") >= fromTurn && Column("turnIndex") <= toTurn)
-                .order(Column("createdAt").asc)
+                .filter(Column("seq") >= from && Column("seq") <= to)
+                .order(Column("seq").asc)
                 .fetchAll(db)
         }
     }
