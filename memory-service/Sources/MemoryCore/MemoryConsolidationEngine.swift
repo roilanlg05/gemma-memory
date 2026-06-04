@@ -406,6 +406,38 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         if done > 0 { onProgress?("+\(done) embeddings") }
     }
 
+    // MARK: Clustering stage — k-NN communities → ephemeral cluster anchors + belongsToCluster edges
+
+    /// Recompute clusters globally: build a k-NN graph over clusterable embeddings, run
+    /// label-propagation, and rebuild ephemeral `cluster` anchors + `belongsToCluster` edges.
+    public func cluster() async {
+        let nodes = (try? store.allNodes()) ?? []
+        let clusterableIds = Set(nodes.filter { Self.clusterableKinds.contains($0.kind) }.map { $0.id })
+        let embs = ((try? store.allEmbeddings()) ?? []).filter { clusterableIds.contains($0.id) }
+        try? store.clearClusters()
+        guard embs.count >= 2 else { return }
+        let adj = Clustering.knnGraph(embs.map { (id: $0.id, vec: $0.vec) }, k: 8, maxDistance: 0.25)
+        let communities = Clustering.labelPropagation(adj, minSize: 2)
+        let t = now()
+        var made = 0
+        for community in communities {
+            let anchorId = UUID().uuidString
+            let anchor = Node(id: anchorId, kind: NodeKind.cluster.rawValue, label: "cluster", body: "",
+                              layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t,
+                              salience: Double(community.count), decayRate: 0, confidence: .probable,
+                              mentionCount: community.count, ttlExpiresAt: nil, sourceRef: nil,
+                              origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+            try? store.upsert(anchor)
+            for memberId in community {
+                try? store.upsert(Edge(id: UUID().uuidString, srcId: anchorId, dstId: memberId,
+                                       relation: .belongsToCluster, weight: 1, confidence: .probable,
+                                       createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+            }
+            made += 1
+        }
+        onProgress?("+\(made) clusters")
+    }
+
     // MARK: Clarify — ask the user when consolidation is genuinely unsure about event identity
     private struct ClarifyOut: Decodable { let questions: [String] }
 
@@ -511,7 +543,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             state = SleepCycleState(phase: .nrem, episodeIds: batch, startedAt: now(), focus: focus)
             try? store.saveSleepCycle(state)
         }
-        let order: [SleepPhase] = [.nrem, .summarize, .detect, .embeddings, .rem, .reflect, .compress, .clarify, .curate, .shy]
+        let order: [SleepPhase] = [.nrem, .summarize, .detect, .embeddings, .cluster, .rem, .reflect, .compress, .clarify, .curate, .shy]
         guard let startIdx = order.firstIndex(of: state.phase) else { return }
         for phase in order[startIdx...] {
             if isCancelled() { return }   // leave persisted phase for resume
@@ -541,6 +573,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             case .detect:
                 await detectFollowUps(episodeTexts: episodeTexts(ids: state.episodeIds))
             case .embeddings: await embedMissing()
+            case .cluster: await cluster()
             case .rem: await associate()
             case .reflect: await reflect()
             case .compress: await compress()

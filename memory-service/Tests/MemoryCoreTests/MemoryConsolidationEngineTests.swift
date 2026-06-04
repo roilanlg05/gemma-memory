@@ -394,4 +394,30 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertTrue(q.body.contains("Carlos"))
         XCTAssertEqual(NodeAttributes.from(q.extra).status, "pending")
     }
+
+    func test_cluster_builds_anchors_and_belongsTo_edges() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let seeds: [(String, [Float])] = [
+            ("a", [1, 0, 0, 0]), ("b", [0.98, 0.02, 0, 0]), ("c", [0.97, 0.03, 0, 0]),
+            ("x", [0, 0, 1, 0]), ("y", [0, 0, 0.98, 0.02]), ("z", [0, 0, 0.97, 0.03]),
+        ]
+        for (id, vec) in seeds {
+            let n = Node(id: id, kind: NodeKind.preference.rawValue, label: id, body: id, layer: .daily,
+                         createdAt: 1, updatedAt: 1, lastSeenAt: 1, salience: 3, decayRate: 0,
+                         confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                         origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+            try store.upsert(n); try store.setEmbedding(nodeId: id, vec)
+        }
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: CannedRuntime([]))
+        await engine.cluster()
+        let clusters = try store.clusterNodes()            // allNodes() excludes cluster kind — use clusterNodes()
+        XCTAssertEqual(clusters.count, 2)
+        for c in clusters {
+            let members = (try store.edges(from: c.id)).filter { $0.relation == .belongsToCluster }
+            XCTAssertEqual(members.count, 3)
+        }
+        // re-running rebuilds globally (still 2, no duplicate anchors)
+        await engine.cluster()
+        XCTAssertEqual(try store.clusterNodes().count, 2)
+    }
 }
