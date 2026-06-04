@@ -11,6 +11,7 @@ struct TranscriptHandlers {
     func register(on group: RouterGroup<BasicRequestContext>) {
         group.post("/transcript/append", use: append)
         group.get("/conversation/window", use: window)
+        group.get("/transcript/range", use: range)
     }
 
     struct AppendBody: Decodable, Sendable {
@@ -52,6 +53,25 @@ struct TranscriptHandlers {
         struct OutPayload: Encodable { let turns: [OutTurn] }
         let out = OutPayload(turns: rows.map { OutTurn(role: $0.role, text: $0.text) })
         let data = try JSONEncoder().encode(out)
+        return Response(status: .ok, headers: [.contentType: "application/json"],
+                        body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+    }
+
+    @Sendable func range(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
+        let q = req.uri.queryParameters
+        guard let chatId = q["chat_id"].map(String.init),
+              let from = q["from"].flatMap({ Int(String($0)) }) else {
+            return jsonError(.badRequest, "bad_request", "chat_id and from required")
+        }
+        let toRaw = q["to"].flatMap { Int(String($0)) } ?? from
+        let cappedTo = min(toRaw, from + 79)        // max 80 messages
+        let truncated = toRaw > cappedTo
+        let rows = (try? services.transcript.range(threadId: chatId, from: from, to: cappedTo)) ?? []
+        struct OutRow: Encodable { let seq: Int; let role: String; let text: String; let createdAt: Double }
+        struct Payload: Encodable { let messages: [OutRow]; let truncated: Bool }
+        let payload = Payload(messages: rows.map { OutRow(seq: $0.seq, role: $0.role, text: $0.text, createdAt: $0.createdAt) },
+                              truncated: truncated)
+        let data = try JSONEncoder().encode(payload)
         return Response(status: .ok, headers: [.contentType: "application/json"],
                         body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
     }

@@ -65,6 +65,36 @@ final class TranscriptEndpointsTests: XCTestCase {
         let hits = try store.nearestTranscript(to: qv, k: 1)
         XCTAssertEqual(hits.count, 1)
     }
+
+    func test_transcript_range_returns_rows_by_seq_and_caps_at_80() async throws {
+        let store = try MemoryStore(path: ":memory:", embeddingDim: 8)
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        let services = await Services(store: store, transcript: ts, embedder: FakeEmbedder(dimension: 8),
+                                      bearerToken: "test-token")
+        let app = try await buildApp(services: services, port: 0)
+        for i in 1...100 { _ = try services.transcript.append(threadId: "g7y", turnIndex: i, role: "user", text: "m\(i)") }
+        struct Out: Decodable {
+            struct R: Decodable { let seq: Int; let role: String; let text: String }
+            let messages: [R]; let truncated: Bool
+        }
+        try await app.test(.live) { client in
+            try await client.execute(uri: "/v1/transcript/range?chat_id=g7y&from=21&to=23", method: .get,
+                headers: [.authorization: "Bearer test-token"]) { res in
+                XCTAssertEqual(res.status, .ok)
+                let out = try JSONDecoder().decode(Out.self, from: Data(buffer: res.body))
+                XCTAssertEqual(out.messages.map { $0.seq }, [21, 22, 23])
+                XCTAssertFalse(out.truncated)
+            }
+            try await client.execute(uri: "/v1/transcript/range?chat_id=g7y&from=1&to=100", method: .get,
+                headers: [.authorization: "Bearer test-token"]) { res in
+                let out = try JSONDecoder().decode(Out.self, from: Data(buffer: res.body))
+                XCTAssertEqual(out.messages.count, 80)        // capped
+                XCTAssertTrue(out.truncated)
+                XCTAssertEqual(out.messages.first?.seq, 1)
+                XCTAssertEqual(out.messages.last?.seq, 80)
+            }
+        }
+    }
 }
 
 /// Builds an in-memory test app sharing Services across the suite.
