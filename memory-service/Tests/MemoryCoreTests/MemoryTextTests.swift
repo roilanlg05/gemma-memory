@@ -32,4 +32,15 @@ final class MemoryTextTests: XCTestCase {
         XCTAssertFalse(MemoryText.isJunkLabel("sushi"))
         XCTAssertFalse(MemoryText.isJunkLabel("Juan"))
     }
+
+    func testIsJunkLabelRejectsCategoryWords() {
+        // NodeKind rawValues and hub labels must never become entities.
+        XCTAssertTrue(MemoryText.isJunkLabel("People"))
+        XCTAssertTrue(MemoryText.isJunkLabel("place"))
+        XCTAssertTrue(MemoryText.isJunkLabel("Conversations"))
+        XCTAssertTrue(MemoryText.isJunkLabel("Tasks"))
+        // Real names still pass.
+        XCTAssertFalse(MemoryText.isJunkLabel("Roilan"))
+        XCTAssertFalse(MemoryText.isJunkLabel("Varadero"))
+    }
 }

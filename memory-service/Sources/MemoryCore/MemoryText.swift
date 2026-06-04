@@ -68,6 +68,10 @@ public enum MemoryText {
             "preferences", "preferencias", "preference", "stuff", "things", "cosas",
             "it", "that", "this", "eso", "esto", "user", "usuario"
         ]
-        return junk.contains(k)
+        if junk.contains(k) { return true }
+        // Reserved: NodeKind raw values and their hub labels are categories, never entities.
+        let reserved = Set(NodeKind.allCases.map { $0.rawValue.lowercased() }
+                         + NodeKind.allCases.map { $0.hubLabel.lowercased() })
+        return reserved.contains(k)
     }
 }
