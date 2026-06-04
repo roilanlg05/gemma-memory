@@ -233,6 +233,23 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(try store.allNodes().filter { $0.kind == NodeKind.summary.rawValue }.count, 1)
     }
 
+    func test_summaryGroups_uses_seq_for_range() throws {
+        let rows = [
+            TranscriptRow(id: "1", threadId: "A", turnIndex: 0, seq: 1, role: "user", text: "hola", createdAt: 1, consolidated: false),
+            TranscriptRow(id: "2", threadId: "A", turnIndex: 0, seq: 2, role: "assistant", text: "qué tal", createdAt: 2, consolidated: false),
+            TranscriptRow(id: "3", threadId: "A", turnIndex: 1, seq: 3, role: "user", text: "bien", createdAt: 3, consolidated: false),
+            TranscriptRow(id: "4", threadId: "B", turnIndex: 0, seq: 1, role: "user", text: "otro chat", createdAt: 4, consolidated: false),
+        ]
+        let groups = MemoryConsolidationEngine.summaryGroups(rows)
+        let a = groups.first { $0.threadId == "A" }
+        XCTAssertEqual(a?.range, 1...3)                 // seq-based, not turnIndex (which is 0..1)
+        XCTAssertEqual(a?.texts.count, 3)
+        XCTAssertEqual(a?.texts.first, "User: hola")
+        XCTAssertEqual(a?.texts[1], "Gemma: qué tal")
+        let b = groups.first { $0.threadId == "B" }
+        XCTAssertEqual(b?.range, 1...1)
+    }
+
     func test_consolidate_stores_absolute_date_for_a_task() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 8)
         let ts = TranscriptStore(dbQueue: store.dbQueue)
