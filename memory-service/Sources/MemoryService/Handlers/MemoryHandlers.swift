@@ -10,10 +10,12 @@ struct MemoryHandlers {
     let services: Services
 
     func register(on group: RouterGroup<BasicRequestContext>) {
-        group.post("/memory/save",   use: save)
-        group.post("/memory/forget", use: forget)
-        group.post("/memory/recall", use: recall)
-        group.get ("/memory/expand", use: expand)
+        group.post("/memory/save",     use: save)
+        group.post("/memory/forget",   use: forget)
+        group.post("/memory/recall",   use: recall)
+        group.get ("/memory/expand",   use: expand)
+        group.get ("/memory/tags",     use: tags)
+        group.get ("/memory/by_topic", use: byTopic)
     }
 
     struct SaveBody: Decodable, Sendable {
@@ -198,6 +200,64 @@ struct MemoryHandlers {
         let payload = Payload(transcript: result.rows.map { OutTurn(role: $0.role, text: $0.text) },
                               summaryLabel: result.summaryLabel)
         let data = try JSONEncoder().encode(payload)
+        return Response(status: .ok, headers: [.contentType: "application/json"],
+                        body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+    }
+
+    /// GET /v1/memory/tags — returns all distinct tags sorted alphabetically.
+    /// GET /v1/memory/tags — the distinct thematic tags the user has memories about.
+    /// Best-effort read: a store failure degrades to an empty list (never a 500), so the agent's
+    /// list_topics tool just reports "no topics" rather than erroring the turn.
+    @Sendable func tags(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
+        struct Payload: Encodable { let tags: [String] }
+        let payload = Payload(tags: (try? services.store.distinctTags()) ?? [])
+        let data = try JSONEncoder().encode(payload)
+        return Response(status: .ok, headers: [.contentType: "application/json"],
+                        body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+    }
+
+    /// GET /v1/memory/by_topic?topic=<text>[&limit=N]
+    /// Resolves a natural-language topic to the nearest canonical tag (exact-match first,
+    /// then embedding cosine ≤ 0.2), then returns every node carrying that tag.
+    @Sendable func byTopic(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
+        let q = req.uri.queryParameters
+        guard let topicRaw = q["topic"], !String(topicRaw).trimmingCharacters(in: .whitespaces).isEmpty else {
+            return jsonError(.badRequest, "bad_request", "topic required")
+        }
+        let topic = String(topicRaw)
+        let limit = q["limit"].flatMap { Int(String($0)) } ?? 100
+        let vocab = (try? services.store.distinctTags()) ?? []
+
+        // 1. Exact case-insensitive match.
+        var resolved = vocab.first { $0.caseInsensitiveCompare(topic) == .orderedSame }
+
+        // 2. Embedding nearest-neighbour with cosine distance ≤ 0.2 (strong semantic overlap).
+        // O(|vocab|) embed calls, only when exact-match fails — fine at personal-memory scale
+        // (tens of tags); cache the tag embeddings if the vocabulary ever grows large.
+        if resolved == nil, let tv = try? services.embedder.embed(topic) {
+            var best: (tag: String, dist: Double)?
+            for t in vocab {
+                guard let v = try? services.embedder.embed(t) else { continue }
+                let d = MemoryStore.cosineDistance(tv, v)
+                if best == nil || d < best!.dist { best = (t, d) }
+            }
+            if let b = best, b.dist <= 0.2 { resolved = b.tag }
+        }
+
+        struct OutNode: Encodable { let kind: String; let label: String; let body: String }
+        struct Payload: Encodable { let tag: String; let nodes: [OutNode] }
+
+        guard let tag = resolved else {
+            // No tag matched → empty result (tag "" is the no-match sentinel; the client checks nodes).
+            let data = try JSONEncoder().encode(Payload(tag: "", nodes: []))
+            return Response(status: .ok, headers: [.contentType: "application/json"],
+                            body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+        }
+
+        let ids = (try? services.store.nodesWithTag(tag)) ?? []
+        let nodes = ids.prefix(limit).compactMap { try? services.store.node(id: $0) }
+            .map { OutNode(kind: $0.kind, label: $0.label, body: $0.body) }
+        let data = try JSONEncoder().encode(Payload(tag: tag, nodes: nodes))
         return Response(status: .ok, headers: [.contentType: "application/json"],
                         body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
     }
