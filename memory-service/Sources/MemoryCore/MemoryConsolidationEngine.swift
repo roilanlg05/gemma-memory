@@ -337,47 +337,64 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     private struct InsightsOut: Decodable { struct I: Decodable { let text: String; let sourceEntities: [String]; let confidence: String? }; let insights: [I] }
 
     public func reflect() async {
-        let nodes = (try? store.allNodes().filter { $0.kind != NodeKind.conversation.rawValue && $0.kind != NodeKind.insight.rawValue }) ?? []
-        guard nodes.count >= 2 else { return }
-        let labels = nodes.prefix(60).map { "\($0.kind): \($0.label)" }.joined(separator: "\n")
-        let prompt = """
-        These memories are all about ONE person (the user). Infer a few higher-level insights or patterns about them. Output JSON only.
-        Each insight MUST be grounded in at least TWO of the listed entities (cite their exact labels in sourceEntities). Look for themes (e.g. shared interests, lifestyle, goals). Do not speculate beyond the evidence.
-        Example: from `preference: sushi`, `preference: ramen` → {"insights":[{"text":"enjoys Japanese food","sourceEntities":["sushi","ramen"],"confidence":"probable"}]}
-        Schema: {"insights":[{"text":"...","sourceEntities":["label1","label2"],"confidence":"probable|maybe"}]}
-        Memories:
-        \(labels)
-        JSON:
-        """
-        guard let out = parse(await generate(prompt, maxTokens: 512), InsightsOut.self) else { return }
-        // Label-only resolution by design: sources must be among the entities shown to the model
-        // (unlike `associate`, which also falls back to semantic nearest-neighbor).
-        func resolve(_ label: String) -> Node? {
-            let key = MemoryText.dedupKey(label)
-            return nodes.first { MemoryText.dedupKey($0.label) == key }
-        }
-        // Dedup: runLight runs reflect() frequently over stable memory; without this guard,
-        // each run would re-mint near-identical insight nodes with fresh UUIDs.
-        var existingInsights = Set(((try? store.allNodes()) ?? []).filter { $0.kind == NodeKind.insight.rawValue }.map { MemoryText.dedupKey($0.body) })
+        let clusters = (try? store.clusterNodes()) ?? []
+        guard !clusters.isEmpty else { return }
+        // Dedup against insights already in the store (runLight reflects frequently over stable clusters).
+        var existingInsights = Set(((try? store.allNodes()) ?? [])
+            .filter { $0.kind == NodeKind.insight.rawValue }.map { MemoryText.dedupKey($0.body) })
         var added = 0
-        for ins in out.insights {
-            let sources = ins.sourceEntities.compactMap(resolve)
-            if Set(sources.map { $0.id }).count < 2 { continue }   // anti-fabrication
-            let key = MemoryText.dedupKey(ins.text)
-            if existingInsights.contains(key) { continue }         // already have this insight
-            existingInsights.insert(key)                            // collapse duplicates within this batch too
-            let t = now()
-            let conf = Confidence(rawValue: ins.confidence ?? "probable") ?? .probable
-            let node = Node(id: UUID().uuidString, kind: NodeKind.insight.rawValue, label: String(ins.text.prefix(60)),
-                            body: ins.text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3,
-                            decayRate: Decay.defaultDecayRate(for: .daily), confidence: conf, mentionCount: 1,
-                            ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
-            try? store.upsert(node)
-            for s in sources {
-                try? store.upsert(Edge(id: UUID().uuidString, srcId: node.id, dstId: s.id, relation: .relatedTo, weight: 1,
-                                       confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+        for cluster in clusters {
+            let memberIds = ((try? store.edges(from: cluster.id)) ?? []).filter { $0.relation == .belongsToCluster }.map { $0.dstId }
+            let members = memberIds.compactMap { try? store.node(id: $0) }
+            guard members.count >= 3 else { continue }   // need a substantial cluster to abstract from
+            let labels = members.map { "\($0.kind): \($0.label)" }.joined(separator: "\n")
+            let prompt = """
+            These memories form ONE thematic group about the user. Infer 1-2 higher-level insights or patterns they reveal. Output JSON only.
+            Each insight MUST be grounded in at least TWO of the listed entities (cite their exact labels in sourceEntities). Do not speculate beyond the evidence.
+            Example: from `preference: sushi`, `preference: ramen` → {"insights":[{"text":"enjoys Japanese food","sourceEntities":["sushi","ramen"],"confidence":"probable"}]}
+            Schema: {"insights":[{"text":"...","sourceEntities":["label1","label2"],"confidence":"probable|maybe"}]}
+            Memories:
+            \(labels)
+            JSON:
+            """
+            guard let out = parse(await generate(prompt, maxTokens: 512), InsightsOut.self) else { continue }
+            func resolve(_ label: String) -> Node? {
+                let key = MemoryText.dedupKey(label)
+                return members.first { MemoryText.dedupKey($0.label) == key }
             }
-            added += 1
+            for ins in out.insights {
+                let sources = ins.sourceEntities.compactMap(resolve)
+                if Set(sources.map { $0.id }).count < 2 { continue }   // anti-fabrication: grounded in ≥2 members
+                let key = MemoryText.dedupKey(ins.text)
+                if existingInsights.contains(key) { continue }
+                existingInsights.insert(key)
+                let t = now()
+                let conf = Confidence(rawValue: ins.confidence ?? "probable") ?? .probable
+                // Identity promotion (CAPA 4): an insight from a substantial cluster (≥4 members),
+                // confidently held, becomes always-injected identity knowledge linked to the self.
+                // KNOWN LIMITATION (B2): a promoted insight is never demoted if its cluster later
+                // shrinks below the threshold — dedup blocks re-mint, so the old identity node persists.
+                // A demotion pass (re-evaluate identity insights vs current cluster membership) is future work.
+                let promote = members.count >= 4 && conf != .maybe
+                let layer: MemoryLayer = promote ? .identity : .daily
+                // 7 (not 8): a derived identity insight ranks just BELOW an asserted permanent fact
+                // (extraction sets those to 8) when coreMemories orders by salience.
+                let node = Node(id: UUID().uuidString, kind: NodeKind.insight.rawValue, label: String(ins.text.prefix(60)),
+                                body: ins.text, layer: layer, createdAt: t, updatedAt: t, lastSeenAt: t,
+                                salience: promote ? 7 : 3, decayRate: Decay.defaultDecayRate(for: layer), confidence: conf,
+                                mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
+                                dirty: true, deleted: false, extra: nil)
+                try? store.upsert(node)
+                for s in sources {
+                    try? store.upsert(Edge(id: UUID().uuidString, srcId: node.id, dstId: s.id, relation: .derivesFrom, weight: 1,
+                                           confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                }
+                if promote, (try? store.node(id: selfUserID)) != nil {
+                    try? store.upsert(Edge(id: UUID().uuidString, srcId: selfUserID, dstId: node.id, relation: .relatedTo, weight: 1,
+                                           confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                }
+                added += 1
+            }
         }
         onProgress?("+\(added) insights")
     }
@@ -664,8 +681,9 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         if isCancelled() { return }
         await associate()
         if isCancelled() { return }
-        await reflect()
-        if isCancelled() { return }
+        // reflect() is now cluster-dependent (SP-B2) and clustering is sleep-only (SP-B1), so
+        // reflection runs in the full sleep cycle (after cluster()), not on the frequent awake
+        // path — running it here would only re-scan stale clusters and waste model calls.
         await clarify()
     }
 }
