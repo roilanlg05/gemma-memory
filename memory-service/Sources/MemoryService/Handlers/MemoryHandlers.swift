@@ -16,6 +16,7 @@ struct MemoryHandlers {
         group.get ("/memory/expand",   use: expand)
         group.get ("/memory/tags",     use: tags)
         group.get ("/memory/by_topic", use: byTopic)
+        group.get ("/memory/why",      use: why)
     }
 
     struct SaveBody: Decodable, Sendable {
@@ -258,6 +259,39 @@ struct MemoryHandlers {
         let nodes = ids.prefix(limit).compactMap { try? services.store.node(id: $0) }
             .map { OutNode(kind: $0.kind, label: $0.label, body: $0.body) }
         let data = try JSONEncoder().encode(Payload(tag: tag, nodes: nodes))
+        return Response(status: .ok, headers: [.contentType: "application/json"],
+                        body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+    }
+
+    /// GET /v1/memory/why?claim=<text> — justify a belief: find the matching insight and return the
+    /// source memories it `derivesFrom`. Best-effort read (empty result, never 500).
+    @Sendable func why(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
+        let q = req.uri.queryParameters
+        guard let claimRaw = q["claim"], !String(claimRaw).trimmingCharacters(in: .whitespaces).isEmpty else {
+            return jsonError(.badRequest, "bad_request", "claim required")
+        }
+        let claim = String(claimRaw)
+        let insightKind = NodeKind.insight.rawValue
+        // Locate the best-matching insight: keyword (FTS) first, then semantic fallback.
+        var insight = ((try? services.store.searchFTS(query: claim, limit: 10)) ?? []).first { $0.kind == insightKind }
+        if insight == nil, let cv = try? services.embedder.embed(claim) {
+            // Wider net than FTS (k:20): `nearest` ranks ALL kinds, so most hits won't be insights;
+            // also skip soft-deleted nodes (nearest scans node_embedding without a deleted filter).
+            let hits = (try? services.store.nearest(to: cv, k: 20)) ?? []
+            for h in hits where h.distance <= 0.35 {
+                if let n = try? services.store.node(id: h.id), n.kind == insightKind, !n.deleted { insight = n; break }
+            }
+        }
+        struct OutNode: Encodable { let kind: String; let label: String; let body: String }
+        struct Payload: Encodable { let insight: String; let sources: [OutNode] }
+        guard let ins = insight else {
+            let data = try JSONEncoder().encode(Payload(insight: "", sources: []))
+            return Response(status: .ok, headers: [.contentType: "application/json"],
+                            body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
+        }
+        let sourceIds = ((try? services.store.edges(from: ins.id)) ?? []).filter { $0.relation == .derivesFrom }.map { $0.dstId }
+        let sources = sourceIds.compactMap { try? services.store.node(id: $0) }.map { OutNode(kind: $0.kind, label: $0.label, body: $0.body) }
+        let data = try JSONEncoder().encode(Payload(insight: ins.body, sources: sources))
         return Response(status: .ok, headers: [.contentType: "application/json"],
                         body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
     }

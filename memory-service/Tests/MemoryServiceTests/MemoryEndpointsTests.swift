@@ -212,6 +212,52 @@ final class MemoryEndpointsTests: XCTestCase {
         }
     }
 
+    func test_memory_why_traces_insight_to_sources() async throws {
+        let (app, services) = try await makeAppWithServices()
+        func mk(_ id: String, _ kind: String, _ label: String, _ body: String) throws {
+            let n = Node(id: id, kind: kind, label: label, body: body, layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1,
+                         salience: 3, decayRate: 0, confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
+                         origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+            try services.store.upsert(n)
+        }
+        try mk("ins", NodeKind.insight.rawValue, "trades options actively", "trades options actively")
+        try mk("s1", NodeKind.preference.rawValue, "calls", "calls")
+        try mk("s2", NodeKind.preference.rawValue, "puts", "puts")
+        for s in ["s1", "s2"] {
+            try services.store.upsert(Edge(id: UUID().uuidString, srcId: "ins", dstId: s, relation: .derivesFrom,
+                                           weight: 1, confidence: .probable, createdAt: 1, updatedAt: 1, dirty: true, deleted: false, extra: nil))
+        }
+        struct Why: Decodable { struct N: Decodable { let label: String }; let insight: String; let sources: [N] }
+        try await app.test(.live) { client in
+            try await client.execute(uri: "/v1/memory/why?claim=trades%20options", method: .get,
+                headers: [.authorization: "Bearer test-token"]) { res in
+                let out = try JSONDecoder().decode(Why.self, from: Data(buffer: res.body))
+                XCTAssertEqual(out.insight, "trades options actively")
+                XCTAssertEqual(Set(out.sources.map { $0.label }), ["calls", "puts"])
+            }
+        }
+    }
+
+    func test_memory_why_empty_when_no_insight_exists() async throws {
+        let (app, services) = try await makeAppWithServices()
+        // A non-insight node exists, but NO insight → why can't locate anything → empty (deterministic:
+        // both the FTS and semantic paths filter to kind==insight, of which there are none).
+        let n = Node(id: "p", kind: NodeKind.preference.rawValue, label: "calls", body: "calls", layer: .daily,
+                     createdAt: 1, updatedAt: 1, lastSeenAt: 1, salience: 3, decayRate: 0, confidence: .probable,
+                     mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
+                     dirty: true, deleted: false, extra: nil)
+        try services.store.upsert(n)
+        struct Why: Decodable { struct N: Decodable { let label: String }; let insight: String; let sources: [N] }
+        try await app.test(.live) { client in
+            try await client.execute(uri: "/v1/memory/why?claim=calls", method: .get,
+                headers: [.authorization: "Bearer test-token"]) { res in
+                let out = try JSONDecoder().decode(Why.self, from: Data(buffer: res.body))
+                XCTAssertTrue(out.insight.isEmpty)
+                XCTAssertTrue(out.sources.isEmpty)
+            }
+        }
+    }
+
     func test_expand_returns_transcript_for_known_summary() async throws {
         let app = try await makeApp()
         try await app.test(.live) { client in
