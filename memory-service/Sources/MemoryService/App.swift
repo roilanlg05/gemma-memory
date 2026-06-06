@@ -59,6 +59,8 @@ public final class Services: @unchecked Sendable {
     public let engine: MemoryConsolidationEngine
     public let scheduler: ConsolidationScheduler
     public let modelConfig: ModelConfigStore
+    /// Tool-calling client used by the agentic gateway (`POST /v1/agent/turn`).
+    public let agentClient: any AgentModelClient
 
     @MainActor
     public init(config: AppConfig) throws {
@@ -90,14 +92,22 @@ public final class Services: @unchecked Sendable {
             isReady: { true },
             hasPendingCycle: { (try? store.loadSleepCycle()) != nil }
         )
+        // The agent gateway reuses the same model config (cloud/local) as consolidation.
+        self.agentClient = ToolCallingClient(
+            configStore: modelConfig,
+            defaultBaseURL: URL(string: config.modelURL)!.appendingPathComponent("v1")
+        )
     }
 
     /// Test-only injection point. `modelClient` defaults to a NoOp so older tests (Task 7/8)
     /// that only pass `store/transcript/embedder/bearerToken` keep compiling.
+    /// `agentClient` defaults to a `ToolCallingClient` built from the in-memory `modelConfig`
+    /// — override with a canned client in endpoint tests that exercise the agent turn handler.
     @MainActor
     public init(store: MemoryStore, transcript: TranscriptStore, embedder: any Embedder,
                 bearerToken: String,
-                modelClient: any ModelTextClient = DefaultNoOpModelClient()) {
+                modelClient: any ModelTextClient = DefaultNoOpModelClient(),
+                agentClient: (any AgentModelClient)? = nil) {
         self.store = store
         self.transcript = transcript
         self.embedder = embedder
@@ -112,8 +122,13 @@ public final class Services: @unchecked Sendable {
             isReady: { true },
             hasPendingCycle: { (try? store.loadSleepCycle()) != nil }
         )
-        self.modelConfig = ModelConfigStore(dbQueue: store.dbQueue,
+        let modelConfig = ModelConfigStore(dbQueue: store.dbQueue,
                                             crypto: ConfigCrypto(bearerToken: bearerToken))
+        self.modelConfig = modelConfig
+        self.agentClient = agentClient ?? ToolCallingClient(
+            configStore: modelConfig,
+            defaultBaseURL: URL(string: "http://host.docker.internal:8080/v1")!
+        )
     }
 }
 
@@ -186,6 +201,7 @@ public func buildApp(services: Services, port: Int) async throws -> some Applica
     ScheduleHandlers(services: services).register(on: v1)
     InspectorHandlers(services: services).register(on: v1)
     ConfigHandlers(services: services).register(on: v1)
+    AgentHandlers(services: services).register(on: v1)
     v1.get("/echo") { _, _ -> Response in
         return Response(
             status: .ok,
