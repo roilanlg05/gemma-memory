@@ -23,6 +23,9 @@ services:
       - MEMORY_DB_PATH=/data/memory.sqlite
       - EMBEDDER_URL=http://embedder:8000
       - MODEL_URL=${MODEL_URL:-http://host.docker.internal:8080}
+      # Container clock for the agent's nowContext + schedule ISO↔epoch + consolidation timing.
+      # Single-user deployment is in Cuba; override TZ in .env for a different zone.
+      - TZ=${TZ:-America/Havana}
       - IDLE_MS=180000
       - POST_TURN_MS=15000
     volumes:

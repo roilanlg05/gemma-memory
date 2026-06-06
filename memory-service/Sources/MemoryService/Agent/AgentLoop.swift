@@ -5,6 +5,12 @@ import MemoryCore
 /// Mirrors the app's `Agent.run` tool-loop logic (prompt augmentation, max-iteration cap, error
 /// fallback), adapted for the gateway's server-side tool set.
 public struct AgentLoop {
+    /// Non-answer replies the loop emits on failure. The endpoint skips persisting these as assistant
+    /// turns so apologies/placeholders don't pollute recall + consolidation.
+    public static let modelUnreachableReply = "I can't reach my model right now."
+    public static let incompleteReply = "(no pude completar la respuesta)"
+    public static let fallbackReplies: Set<String> = [modelUnreachableReply, incompleteReply]
+
     let client: AgentModelClient
     let maxIterations: Int
 
@@ -36,7 +42,7 @@ public struct AgentLoop {
                     tools: specs
                 )
             } catch {
-                return "I can't reach my model right now."
+                return Self.modelUnreachableReply
             }
 
             lastText = result.text
@@ -61,7 +67,7 @@ public struct AgentLoop {
             // `lastText` here is the INTERMEDIATE text from this same tool-using turn (the model's
             // pre-final chatter), not a true final answer — the model never got a turn to conclude.
             if iteration == maxIterations - 1 {
-                return lastText.isEmpty ? "(no pude completar la respuesta)" : lastText
+                return lastText.isEmpty ? Self.incompleteReply : lastText
             }
         }
 

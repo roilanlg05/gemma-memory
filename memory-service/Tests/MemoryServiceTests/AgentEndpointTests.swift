@@ -147,6 +147,32 @@ final class AgentEndpointTests: XCTestCase {
         XCTAssertFalse(rows.isEmpty, "default threadId 'gateway' must be used when omitted")
     }
 
+    /// A throwing model client → the loop returns the unreachable apology; the endpoint replies 200
+    /// with that apology but does NOT persist it as an assistant turn (only the user turn lands).
+    func test_agent_turn_model_unreachable_reply_not_persisted() async throws {
+        final class ThrowingClient: AgentModelClient, @unchecked Sendable {
+            struct E: Error {}
+            func complete(systemPrompt: String, userPrompt: String,
+                          tools: [[String: Any]]) async throws -> AgentModelResult { throw E() }
+        }
+        let (app, services) = try await makeAppWithServices(agentClient: ThrowingClient())
+
+        try await app.test(.live) { client in
+            try await client.execute(
+                uri: "/v1/agent/turn",
+                method: .post,
+                headers: [.authorization: "Bearer test-token", .contentType: "application/json"],
+                body: ByteBuffer(string: #"{"text":"hola","threadId":"DOWN"}"#)
+            ) { res in
+                XCTAssertEqual(res.status, .ok)
+                XCTAssertTrue(String(buffer: res.body).contains(AgentLoop.modelUnreachableReply))
+            }
+        }
+
+        let rows = try services.transcript.range(threadId: "DOWN", from: 1, to: 99)
+        XCTAssertEqual(rows.map { $0.role }, ["user"], "apology must not be persisted as assistant turn")
+    }
+
     func test_agent_turn_malformed_body_is_400() async throws {
         let canned = CannedAgentClient([])
         let (app, _) = try await makeAppWithServices(agentClient: canned)

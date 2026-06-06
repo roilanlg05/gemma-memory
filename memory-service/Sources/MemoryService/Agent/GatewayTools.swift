@@ -10,6 +10,8 @@ private func isoToEpoch(_ s: String) -> Double? {
     let t = s.trimmingCharacters(in: .whitespaces)
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
+    // `.current` = the container's TZ (set to America/Havana in compose). Per-request timezone
+    // threading is a deferred follow-up for multi-zone clients; today it must match nowContext's zone.
     f.timeZone = .current
     for fmt in ["yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd HH:mm", "yyyy-MM-dd'T'HH:mm:ss"] {
         f.dateFormat = fmt

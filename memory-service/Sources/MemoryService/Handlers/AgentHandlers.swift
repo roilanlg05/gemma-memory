@@ -45,10 +45,13 @@ struct AgentHandlers {
         // `seq` is server-authoritative (assigned inside append, ignoring the client turnIndex).
         // Best-effort: a persistence hiccup shouldn't fail the user's reply, but we log it for ops.
         let now = Date().timeIntervalSince1970
+        // Don't persist failure placeholders (model-unreachable / incomplete) as assistant turns —
+        // they'd pollute future recall + consolidation. The user turn is still recorded.
+        let persistAssistant = !reply.isEmpty && !AgentLoop.fallbackReplies.contains(reply)
         do {
             _ = try services.transcript.append(threadId: threadId, turnIndex: 0,
                                                role: "user", text: body.text, now: now)
-            if !reply.isEmpty {
+            if persistAssistant {
                 _ = try services.transcript.append(threadId: threadId, turnIndex: 0,
                                                    role: "assistant", text: reply, now: now + 0.001)
             }

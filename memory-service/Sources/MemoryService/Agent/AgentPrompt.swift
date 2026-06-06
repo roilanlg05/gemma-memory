@@ -60,6 +60,8 @@ public enum AgentPrompt {
     public static func nowContext(_ date: Date = Date()) -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
+        // `.current` = the container's TZ (compose sets America/Havana). MUST match the schedule
+        // tools' zone (GatewayTools.isoToEpoch) so the model's clock and date-math agree.
         f.timeZone = .current
         f.dateFormat = "yyyy-MM-dd (EEEE) HH:mm"
         return "Current date and time: \(f.string(from: date)) (local)."
