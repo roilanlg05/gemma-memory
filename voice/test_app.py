@@ -31,3 +31,24 @@ def test_fake_stt_returns_configured_text():
 def test_faster_whisper_stt_is_constructible_symbol():
     # The real class must exist and expose .transcribe; we do NOT load the model here.
     assert hasattr(FasterWhisperSTT, "transcribe")
+
+
+from engines import FakeTTS, KokoroTTS, LANG_VOICE  # noqa: E402
+
+
+def test_fake_tts_returns_valid_wav():
+    out = FakeTTS().synthesize("hola", "es")
+    # Valid WAV header ("RIFF"...."WAVE") and non-trivial length.
+    assert out[:4] == b"RIFF"
+    assert out[8:12] == b"WAVE"
+    assert len(out) > 44
+
+
+def test_lang_voice_map_has_es_and_en():
+    assert "es" in LANG_VOICE and "en" in LANG_VOICE
+    # Each entry is (kokoro_lang_code, voice_name).
+    assert len(LANG_VOICE["es"]) == 2 and len(LANG_VOICE["en"]) == 2
+
+
+def test_kokoro_tts_is_constructible_symbol():
+    assert hasattr(KokoroTTS, "synthesize")
