@@ -6,6 +6,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Install CPU-only torch FIRST: the i3 has no GPU, and the default torch==2.6.0 wheel drags in
+# ~4 GB of unused CUDA libs. The CPU wheel (2.6.0+cpu) satisfies kokoro's `torch==2.6.0` dep below.
+RUN pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
