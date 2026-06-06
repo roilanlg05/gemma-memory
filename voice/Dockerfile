@@ -13,14 +13,15 @@ RUN pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py engines.py test_app.py ./
-
-# Pre-pull models into the image so the first request is warm.
+# Pre-pull models into the image so the first request is warm. Done BEFORE copying the app code
+# (the pre-pull only needs the pip packages) so editing app.py/engines.py doesn't re-download models.
 ENV HF_HUB_CACHE=/models
 ENV WHISPER_CACHE=/models
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', download_root='/models')"
 RUN python -c "import warnings; warnings.filterwarnings('ignore'); from kokoro import KPipeline; \
 [list(KPipeline(lang_code=lc)(t, voice=v)) for lc, v, t in [('a','af_heart','hi'), ('e','ef_dora','hola')]]"
+
+COPY app.py engines.py test_app.py ./
 
 EXPOSE 8082
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8082"]

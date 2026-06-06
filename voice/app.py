@@ -89,9 +89,11 @@ async def voice_turn(
     try:
         out = _tts.synthesize(reply, lang)
     except Exception as exc:  # TTS failure -> 502, but surface the (unspoken) text
+        print(f"[voice] tts failed: {exc!r}")  # full detail in the server log only
         return Response(
             status_code=502,
-            headers={"X-STT-Text": quote(text), "X-Reply-Text": quote(reply), "X-Error": f"tts: {exc}"},
+            # Header carries the exception TYPE, not the message (avoid leaking paths/model names).
+            headers={"X-STT-Text": quote(text), "X-Reply-Text": quote(reply), "X-Error": f"tts: {type(exc).__name__}"},
         )
 
     return Response(

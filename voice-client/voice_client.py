@@ -82,12 +82,13 @@ def main() -> None:
     timezone = os.environ.get("TIMEZONE", "America/Havana")
     print(f"Voice client -> {host} (thread={thread_id}). Listening… Ctrl-C to quit.")
     while True:
-        vad = webrtcvad.Vad(2)
-        ep = VadEndpointer()
-        pcm = _record_utterance(vad, ep)
-        if len(pcm) < int(SR * 2 * 0.3):    # <300 ms captured -> ignore
-            continue
+        # Guard the whole turn: a capture/playback/decode error must never kill the loop.
         try:
+            vad = webrtcvad.Vad(2)
+            ep = VadEndpointer()
+            pcm = _record_utterance(vad, ep)
+            if len(pcm) < int(SR * 2 * 0.3):    # <300 ms captured -> ignore
+                continue
             r = requests.post(
                 f"{host}/v1/voice/turn",
                 headers={"Authorization": f"Bearer {token}"},
@@ -95,17 +96,19 @@ def main() -> None:
                 data={"threadId": thread_id, "timezone": timezone},
                 timeout=180,
             )
+            if r.status_code == 400:             # silence/no transcript -> just listen again
+                continue
+            if r.status_code != 200:
+                print("error", r.status_code, unquote(r.headers.get("X-Reply-Text", "")))
+                continue
+            print("you:  ", unquote(r.headers.get("X-STT-Text", "")))
+            print("gemma:", unquote(r.headers.get("X-Reply-Text", "")))
+            _play(r.content)
+        except KeyboardInterrupt:
+            raise
         except Exception as exc:
-            print("net error:", exc)
+            print("turn error:", exc)
             continue
-        if r.status_code == 400:             # silence/no transcript -> just listen again
-            continue
-        if r.status_code != 200:
-            print("error", r.status_code, unquote(r.headers.get("X-Reply-Text", "")))
-            continue
-        print("you:  ", unquote(r.headers.get("X-STT-Text", "")))
-        print("gemma:", unquote(r.headers.get("X-Reply-Text", "")))
-        _play(r.content)
 
 
 if __name__ == "__main__":
