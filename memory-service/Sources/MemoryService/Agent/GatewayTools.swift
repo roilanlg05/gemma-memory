@@ -433,4 +433,9 @@ public enum GatewayToolRegistry {
     /// OpenAI-style tool specs for all tools (pass directly to the model's `tools` array).
     /// Derived from `gatewayTools` (single source of truth) so the two can never diverge.
     public static let gatewayToolSpecs: [[String: Any]] = gatewayTools.map { type(of: $0).functionSpec }
+
+    /// Look up a tool by its registered name (for the agent loop's dispatch).
+    public static func tool(named n: String) -> (any GatewayTool)? {
+        gatewayTools.first { type(of: $0).name == n }
+    }
 }
