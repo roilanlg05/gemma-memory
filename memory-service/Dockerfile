@@ -34,7 +34,7 @@ FROM swift:6.2-jammy-slim AS runtime
 # tzdata: named zones (e.g. America/Havana via the TZ env) must resolve so the agent's clock
 # (AgentPrompt.nowContext) and schedule ISO↔epoch conversions use local time, not the container's UTC.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates tzdata \
+    ca-certificates tzdata curl \
  && rm -rf /var/lib/apt/lists/*
 # Bring the custom SQLite shared lib along; the binary's rpath points at /usr/local/lib.
 COPY --from=build /usr/local/lib/libsqlite3.so* /usr/local/lib/
