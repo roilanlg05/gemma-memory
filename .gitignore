@@ -19,3 +19,4 @@ docker-data/
 
 # OS
 .DS_Store
+.venv-voicetest/

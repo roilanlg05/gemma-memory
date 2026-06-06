@@ -44,5 +44,32 @@ services:
       retries: 3
     restart: unless-stopped
 
+  voice:
+    build:
+      context: ./voice
+    ports:
+      - "8082:8082"
+    environment:
+      - VOICE_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
+      - MEMORY_URL=http://memory:8081
+      - MEMORY_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
+      - WHISPER_MODEL=small
+      - WHISPER_CACHE=/models
+      - HF_HUB_CACHE=/models
+      - KOKORO_VOICE=
+      - TZ=${TZ:-America/Havana}
+    volumes:
+      - voice-models:/models
+    depends_on:
+      memory:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8082/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
 volumes:
   embedder-models:
+  voice-models:
