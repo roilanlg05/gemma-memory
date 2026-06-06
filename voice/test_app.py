@@ -52,3 +52,90 @@ def test_lang_voice_map_has_es_and_en():
 
 def test_kokoro_tts_is_constructible_symbol():
     assert hasattr(KokoroTTS, "synthesize")
+
+
+import io, wave  # noqa: E402
+from urllib.parse import unquote  # noqa: E402
+from engines import FakeSTT  # noqa: E402
+
+AUTH = {"Authorization": "Bearer test-token"}
+
+
+def _wav_16k(seconds: float = 0.5) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x01\x00" * int(16000 * seconds))
+    return buf.getvalue()
+
+
+def test_voice_turn_returns_audio_and_headers(monkeypatch):
+    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz: "hola Roilan")
+    r = client.post(
+        "/v1/voice/turn", headers=AUTH,
+        files={"audio": ("u.wav", _wav_16k(), "audio/wav")},
+        data={"threadId": "T", "timezone": "America/Havana"},
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/wav"
+    assert unquote(r.headers["x-stt-text"]) == "hola"          # FakeSTT default
+    assert unquote(r.headers["x-reply-text"]) == "hola Roilan"
+    assert len(r.content) > 44                                  # real audio body
+
+
+def test_voice_turn_requires_bearer():
+    r = client.post("/v1/voice/turn", files={"audio": ("u.wav", _wav_16k(), "audio/wav")})
+    assert r.status_code == 401
+
+
+def test_voice_turn_empty_transcript_is_400(monkeypatch):
+    monkeypatch.setattr(appmod, "_stt", FakeSTT(text="", lang="es"))
+    called = {"agent": False}
+    monkeypatch.setattr(appmod, "call_agent", lambda *a: called.__setitem__("agent", True) or "x")
+    r = client.post("/v1/voice/turn", headers=AUTH,
+                    files={"audio": ("u.wav", _wav_16k(), "audio/wav")})
+    assert r.status_code == 400
+    assert r.headers.get("x-stt-text", "") == ""
+    assert called["agent"] is False                             # never reached the agent
+
+
+def test_voice_turn_missing_audio_is_400():
+    r = client.post("/v1/voice/turn", headers=AUTH, data={"threadId": "T"})
+    assert r.status_code in (400, 422)                          # FastAPI 422 if field absent
+
+
+def test_voice_turn_agent_error_speaks_fallback(monkeypatch):
+    import httpx
+
+    def boom(text, tid, tz):
+        raise httpx.ConnectError("memory down")  # transport failure -> spoken fallback, 200
+    monkeypatch.setattr(appmod, "call_agent", boom)
+    r = client.post("/v1/voice/turn", headers=AUTH,
+                    files={"audio": ("u.wav", _wav_16k(), "audio/wav")})
+    assert r.status_code == 200
+    assert "cerebro" in unquote(r.headers["x-reply-text"]).lower()
+    assert len(r.content) > 44                                  # the fallback was spoken
+
+
+def test_voice_turn_stt_failure_is_502(monkeypatch):
+    class BoomSTT:
+        def transcribe(self, wav_bytes):
+            raise RuntimeError("model crashed")
+    monkeypatch.setattr(appmod, "_stt", BoomSTT())
+    r = client.post("/v1/voice/turn", headers=AUTH,
+                    files={"audio": ("u.wav", _wav_16k(), "audio/wav")})
+    assert r.status_code == 502
+
+
+def test_voice_turn_tts_failure_is_502(monkeypatch):
+    class BoomTTS:
+        def synthesize(self, text, lang):
+            raise RuntimeError("tts down")
+    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz: "una respuesta")
+    monkeypatch.setattr(appmod, "_tts", BoomTTS())
+    r = client.post("/v1/voice/turn", headers=AUTH,
+                    files={"audio": ("u.wav", _wav_16k(), "audio/wav")})
+    assert r.status_code == 502
+    assert unquote(r.headers["x-reply-text"]) == "una respuesta"  # unspoken text surfaced
