@@ -16,3 +16,18 @@ def test_healthz_returns_200():
     r = client.get("/healthz")
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
+
+
+from engines import FakeSTT, FasterWhisperSTT  # noqa: E402
+
+
+def test_fake_stt_returns_configured_text():
+    stt = FakeSTT(text="hola mundo", lang="es")
+    text, lang = stt.transcribe(b"ignored")
+    assert text == "hola mundo"
+    assert lang == "es"
+
+
+def test_faster_whisper_stt_is_constructible_symbol():
+    # The real class must exist and expose .transcribe; we do NOT load the model here.
+    assert hasattr(FasterWhisperSTT, "transcribe")
