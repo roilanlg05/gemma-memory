@@ -7,5 +7,8 @@ faster-whisper==1.1.1
 soundfile==0.12.1
 numpy==1.26.4
 kokoro==0.9.4
+# Pin transformers to the 4.x line kokoro 0.9.4 was built against. Unpinned, pip grabs
+# transformers 5.x which needs torch>=2.7 (torch.float8_e8m0fnu) and breaks on our torch 2.6.0 CPU.
+transformers==4.48.3
 torch==2.6.0
 pytest==8.3.4
