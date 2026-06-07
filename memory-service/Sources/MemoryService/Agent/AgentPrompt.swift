@@ -73,10 +73,22 @@ public enum AgentPrompt {
     /// semaphore inside `RemoteEmbedder` — the established pattern across this service's sync read paths.
     /// A future async-embed refactor (protocol-wide) would remove the bridge; out of scope for Phase 1a.
     public static func recallTail(query: String, threadId: String, services: Services) -> String {
+        let now = nowContext()
+        // Recent turns of THIS thread — multi-turn context so the agent doesn't lose the
+        // conversation across turns (the gateway was previously stateless per turn).
+        let history = conversationBlock(threadId: threadId, services: services)
         let qv = try? services.embedder.embed(query)
         let nodes = (try? services.retriever.retrieve(query: query, queryVector: qv)) ?? []
-        let block = services.retriever.injectionBlock(for: nodes)
-        let now = nowContext()
-        return block.isEmpty ? now : now + "\n\n" + block
+        let recall = services.retriever.injectionBlock(for: nodes)
+        return [now, history, recall].filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
+    /// The thread's recent turns, oldest-first, rendered for the prompt (empty if none).
+    static func conversationBlock(threadId: String, services: Services) -> String {
+        let rows = (try? services.transcript.recent(threadId: threadId, maxTurns: 12, maxChars: 1500)) ?? []
+        guard !rows.isEmpty else { return "" }
+        let lines = rows.map { "\($0.role == "assistant" ? "Gemma" : "User"): \($0.text)" }
+            .joined(separator: "\n")
+        return "Recent conversation (this chat, oldest first):\n" + lines
     }
 }
