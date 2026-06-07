@@ -25,7 +25,10 @@ public struct AgentLoop {
     ///   - threadId: The conversation thread identifier (scopes recall / episodic context).
     ///   - services: Process-wide service container (store, embedder, retriever, …).
     public func run(text: String, threadId: String, services: Services) async -> String {
+        // Voice/gateway turns: answer in the user's language (STT may be EN or ES) so the reply
+        // matches what they spoke (and the TTS voice picked from the detected language).
         let system = AgentPrompt.systemPrompt()
+            + "\n\nAlways reply in the same language the user used in their most recent message."
         let tail = AgentPrompt.recallTail(query: text, threadId: threadId, services: services)
         // Iteration 0: recall tail (nowContext + injected memory) prepended so the system-prompt
         // prefix stays byte-stable (mirrors app's Agent.run APC strategy).

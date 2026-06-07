@@ -33,10 +33,25 @@ final class AgentPromptTests: XCTestCase {
     }
 
     func test_recall_tail_is_just_nowContext_when_no_memory() async throws {
-        let s = try await MainActor.run { try services() }   // empty store → empty injection block
+        let s = try await MainActor.run { try services() }   // empty store + empty thread
         let tail = AgentPrompt.recallTail(query: "anything", threadId: "T", services: s)
         // Empty-injection branch: tail is exactly the nowContext line — no "\n\n"-joined block appended.
         XCTAssertTrue(tail.hasPrefix("Current date and time:"), tail)
         XCTAssertFalse(tail.contains("\n\n"), "no injection block should be appended, got: \(tail)")
+    }
+
+    func test_recall_tail_includes_recent_conversation_history() async throws {
+        let s = try await MainActor.run { try services() }
+        _ = try s.transcript.append(threadId: "T", turnIndex: 0, role: "user",
+                                    text: "agéndame algo el lunes de 6 a 8am", now: 1)
+        _ = try s.transcript.append(threadId: "T", turnIndex: 0, role: "assistant",
+                                    text: "¿Qué título le pongo?", now: 1.001)
+        // A DIFFERENT thread's turn must NOT leak in.
+        _ = try s.transcript.append(threadId: "OTHER", turnIndex: 0, role: "user",
+                                    text: "no debería aparecer", now: 1)
+        let tail = AgentPrompt.recallTail(query: "ponle Miami", threadId: "T", services: s)
+        XCTAssertTrue(tail.contains("agéndame algo el lunes de 6 a 8am"), tail)  // prior user turn
+        XCTAssertTrue(tail.contains("¿Qué título le pongo?"), tail)             // prior assistant turn
+        XCTAssertFalse(tail.contains("no debería aparecer"), "other thread leaked: \(tail)")
     }
 }
