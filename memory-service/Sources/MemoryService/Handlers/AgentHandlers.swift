@@ -19,6 +19,9 @@ struct AgentHandlers {
         /// IANA tz id (e.g. "America/Havana") — drives consolidation sleep-window timing. The i3
         /// runs UTC in Docker, so a caller in another zone should pass its local tz. Optional → server's.
         let timezone: String?
+        /// STT-detected language code (e.g. "en"/"es"). When present, pins the reply language for
+        /// this turn. Optional — typed callers omit it; the voice gateway forwards the STT language.
+        let language: String?
     }
 
     @Sendable func turn(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
@@ -38,7 +41,7 @@ struct AgentHandlers {
 
         // Run the agentic loop (recall → model → tool calls → final reply).
         let reply = await AgentLoop(client: services.agentClient).run(
-            text: body.text, threadId: threadId, services: services
+            text: body.text, threadId: threadId, services: services, language: body.language
         )
 
         // Persist the turn to the transcript: user first, then assistant.

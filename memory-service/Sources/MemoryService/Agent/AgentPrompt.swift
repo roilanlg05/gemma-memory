@@ -52,6 +52,26 @@ public enum AgentPrompt {
     about, call query_schedule with includeCancelled true; they are shown marked "(cancelado)".
     """
 
+    // MARK: - Per-turn language
+
+    /// Primary-subtag → English language name, for rendering the per-turn reply directive.
+    private static let languageNames: [String: String] = [
+        "en": "English", "es": "Spanish", "pt": "Portuguese", "fr": "French",
+        "de": "German", "it": "Italian",
+    ]
+
+    /// A firm per-turn directive pinning the reply language to the one the user actually spoke
+    /// (from the STT-detected language code). Empty when `code` is nil/blank. Rides the per-turn
+    /// tail — never the static system prefix — so the prompt-prefix cache is unaffected.
+    public static func languageDirective(_ code: String?) -> String {
+        guard let trimmed = code?.lowercased().trimmingCharacters(in: .whitespaces), !trimmed.isEmpty
+        else { return "" }
+        // Match on the primary subtag ("en-US" → "en"); fall back to the raw code if unmapped.
+        let primary = trimmed.split(separator: "-").first.map(String.init) ?? trimmed
+        let name = languageNames[primary] ?? primary
+        return "Reply in \(name)."
+    }
+
     // MARK: - Per-turn context
 
     /// Current date/time line — ported VERBATIM from Agent.nowContext(_:).

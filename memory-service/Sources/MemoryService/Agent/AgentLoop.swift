@@ -24,14 +24,20 @@ public struct AgentLoop {
     ///   - text:     The user's message for this turn.
     ///   - threadId: The conversation thread identifier (scopes recall / episodic context).
     ///   - services: Process-wide service container (store, embedder, retriever, …).
-    public func run(text: String, threadId: String, services: Services) async -> String {
-        // The language rule ("reply in the same language the user is using") now lives in the
-        // system prompt itself, so no per-turn append here. A firmer per-turn language hint derived
-        // from the STT-detected language is a separate, planned change.
+    ///   - language: Optional STT-detected language code (e.g. "en"/"es"). When present, a firm
+    ///               "Reply in <Language>." directive rides the per-turn tail to pin the reply
+    ///               language to what the user actually spoke (the prompt's general rule alone
+    ///               sometimes flips EN↔ES on voice turns).
+    public func run(text: String, threadId: String, services: Services, language: String? = nil) async -> String {
+        // The general language rule ("reply in the same language the user is using") lives in the
+        // system prompt. The per-turn directive below (from the STT-detected language) is firmer and
+        // rides the tail so the system prefix stays byte-stable (mirrors app's APC strategy).
         let system = AgentPrompt.systemPrompt()
-        let tail = AgentPrompt.recallTail(query: text, threadId: threadId, services: services)
-        // Iteration 0: recall tail (nowContext + injected memory) prepended so the system-prompt
-        // prefix stays byte-stable (mirrors app's Agent.run APC strategy).
+        var tail = AgentPrompt.recallTail(query: text, threadId: threadId, services: services)
+        let langDir = AgentPrompt.languageDirective(language)
+        if !langDir.isEmpty { tail = tail.isEmpty ? langDir : tail + "\n\n" + langDir }
+        // Iteration 0: recall tail (nowContext + injected memory + language) prepended so the
+        // system-prompt prefix stays byte-stable (mirrors app's Agent.run APC strategy).
         var currentPrompt = tail.isEmpty ? text : tail + "\n\n" + text
         let specs = GatewayToolRegistry.gatewayToolSpecs
         var lastText = ""

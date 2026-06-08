@@ -39,6 +39,17 @@ final class AgentLoopTests: XCTestCase {
         }
     }
 
+    /// Records the last system/user prompt it was called with, then returns a final answer.
+    final class CapturingClient: AgentModelClient, @unchecked Sendable {
+        var lastSystemPrompt = ""
+        var lastUserPrompt = ""
+        func complete(systemPrompt: String, userPrompt: String, tools: [[String: Any]]) async throws -> AgentModelResult {
+            lastSystemPrompt = systemPrompt
+            lastUserPrompt = userPrompt
+            return AgentModelResult(text: "ok", toolCalls: [])
+        }
+    }
+
     // MARK: - Tests
 
     func test_final_text_returned() async throws {
@@ -66,6 +77,26 @@ final class AgentLoopTests: XCTestCase {
         // Terminates at the cap (no hang) and returns the intermediate text from the capped turn
         // (InfiniteToolClient always replies "thinking…" alongside its tool call).
         XCTAssertEqual(reply, "thinking…", "Expected the capped-turn intermediate text, got: \(reply)")
+    }
+
+    func test_language_directive_rides_the_tail_when_provided() async throws {
+        let s = try await MainActor.run { try services() }
+        let client = CapturingClient()
+        let loop = AgentLoop(client: client)
+        _ = await loop.run(text: "hi", threadId: "T", services: s, language: "es")
+        XCTAssertTrue(client.lastUserPrompt.contains("Reply in Spanish."),
+                      "per-turn tail must carry the language directive, got: \(client.lastUserPrompt)")
+        XCTAssertFalse(client.lastSystemPrompt.contains("Reply in Spanish."),
+                       "language hint must NOT be in the static system prefix (would break prefix caching)")
+    }
+
+    func test_no_language_directive_when_absent() async throws {
+        let s = try await MainActor.run { try services() }
+        let client = CapturingClient()
+        let loop = AgentLoop(client: client)
+        _ = await loop.run(text: "hi", threadId: "T", services: s)
+        XCTAssertFalse(client.lastUserPrompt.contains("Reply in"),
+                       "no language directive expected when language is nil, got: \(client.lastUserPrompt)")
     }
 
     func test_model_error_returns_graceful_message() async throws {

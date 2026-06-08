@@ -38,11 +38,13 @@ _stt = _make_stt()
 _tts = _make_tts()
 
 
-def call_agent(text: str, thread_id: str, timezone: str | None) -> str:
+def call_agent(text: str, thread_id: str, timezone: str | None, language: str | None = None) -> str:
     """POST to the Swift agent gateway and return its reply text. Raises on transport/HTTP error."""
     body = {"text": text, "threadId": thread_id}
     if timezone:
         body["timezone"] = timezone
+    if language:  # STT-detected language -> agent pins the reply to the language the user spoke
+        body["language"] = language
     headers = {"Authorization": f"Bearer {MEMORY_BEARER}", "Content-Type": "application/json"}
     r = httpx.post(f"{MEMORY_URL}/v1/agent/turn", json=body, headers=headers, timeout=180)
     r.raise_for_status()
@@ -85,7 +87,7 @@ async def voice_turn(
         return Response(status_code=400, headers={"X-STT-Text": ""})
 
     try:
-        reply = call_agent(text, threadId, timezone)
+        reply = call_agent(text, threadId, timezone, lang)
     except httpx.HTTPError:  # transport error or non-2xx from the agent
         reply = AGENT_FALLBACK  # agent unreachable -> speak the failure, still 200
     t_agent = time.perf_counter()

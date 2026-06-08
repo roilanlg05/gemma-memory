@@ -72,7 +72,7 @@ def _wav_16k(seconds: float = 0.5) -> bytes:
 
 
 def test_voice_turn_returns_audio_and_headers(monkeypatch):
-    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz: "hola Roilan")
+    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz, lang=None: "hola Roilan")
     r = client.post(
         "/v1/voice/turn", headers=AUTH,
         files={"audio": ("u.wav", _wav_16k(), "audio/wav")},
@@ -83,6 +83,41 @@ def test_voice_turn_returns_audio_and_headers(monkeypatch):
     assert unquote(r.headers["x-stt-text"]) == "hola"          # FakeSTT default
     assert unquote(r.headers["x-reply-text"]) == "hola Roilan"
     assert len(r.content) > 44                                  # real audio body
+
+
+def test_voice_turn_forwards_stt_language_to_agent(monkeypatch):
+    # The STT-detected language must reach the agent so it can pin the reply language.
+    monkeypatch.setattr(appmod, "_stt", FakeSTT(text="hello", lang="en"))
+    captured = {}
+
+    def fake_agent(text, tid, tz, language=None):
+        captured["language"] = language
+        return "hi Roilan"
+
+    monkeypatch.setattr(appmod, "call_agent", fake_agent)
+    r = client.post("/v1/voice/turn", headers=AUTH,
+                    files={"audio": ("u.wav", _wav_16k(), "audio/wav")})
+    assert r.status_code == 200
+    assert captured["language"] == "en"
+
+
+def test_call_agent_includes_language_in_body(monkeypatch):
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self): pass
+        def json(self): return {"reply": "ok"}
+
+    def fake_post(url, json, headers, timeout):
+        captured["body"] = json
+        return FakeResp()
+
+    monkeypatch.setattr(appmod.httpx, "post", fake_post)
+    appmod.call_agent("hi", "T", "America/Havana", "en")
+    assert captured["body"]["language"] == "en"
+    # Omitted entirely when no language is known (typed callers).
+    appmod.call_agent("hi", "T", None, None)
+    assert "language" not in captured["body"]
 
 
 def test_voice_turn_requires_bearer():
@@ -109,7 +144,7 @@ def test_voice_turn_missing_audio_is_400():
 def test_voice_turn_agent_error_speaks_fallback(monkeypatch):
     import httpx
 
-    def boom(text, tid, tz):
+    def boom(text, tid, tz, lang=None):
         raise httpx.ConnectError("memory down")  # transport failure -> spoken fallback, 200
     monkeypatch.setattr(appmod, "call_agent", boom)
     r = client.post("/v1/voice/turn", headers=AUTH,
@@ -133,7 +168,7 @@ def test_voice_turn_tts_failure_is_502(monkeypatch):
     class BoomTTS:
         def synthesize(self, text, lang):
             raise RuntimeError("tts down")
-    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz: "una respuesta")
+    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz, lang=None: "una respuesta")
     monkeypatch.setattr(appmod, "_tts", BoomTTS())
     r = client.post("/v1/voice/turn", headers=AUTH,
                     files={"audio": ("u.wav", _wav_16k(), "audio/wav")})
