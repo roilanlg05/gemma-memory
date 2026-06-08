@@ -2,6 +2,7 @@
 -> TTS, exposing POST /v1/voice/turn (audio in -> audio out). CPU-only; runs on the i3.
 All audio processing lives here; devices are thin clients."""
 import os
+import time
 from urllib.parse import quote
 
 import httpx
@@ -73,10 +74,12 @@ async def voice_turn(
     if not wav or len(wav) < 200:  # WAV header is 44 bytes; under 200 is never a real utterance
         raise HTTPException(status_code=400, detail="audio required")
 
+    t0 = time.perf_counter()
     try:
         text, lang = _stt.transcribe(wav)
     except Exception as exc:  # STT failure
         raise HTTPException(status_code=502, detail=f"stt failed: {exc}")
+    t_stt = time.perf_counter()
 
     if not text.strip():  # silence/noise -> client just re-listens
         return Response(status_code=400, headers={"X-STT-Text": ""})
@@ -85,9 +88,13 @@ async def voice_turn(
         reply = call_agent(text, threadId, timezone)
     except httpx.HTTPError:  # transport error or non-2xx from the agent
         reply = AGENT_FALLBACK  # agent unreachable -> speak the failure, still 200
+    t_agent = time.perf_counter()
 
     try:
         out = _tts.synthesize(reply, lang)
+        t_tts = time.perf_counter()
+        print(f"[voice] timing: stt={t_stt-t0:.2f}s agent={t_agent-t_stt:.2f}s "
+              f"tts={t_tts-t_agent:.2f}s total={t_tts-t0:.2f}s reply_chars={len(reply)}", flush=True)
     except Exception as exc:  # TTS failure -> 502, but surface the (unspoken) text
         print(f"[voice] tts failed: {exc!r}")  # full detail in the server log only
         return Response(
