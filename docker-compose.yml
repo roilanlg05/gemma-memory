@@ -53,7 +53,7 @@ services:
       - VOICE_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
       - MEMORY_URL=http://memory:8081
       - MEMORY_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
-      - WHISPER_MODEL=base
+      - WHISPER_MODEL=small
       - WHISPER_CACHE=/models
       - HF_HUB_CACHE=/models
       - KOKORO_VOICE=
