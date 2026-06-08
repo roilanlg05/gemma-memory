@@ -23,12 +23,17 @@ class FakeSTT:
 
 
 class FasterWhisperSTT:
-    """CPU faster-whisper (CTranslate2 int8). Expects 16 kHz mono WAV bytes."""
+    """CPU faster-whisper (CTranslate2 int8). Expects 16 kHz mono WAV bytes.
+    WHISPER_LANGUAGE (e.g. "en") forces the language — skips auto-detect (faster) and avoids
+    cross-language mis-transcription; leave unset for multilingual auto-detect."""
     def __init__(self, model_name: str = "small"):
         from faster_whisper import WhisperModel
         download_root = os.environ.get("WHISPER_CACHE") or None
+        cpu_threads = int(os.environ.get("WHISPER_CPU_THREADS", "0"))  # 0 = CTranslate2 default
+        self._language = os.environ.get("WHISPER_LANGUAGE") or None
         self._model = WhisperModel(
-            model_name, device="cpu", compute_type="int8", download_root=download_root
+            model_name, device="cpu", compute_type="int8",
+            download_root=download_root, cpu_threads=cpu_threads,
         )
 
     def transcribe(self, wav_bytes: bytes) -> Tuple[str, str]:
@@ -38,7 +43,10 @@ class FasterWhisperSTT:
         if getattr(data, "ndim", 1) > 1:  # downmix to mono
             data = data.mean(axis=1)
         # Client guarantees 16 kHz; faster-whisper assumes 16 kHz for ndarray input.
-        segments, info = self._model.transcribe(np.ascontiguousarray(data), beam_size=1)
+        # vad_filter drops silence (e.g. the endpointer's trailing pause) -> less audio to decode.
+        segments, info = self._model.transcribe(
+            np.ascontiguousarray(data), beam_size=1, language=self._language, vad_filter=True,
+        )
         text = "".join(seg.text for seg in segments).strip()
         return text, info.language
 
