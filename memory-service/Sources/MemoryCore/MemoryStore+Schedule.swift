@@ -7,6 +7,13 @@ public func eventsOverlap(_ s1: Double, _ e1: Double, _ s2: Double, _ e2: Double
     s1 < e2 && s2 < e1
 }
 
+/// Result of resolving which event the user means for an edit (time-first).
+public enum EditTarget: Sendable {
+    case found(Node)
+    case none
+    case ambiguous([Node])
+}
+
 extension MemoryStore {
     /// All `event` nodes whose [start,end) intersects [from,to), sorted by start ascending.
     /// Excludes cancelled unless `includeCancelled`. Pure read.
@@ -24,9 +31,11 @@ extension MemoryStore {
     }
 
     /// Scheduled events overlapping the proposed [start,end). Cancelled/done excluded.
-    public func scheduleConflicts(start: Double, end: Double) throws -> [Node] {
+    /// `excluding` drops nodes by id so an edit never conflicts with the event being edited.
+    public func scheduleConflicts(start: Double, end: Double, excluding: Set<String> = []) throws -> [Node] {
         let events = try allNodes().filter { $0.kind == NodeKind.event.rawValue }
         return events.filter { node in
+            guard !excluding.contains(node.id) else { return false }
             let a = NodeAttributes.from(node.extra)
             guard let s = a.startAt, let e = a.endAt, a.status == "scheduled" else { return false }
             return eventsOverlap(s, e, start, end)
@@ -101,5 +110,57 @@ extension MemoryStore {
             changed += 1
         }
         return changed
+    }
+
+    /// Resolve which scheduled event the user means for an edit, anchored on TIME.
+    /// Candidates = scheduled events on the same calendar day as `start` (server TZ), optionally
+    /// filtered by `title` (case-insensitive). One candidate → .found; several → prefer an
+    /// exact-minute start match, else .ambiguous; none → .none.
+    /// Note: with a single same-day candidate it returns .found regardless of how far `start` is
+    /// from the event's time (the `< 60s` tolerance only disambiguates among multiple candidates).
+    public func findEditTarget(start: Double, title: String?) throws -> EditTarget {
+        let cal = Calendar.current
+        let day = Date(timeIntervalSince1970: start)
+        var candidates = try allNodes().filter { node in
+            guard node.kind == NodeKind.event.rawValue else { return false }
+            let a = NodeAttributes.from(node.extra)
+            guard a.status == "scheduled", let s = a.startAt else { return false }
+            return cal.isDate(Date(timeIntervalSince1970: s), inSameDayAs: day)
+        }
+        if let title = title?.trimmingCharacters(in: .whitespaces), !title.isEmpty {
+            candidates = candidates.filter { $0.label.caseInsensitiveCompare(title) == .orderedSame }
+        }
+        if candidates.isEmpty { return .none }
+        if candidates.count == 1 { return .found(candidates[0]) }
+        let exact = candidates.filter { node in
+            guard let s = NodeAttributes.from(node.extra).startAt else { return false }
+            return abs(s - start) < 60   // within a minute = the same start
+        }
+        if exact.count == 1 { return .found(exact[0]) }
+        return .ambiguous(candidates)
+    }
+
+    /// Edit an event in place: override ONLY the provided fields, keep the same node id, recompute
+    /// canonicalKey, stay scheduled. `location == ""` clears it; nil leaves a field unchanged.
+    /// Precondition: caller passes a scheduled event (e.g. a `.found` from `findEditTarget`); this
+    /// leaves `status` untouched, so it must not be used to edit a cancelled/done node.
+    @discardableResult
+    public func applyEventEdit(_ node: Node, newTitle: String? = nil, newStart: Double? = nil,
+                               newEnd: Double? = nil, location: String? = nil, allDay: Bool? = nil) throws -> Node {
+        var node = node
+        var a = NodeAttributes.from(node.extra)
+        let trimmed = newTitle?.trimmingCharacters(in: .whitespaces)
+        let effTitle = (trimmed?.isEmpty == false) ? trimmed! : node.label
+        if let newStart { a.startAt = newStart }
+        if let newEnd { a.endAt = newEnd }
+        if let allDay { a.allDay = allDay }
+        if let location { a.location = location.isEmpty ? nil : location }
+        a.canonicalKey = MemoryText.eventCanonicalKey(title: effTitle, startAt: a.startAt ?? 0)
+        let now = Date().timeIntervalSince1970
+        node.label = effTitle; node.body = effTitle
+        node.updatedAt = now; node.lastSeenAt = now
+        node.extra = a.toJSON(); node.dirty = true
+        try upsert(node)
+        return node
     }
 }
