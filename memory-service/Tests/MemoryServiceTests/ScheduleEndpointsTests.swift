@@ -119,4 +119,67 @@ final class ScheduleEndpointsTests: XCTestCase {
             }
         }
     }
+
+    func test_update_event_endpoint_move_notfound_conflict() async throws {
+        let app = try await makeApp()
+        try await app.test(.live) { client in
+            let auth: HTTPFields = [.authorization: "Bearer test-token", .contentType: "application/json"]
+            // Seed two same-day events: meeting [9000,9600), dentist [3000,3600).
+            try await client.execute(uri: "/v1/schedule/create", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"title":"meeting","start":9000,"end":9600,"origin":"user"}"#)) { res in
+                XCTAssertTrue(String(buffer: res.body).contains("\"created\":true")) }
+            try await client.execute(uri: "/v1/schedule/create", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"title":"dentist","start":3000,"end":3600,"origin":"user"}"#)) { res in
+                XCTAssertTrue(String(buffer: res.body).contains("\"created\":true")) }
+
+            // notFound: no event at start=999999.
+            try await client.execute(uri: "/v1/schedule/update", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"start":999999,"location":"Miami"}"#)) { res in
+                XCTAssertTrue(String(buffer: res.body).contains("\"notFound\":true")) }
+
+            // location-only update on the meeting → updated true.
+            try await client.execute(uri: "/v1/schedule/update", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"start":9000,"title":"meeting","location":"Miami"}"#)) { res in
+                let s = String(buffer: res.body)
+                XCTAssertTrue(s.contains("\"updated\":true"))
+                XCTAssertTrue(s.contains("Miami")) }
+
+            // time move onto the dentist slot, no force → updated false + conflicts.
+            try await client.execute(uri: "/v1/schedule/update", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"start":9000,"title":"meeting","newStart":3000,"newEnd":3600}"#)) { res in
+                let s = String(buffer: res.body)
+                XCTAssertTrue(s.contains("\"updated\":false"))
+                XCTAssertTrue(s.contains("dentist")) }
+        }
+    }
+
+    // Covers the two HTTP response shapes the first test doesn't reach: `ambiguous` and the
+    // force-applies-despite-conflict path.
+    func test_update_event_endpoint_ambiguous_and_force() async throws {
+        let app = try await makeApp()
+        try await app.test(.live) { client in
+            let auth: HTTPFields = [.authorization: "Bearer test-token", .contentType: "application/json"]
+            // Two same-title, same-day events → ambiguous when the passed start matches neither.
+            try await client.execute(uri: "/v1/schedule/create", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"title":"sync","start":4000,"end":4600,"origin":"user"}"#)) { res in
+                XCTAssertTrue(String(buffer: res.body).contains("\"created\":true")) }
+            try await client.execute(uri: "/v1/schedule/create", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"title":"sync","start":8000,"end":8600,"origin":"user"}"#)) { res in
+                XCTAssertTrue(String(buffer: res.body).contains("\"created\":true")) }
+            // start=6000 matches neither exactly → ambiguous list, no change.
+            try await client.execute(uri: "/v1/schedule/update", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"start":6000,"title":"sync","location":"X"}"#)) { res in
+                let s = String(buffer: res.body)
+                XCTAssertTrue(s.contains("\"ambiguous\""), s)
+                XCTAssertTrue(s.contains("\"updated\":false"), s) }
+
+            // A blocking event, then a FORCED time-move of sync@8000 onto its slot → applied.
+            try await client.execute(uri: "/v1/schedule/create", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"title":"block","start":2000,"end":2600,"origin":"user"}"#)) { res in
+                XCTAssertTrue(String(buffer: res.body).contains("\"created\":true")) }
+            try await client.execute(uri: "/v1/schedule/update", method: .post, headers: auth,
+                body: ByteBuffer(string: #"{"start":8000,"title":"sync","newStart":2000,"newEnd":2600,"force":true}"#)) { res in
+                XCTAssertTrue(String(buffer: res.body).contains("\"updated\":true")) }
+        }
+    }
 }

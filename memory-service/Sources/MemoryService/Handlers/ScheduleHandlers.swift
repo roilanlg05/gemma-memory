@@ -13,6 +13,7 @@ struct ScheduleHandlers {
         group.post("/schedule/create", use: create)
         group.get ("/schedule/window", use: window)
         group.post("/schedule/cancel", use: cancel)
+        group.post("/schedule/update", use: update)
     }
 
     private func eventJSON(_ n: Node) -> [String: Any] {
@@ -89,5 +90,39 @@ struct ScheduleHandlers {
         }
         let n = (try? services.store.cancelEvents(ids: b.ids, from: b.from, to: b.to)) ?? 0
         return json(["cancelled": n])
+    }
+
+    struct UpdateBody: Decodable, Sendable {
+        let start: Double
+        let title: String?
+        let newStart: Double?; let newEnd: Double?; let newTitle: String?
+        let location: String?; let allDay: Bool?; let force: Bool?
+    }
+
+    @Sendable func update(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
+        guard let b = await body(req, UpdateBody.self) else {
+            return jsonError(.badRequest, "bad_request", "start required")
+        }
+        do {
+            let node: Node
+            switch try services.store.findEditTarget(start: b.start, title: b.title) {
+            case .none:           return json(["updated": false, "notFound": true])
+            case .ambiguous(let l): return json(["updated": false, "ambiguous": l.map(eventJSON)])
+            case .found(let n):   node = n
+            }
+            let a = NodeAttributes.from(node.extra)
+            if b.newStart != nil || b.newEnd != nil {
+                let effStart = b.newStart ?? a.startAt ?? b.start
+                let effEnd = b.newEnd ?? a.endAt ?? effStart
+                let conflicts = try services.store.scheduleConflicts(start: effStart, end: effEnd, excluding: [node.id])
+                if !conflicts.isEmpty && b.force != true {
+                    return json(["updated": false, "conflicts": conflicts.map(eventJSON)])
+                }
+            }
+            let updated = try services.store.applyEventEdit(
+                node, newTitle: b.newTitle, newStart: b.newStart, newEnd: b.newEnd,
+                location: b.location, allDay: b.allDay)
+            return json(["updated": true, "event": eventJSON(updated)])
+        } catch { return jsonError(.internalServerError, "store_error", "\(error)") }
     }
 }
