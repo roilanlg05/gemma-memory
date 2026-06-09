@@ -436,7 +436,9 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     /// label-propagation, and rebuild ephemeral `cluster` anchors + `belongsToCluster` edges.
     public func cluster() async {
         let nodes = (try? store.allNodes()) ?? []
-        let clusterableIds = Set(nodes.filter { Self.clusterableKinds.contains($0.kind) }.map { $0.id })
+        // Exclude structural kind-hubs (id "hub:<kind>") regardless of their `kind` — even if a hub
+        // were ever mis-kinded into a clusterable kind, it must never be clustered/reflected over.
+        let clusterableIds = Set(nodes.filter { Self.clusterableKinds.contains($0.kind) && !$0.id.hasPrefix("hub:") }.map { $0.id })
         let embs = ((try? store.allEmbeddings()) ?? []).filter { clusterableIds.contains($0.id) }
         try? store.clearClusters()
         guard embs.count >= 2 else { return }
@@ -582,18 +584,24 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     private struct KindMapOut: Decodable { let map: [String: String] }
 
     public func curateKinds() async {
-        let known = NodeKind.allCases.map { $0.rawValue }
+        // `known` includes structural HubKind so a hub is NEVER treated as a foldable memory kind:
+        // mapping hub→topic would turn the 18 structural kind-hubs into clusterable `topic` nodes,
+        // which then poison cluster→reflect→identity (confabulated "the user categorizes information").
+        let standard = NodeKind.allCases.map { $0.rawValue }
+        let known = Set(standard + HubKind.allCases.map { $0.rawValue })
         let kinds = (try? store.distinctKinds()) ?? []
         let unknown = kinds.filter { !known.contains($0) }
         guard !unknown.isEmpty else { return }
         let prompt = """
         Map each non-standard memory kind to the closest STANDARD kind, or keep it if it's genuinely distinct. Output JSON only.
-        Standard kinds: \(known.joined(separator: ", ")). Schema: {"map":{"<kind>":"<standard-or-same>"}}
+        Standard kinds: \(standard.joined(separator: ", ")). Schema: {"map":{"<kind>":"<standard-or-same>"}}
         Kinds to map: \(unknown.joined(separator: ", "))
         JSON:
         """
         guard let out = parse(await generate(prompt, maxTokens: 512), KindMapOut.self) else { return }
-        for (from, to) in out.map where from != to && !to.isEmpty {
+        // Guard `from`: even if the model hallucinates a mapping for a known/structural kind we didn't
+        // ask about, never reassign it — only genuinely non-standard kinds get folded.
+        for (from, to) in out.map where from != to && !to.isEmpty && !known.contains(from) {
             try? store.reassignKind(from: from, to: to)
         }
     }

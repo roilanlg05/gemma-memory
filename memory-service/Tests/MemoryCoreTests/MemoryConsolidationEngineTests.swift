@@ -108,6 +108,45 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(try store.node(id: "a")?.kind, "plan")
     }
 
+    func test_curate_never_reassigns_structural_hub_kind() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        _ = try store.ensureKindHubs()                      // 18 hub nodes (kind "hub", ids "hub:<kind>")
+        let now = Date().timeIntervalSince1970
+        // A genuinely non-standard kind that SHOULD still be folded.
+        try store.upsert(Node(id: "x", kind: "spaceship", label: "Falcon", body: "", layer: .daily, createdAt: now, updatedAt: now, lastSeenAt: now, salience: 1, decayRate: 0.001, confidence: .sure, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .explicit, serverId: nil, dirty: true, deleted: false, extra: nil))
+        // The model tries to fold BOTH the structural "hub" and the real "spaceship".
+        let rt = CannedRuntime([#"{"map":{"hub":"topic","spaceship":"fact"}}"#])
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: rt)
+        await engine.curateKinds()
+        // Structural hubs are protected — never reassigned (a hub→topic would become clusterable and
+        // poison reflect). Fetch by id directly: allNodes() excludes structural hubs, so a correctly
+        // kept hub is absent there — we check the hub node itself still has kind "hub".
+        for kind in ["person", "topic", "self", "cluster", "follow_up"] {
+            XCTAssertEqual(try store.node(id: "hub:\(kind)")?.kind, "hub",
+                           "structural hub 'hub:\(kind)' must keep kind 'hub'")
+        }
+        // A real non-standard kind is still folded.
+        XCTAssertEqual(try store.node(id: "x")?.kind, "fact")
+    }
+
+    func test_cluster_excludes_structural_hub_nodes_even_if_miskinded() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let now = Date().timeIntervalSince1970
+        func mk(_ id: String, _ label: String) -> Node {
+            Node(id: id, kind: NodeKind.topic.rawValue, label: label, body: label, layer: .daily, createdAt: now, updatedAt: now, lastSeenAt: now, salience: 3, decayRate: 0, confidence: .sure, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .explicit, serverId: nil, dirty: true, deleted: false, extra: nil)
+        }
+        // 3 real clusterable nodes with an identical label → identical FakeEmbedder vectors → they cluster.
+        for id in ["r1", "r2", "r3"] { try store.upsert(mk(id, "alpha")) }
+        // A mis-kinded structural hub (id "hub:*") with the SAME label — would join the cluster if not excluded.
+        try store.upsert(mk("hub:bad", "alpha"))
+        let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: CannedRuntime([]))
+        await engine.embedMissing()
+        await engine.cluster()
+        let members = Set(try store.allEdges().filter { $0.relation == .belongsToCluster }.map { $0.dstId })
+        XCTAssertFalse(members.contains("hub:bad"), "structural hub node must be excluded from clustering")
+        XCTAssertTrue(members.isSuperset(of: ["r1", "r2", "r3"]), "real nodes still cluster, got: \(members)")
+    }
+
     func test_forget_sweeps_weak_and_prunes_edges() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 4)
         let old = Date().timeIntervalSince1970 - 10_000_000   // long ago → effective salience ~0
