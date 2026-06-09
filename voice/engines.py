@@ -5,6 +5,8 @@ import os
 import wave
 from typing import Protocol, Tuple
 
+import httpx
+
 
 class STTEngine(Protocol):
     def transcribe(self, wav_bytes: bytes) -> Tuple[str, str]:
@@ -49,6 +51,35 @@ class FasterWhisperSTT:
         )
         text = "".join(seg.text for seg in segments).strip()
         return text, info.language
+
+
+class ElevenLabsScribeSTT:
+    """ElevenLabs Scribe speech-to-text (cloud). Expects 16 kHz mono WAV bytes.
+    `language` (ISO-639-1, e.g. "en") forces the language AND is returned verbatim, so the
+    downstream agent reply + TTS voice are pinned deterministically; leave None for auto-detect.
+    No local model is loaded."""
+    _URL = "https://api.elevenlabs.io/v1/speech-to-text"
+
+    def __init__(self, api_key: str, model: str = "scribe_v1", language: str | None = None):
+        if not api_key:
+            raise RuntimeError("ElevenLabsScribeSTT requires ELEVENLABS_API_KEY")
+        self._api_key = api_key
+        self._model = model
+        self._language = language or None
+
+    def transcribe(self, wav_bytes: bytes) -> Tuple[str, str]:
+        data = {"model_id": self._model}
+        if self._language:
+            data["language_code"] = self._language
+        files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
+        r = httpx.post(self._URL, headers={"xi-api-key": self._api_key},
+                       data=data, files=files, timeout=30)
+        r.raise_for_status()
+        body = r.json()
+        text = (body.get("text") or "").strip()
+        # Forced language wins (deterministic pinning); else the detected code; else "en".
+        lang = self._language or body.get("language_code") or "en"
+        return text, lang
 
 
 # --- TTS ---------------------------------------------------------------------

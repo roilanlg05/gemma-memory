@@ -174,3 +174,62 @@ def test_voice_turn_tts_failure_is_502(monkeypatch):
                     files={"audio": ("u.wav", _wav_16k(), "audio/wav")})
     assert r.status_code == 502
     assert unquote(r.headers["x-reply-text"]) == "una respuesta"  # unspoken text surfaced
+
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+from engines import ElevenLabsScribeSTT  # noqa: E402
+
+
+def test_elevenlabs_stt_parses_text_and_forces_language(monkeypatch):
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self): pass
+        def json(self): return {"text": " hello world ", "language_code": "es"}  # detected es
+
+    def fake_post(url, **kw):
+        captured["url"] = url
+        captured["headers"] = kw.get("headers")
+        captured["data"] = kw.get("data")
+        captured["files"] = kw.get("files")
+        return FakeResp()
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    stt = ElevenLabsScribeSTT(api_key="k", model="scribe_v1", language="en")
+    text, lang = stt.transcribe(b"RIFF....")
+    assert text == "hello world"          # trimmed
+    assert lang == "en"                   # forced, ignores detected "es"
+    assert captured["url"] == "https://api.elevenlabs.io/v1/speech-to-text"
+    assert captured["headers"]["xi-api-key"] == "k"
+    assert captured["data"]["model_id"] == "scribe_v1"
+    assert captured["data"]["language_code"] == "en"
+    assert captured["files"]["file"][0] == "audio.wav"
+
+
+def test_elevenlabs_stt_autodetect_when_language_none(monkeypatch):
+    class FakeResp:
+        def raise_for_status(self): pass
+        def json(self): return {"text": "hola", "language_code": "es"}
+
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: FakeResp())
+    stt = ElevenLabsScribeSTT(api_key="k", language=None)
+    text, lang = stt.transcribe(b"x")
+    assert (text, lang) == ("hola", "es")  # returns detected language
+
+
+def test_elevenlabs_stt_raises_on_http_error(monkeypatch):
+    class FakeResp:
+        def raise_for_status(self):
+            raise httpx.HTTPStatusError("boom", request=None, response=None)
+        def json(self): return {}
+
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: FakeResp())
+    stt = ElevenLabsScribeSTT(api_key="k")
+    with pytest.raises(httpx.HTTPStatusError):
+        stt.transcribe(b"x")
+
+
+def test_elevenlabs_stt_requires_api_key():
+    with pytest.raises(RuntimeError):
+        ElevenLabsScribeSTT(api_key="")
