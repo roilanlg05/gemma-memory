@@ -414,9 +414,73 @@ public struct CancelEventsGatewayTool: GatewayTool {
     }
 }
 
+// MARK: - 12. UpdateEventGatewayTool
+
+public struct UpdateEventGatewayTool: GatewayTool {
+    public static let name = "update_event"
+    public static let description = "Edit an EXISTING calendar event in place — change its time, title, or location. Never cancel+recreate to make a change. Identify the event by its CURRENT start (the time the user named) plus title when known."
+    public static let parameters: [GatewayToolParam] = [
+        .init(name: "start", type: .string,
+              description: "The event's CURRENT local ISO start (the time the user referred to), e.g. 2099-06-09T15:00.",
+              required: true),
+        .init(name: "title", type: .string,
+              description: "The event's current title, to disambiguate if several share that time.",
+              required: false),
+        .init(name: "newStart", type: .string, description: "New local ISO start, if moving the event.", required: false),
+        .init(name: "newEnd", type: .string, description: "New local ISO end, if changing the end.", required: false),
+        .init(name: "newTitle", type: .string, description: "New title, if renaming.", required: false),
+        .init(name: "location", type: .string, description: "New place (empty string clears it).", required: false),
+        .init(name: "allDay", type: .boolean, description: "true/false to change all-day.", required: false),
+        .init(name: "force", type: .boolean,
+              description: "true to apply despite a conflict with a DIFFERENT event (only after the user confirms).",
+              required: false),
+    ]
+    public init() {}
+
+    public func run(argsJSON: String, services: Services) async -> String {
+        let o = Self.args(argsJSON)
+        guard let s = (o["start"] as? String).flatMap(isoToEpoch) else {
+            return "Which event? Tell me the time of the event you want to change (e.g. 2099-06-09T15:00)."
+        }
+        let title = (o["title"] as? String)?.trimmingCharacters(in: .whitespaces)
+        do {
+            let node: Node
+            switch try services.store.findEditTarget(start: s, title: (title?.isEmpty == false) ? title : nil) {
+            case .none:
+                return "I couldn't find that event — want me to check your schedule?"
+            case .ambiguous(let list):
+                return "I found more than one event around then: " + list.map(eventLine).joined(separator: "; ") + ". Which one?"
+            case .found(let n):
+                node = n
+            }
+            let a = NodeAttributes.from(node.extra)
+            let newStart = (o["newStart"] as? String).flatMap(isoToEpoch)
+            let newEnd = (o["newEnd"] as? String).flatMap(isoToEpoch)
+            let newTitle = (o["newTitle"] as? String)?.trimmingCharacters(in: .whitespaces)
+            let location = o["location"] as? String      // may be "" to clear
+            let allDay = o["allDay"] as? Bool
+            let force = (o["force"] as? Bool) ?? false
+
+            if newStart != nil || newEnd != nil {
+                let effStart = newStart ?? a.startAt ?? s
+                let effEnd = newEnd ?? a.endAt ?? effStart
+                let conflicts = try services.store.scheduleConflicts(start: effStart, end: effEnd, excluding: [node.id])
+                if !conflicts.isEmpty && !force {
+                    return "NOT changed — the new time conflicts with: " + conflicts.map(eventLine).joined(separator: "; ")
+                        + ". Ask the user whether to reschedule, cancel the other event, or keep it anyway — if they confirm, call update_event again with force=true."
+                }
+            }
+            let updated = try services.store.applyEventEdit(
+                node, newTitle: (newTitle?.isEmpty == false) ? newTitle : nil,
+                newStart: newStart, newEnd: newEnd, location: location, allDay: allDay)
+            return "Updated: \(eventLine(updated))"
+        } catch { return "schedule error: \(error)" }
+    }
+}
+
 // MARK: - Registry
 
-/// All 11 gateway tools, registered for use by the agent loop.
+/// All 12 gateway tools, registered for use by the agent loop.
 public enum GatewayToolRegistry {
     public static let gatewayTools: [any GatewayTool] = [
         CurrentTimeGatewayTool(),
@@ -430,6 +494,7 @@ public enum GatewayToolRegistry {
         CreateEventGatewayTool(),
         QueryScheduleGatewayTool(),
         CancelEventsGatewayTool(),
+        UpdateEventGatewayTool(),
     ]
 
     /// OpenAI-style tool specs for all tools (pass directly to the model's `tools` array).

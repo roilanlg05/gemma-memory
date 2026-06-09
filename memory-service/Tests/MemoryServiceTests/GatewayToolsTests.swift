@@ -311,9 +311,9 @@ final class GatewayToolsTests: XCTestCase {
         XCTAssertEqual(names.count, Set(names).count, "Duplicate tool names: \(names)")
     }
 
-    func test_registry_has_11_tools() {
-        XCTAssertEqual(GatewayToolRegistry.gatewayTools.count, 11)
-        XCTAssertEqual(GatewayToolRegistry.gatewayToolSpecs.count, 11)
+    func test_registry_has_12_tools() {
+        XCTAssertEqual(GatewayToolRegistry.gatewayTools.count, 12)
+        XCTAssertEqual(GatewayToolRegistry.gatewayToolSpecs.count, 12)
     }
 
     func test_gatewayToolSpecs_are_valid_function_specs() {
@@ -323,5 +323,58 @@ final class GatewayToolsTests: XCTestCase {
             XCTAssertNotNil(fn?["name"])
             XCTAssertNotNil(fn?["description"])
         }
+    }
+
+    // MARK: - UpdateEventGatewayTool
+
+    private func seedEvent(_ s: Services, title: String, start: String, end: String) async {
+        _ = await CreateEventGatewayTool().run(
+            argsJSON: #"{"title":"\#(title)","start":"\#(start)","end":"\#(end)"}"#, services: s)
+    }
+
+    func test_updateEvent_location_only_applies_without_conflict_check() async throws {
+        let s = try await MainActor.run { try services() }
+        await seedEvent(s, title: "meeting", start: "2099-06-09T15:00", end: "2099-06-09T16:00")
+        let out = await UpdateEventGatewayTool().run(
+            argsJSON: #"{"start":"2099-06-09T15:00","title":"meeting","location":"Miami"}"#, services: s)
+        XCTAssertTrue(out.contains("Updated"), "Expected echo, got: \(out)")
+        XCTAssertTrue(out.contains("Miami"), "Expected new location, got: \(out)")
+        let ev = try s.store.allNodes().first { $0.kind == NodeKind.event.rawValue }!
+        XCTAssertEqual(NodeAttributes.from(ev.extra).location, "Miami")
+    }
+
+    func test_updateEvent_not_found_never_creates() async throws {
+        let s = try await MainActor.run { try services() }
+        let out = await UpdateEventGatewayTool().run(
+            argsJSON: #"{"start":"2099-06-09T15:00","title":"ghost","location":"Miami"}"#, services: s)
+        XCTAssertTrue(out.lowercased().contains("couldn't find"), "Expected not-found, got: \(out)")
+        let events = try s.store.allNodes().filter { $0.kind == NodeKind.event.rawValue }
+        XCTAssertTrue(events.isEmpty, "Must not create anything on a missed match")
+    }
+
+    func test_updateEvent_time_move_conflict_blocked_then_forced() async throws {
+        let s = try await MainActor.run { try services() }
+        await seedEvent(s, title: "meeting", start: "2099-06-09T15:00", end: "2099-06-09T16:00")
+        await seedEvent(s, title: "dentist", start: "2099-06-09T11:00", end: "2099-06-09T12:00")
+        // Move "meeting" onto the dentist slot → blocked.
+        let blocked = await UpdateEventGatewayTool().run(
+            argsJSON: #"{"start":"2099-06-09T15:00","title":"meeting","newStart":"2099-06-09T11:00","newEnd":"2099-06-09T12:00"}"#,
+            services: s)
+        XCTAssertTrue(blocked.contains("NOT changed"), "Expected conflict refusal, got: \(blocked)")
+        XCTAssertTrue(blocked.contains("dentist"), "Expected the conflicting event named, got: \(blocked)")
+        // With force → applied.
+        let forced = await UpdateEventGatewayTool().run(
+            argsJSON: #"{"start":"2099-06-09T15:00","title":"meeting","newStart":"2099-06-09T11:00","newEnd":"2099-06-09T12:00","force":true}"#,
+            services: s)
+        XCTAssertTrue(forced.contains("Updated"), "force should apply, got: \(forced)")
+    }
+
+    func test_updateEvent_time_move_no_conflict_excludes_self() async throws {
+        let s = try await MainActor.run { try services() }
+        await seedEvent(s, title: "meeting", start: "2099-06-09T15:00", end: "2099-06-09T16:00")
+        // Shorten within its own old slot — must NOT conflict with itself.
+        let out = await UpdateEventGatewayTool().run(
+            argsJSON: #"{"start":"2099-06-09T15:00","title":"meeting","newEnd":"2099-06-09T15:30"}"#, services: s)
+        XCTAssertTrue(out.contains("Updated"), "self-overlap must not block, got: \(out)")
     }
 }
