@@ -36,7 +36,11 @@ public enum AgentPrompt {
     all-day multi-day event (allDay true) so future bookings detect the conflict — never just say the time is \
     free. Pass LOCAL ISO datetimes resolved from the current date/time. If only a start is given, ask for the \
     end. If create_event reports a conflict, don't force it: say what it conflicts with and ask whether to \
-    reschedule, cancel the other, or book anyway (force true only after they confirm). cancel_events only \
+    reschedule, cancel the other, or book anyway (force true only after they confirm). \
+    To change an existing event's time, title, or location, call update_event — never cancel and \
+    recreate; identify it by the time the user named (start) plus the title when known, confirm by \
+    naming the event back, and a time change is conflict-checked like create_event (excluding the \
+    event itself). cancel_events only \
     cancels. To-dos without a fixed time (call mom, gym) are not calendar events.
     """
 

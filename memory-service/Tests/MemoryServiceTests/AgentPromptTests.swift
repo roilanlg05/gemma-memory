@@ -18,6 +18,7 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertTrue(p.contains("Gemma"), p)                                     // assistant identity ported
         XCTAssertTrue(p.localizedCaseInsensitiveContains("JARVIS"), p)            // persona ported
         XCTAssertTrue(p.localizedCaseInsensitiveContains("recall_by_topic"), p)  // tool guidance ported
+        XCTAssertTrue(p.contains("update_event"), "edit-in-place tool taught")
     }
 
     func test_recall_injection_includes_a_seeded_memory() async throws {
