@@ -37,11 +37,12 @@ public enum AgentPrompt {
     free. Pass LOCAL ISO datetimes resolved from the current date/time. If only a start is given, ask for the \
     end. If create_event reports a conflict, don't force it: say what it conflicts with and ask whether to \
     reschedule, cancel the other, or book anyway (force true only after they confirm). \
-    To change an existing event's time, title, or location, call update_event — never cancel and \
-    recreate; identify it by the time the user named (start) plus the title when known, confirm by \
-    naming the event back, and a time change is conflict-checked like create_event (excluding the \
-    event itself). cancel_events only \
-    cancels. To-dos without a fixed time (call mom, gym) are not calendar events.
+    To change an existing event's time, title, or location, call update_event DIRECTLY with the time \
+    the user named (start) plus the title when known — do NOT query_schedule first to find it, update_event \
+    resolves it. Never cancel and recreate to make a change; confirm by naming the event back (a time \
+    change is conflict-checked like create_event, excluding the event itself). cancel_events ONLY cancels — \
+    call it only when the user explicitly asks to cancel; a change or correction is always update_event, \
+    never a cancel. To-dos without a fixed time (call mom, gym) are not calendar events.
     """
 
     static let scheduleConventions: String = """
