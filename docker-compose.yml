@@ -53,6 +53,12 @@ services:
       - VOICE_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
       - MEMORY_URL=http://memory:8081
       - MEMORY_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
+      # STT: ElevenLabs Scribe (cloud). Forces English so the reply language is pinned.
+      - STT_ENGINE=elevenlabs
+      - STT_LANGUAGE=en
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_STT_MODEL=scribe_v1
+      # faster-whisper vars below are now the inert fallback (only used if STT_ENGINE is unset).
       - WHISPER_MODEL=distil-small.en   # English-only distil model: ~6x faster than small, accurate for EN
       - WHISPER_LANGUAGE=en             # user speaks English → force EN (skips detect, avoids mis-transcription)
       - WHISPER_CPU_THREADS=8           # i3-13100 has 8 threads
