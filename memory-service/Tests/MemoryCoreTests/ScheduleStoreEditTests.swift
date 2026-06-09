@@ -102,4 +102,45 @@ final class ScheduleStoreEditTests: XCTestCase {
         let some = try s.scheduleConflicts(start: epoch("2099-03-01T09:00"), end: epoch("2099-03-01T10:00"), excluding: [id])
         XCTAssertTrue(some.contains { $0.label == "gym" })
     }
+
+    func test_effectiveEditInterval_start_only_preserves_duration() throws {
+        let s = try store()
+        let id = try s.upsertEvent(title: "m", start: epoch("2099-03-01T15:00"), end: epoch("2099-03-01T16:00"),
+                                   allDay: false, location: nil, origin: .explicit)
+        let node = try s.node(id: id)!
+        // Move start 15:00 → 17:00 with no newEnd → end shifts to 18:00 (1h kept).
+        let (st, en) = s.effectiveEditInterval(for: node, newStart: epoch("2099-03-01T17:00"), newEnd: nil)
+        XCTAssertEqual(st, epoch("2099-03-01T17:00"))
+        XCTAssertEqual(en, epoch("2099-03-01T18:00"))
+    }
+
+    func test_effectiveEditInterval_explicit_end_wins() throws {
+        let s = try store()
+        let id = try s.upsertEvent(title: "m", start: epoch("2099-03-01T15:00"), end: epoch("2099-03-01T16:00"),
+                                   allDay: false, location: nil, origin: .explicit)
+        let node = try s.node(id: id)!
+        let (st, en) = s.effectiveEditInterval(for: node, newStart: epoch("2099-03-01T17:00"), newEnd: epoch("2099-03-01T17:30"))
+        XCTAssertEqual(st, epoch("2099-03-01T17:00"))
+        XCTAssertEqual(en, epoch("2099-03-01T17:30"))
+    }
+
+    func test_effectiveEditInterval_end_only_keeps_start() throws {
+        let s = try store()
+        let id = try s.upsertEvent(title: "m", start: epoch("2099-03-01T15:00"), end: epoch("2099-03-01T16:00"),
+                                   allDay: false, location: nil, origin: .explicit)
+        let node = try s.node(id: id)!
+        let (st, en) = s.effectiveEditInterval(for: node, newStart: nil, newEnd: epoch("2099-03-01T16:30"))
+        XCTAssertEqual(st, epoch("2099-03-01T15:00"))
+        XCTAssertEqual(en, epoch("2099-03-01T16:30"))
+    }
+
+    func test_applyEventEdit_start_only_move_preserves_duration() throws {
+        let s = try store()
+        let id = try s.upsertEvent(title: "m", start: epoch("2099-03-01T15:00"), end: epoch("2099-03-01T16:00"),
+                                   allDay: false, location: nil, origin: .explicit)
+        let updated = try s.applyEventEdit(try s.node(id: id)!, newStart: epoch("2099-03-01T17:00"))
+        let a = NodeAttributes.from(updated.extra)
+        XCTAssertEqual(a.startAt, epoch("2099-03-01T17:00"))
+        XCTAssertEqual(a.endAt, epoch("2099-03-01T18:00"))   // 1h duration kept
+    }
 }

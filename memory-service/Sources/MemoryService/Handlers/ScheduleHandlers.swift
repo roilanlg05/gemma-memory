@@ -110,11 +110,9 @@ struct ScheduleHandlers {
             case .ambiguous(let l): return json(["updated": false, "ambiguous": l.map(eventJSON)])
             case .found(let n):   node = n
             }
-            let a = NodeAttributes.from(node.extra)
             if b.newStart != nil || b.newEnd != nil {
-                let effStart = b.newStart ?? a.startAt ?? b.start
-                let effEnd = b.newEnd ?? a.endAt ?? effStart
-                let conflicts = try services.store.scheduleConflicts(start: effStart, end: effEnd, excluding: [node.id])
+                let interval = services.store.effectiveEditInterval(for: node, newStart: b.newStart, newEnd: b.newEnd)
+                let conflicts = try services.store.scheduleConflicts(start: interval.start, end: interval.end, excluding: [node.id])
                 if !conflicts.isEmpty && b.force != true {
                     return json(["updated": false, "conflicts": conflicts.map(eventJSON)])
                 }

@@ -453,7 +453,6 @@ public struct UpdateEventGatewayTool: GatewayTool {
             case .found(let n):
                 node = n
             }
-            let a = NodeAttributes.from(node.extra)
             let newStart = (o["newStart"] as? String).flatMap(isoToEpoch)
             let newEnd = (o["newEnd"] as? String).flatMap(isoToEpoch)
             let newTitle = (o["newTitle"] as? String)?.trimmingCharacters(in: .whitespaces)
@@ -462,9 +461,8 @@ public struct UpdateEventGatewayTool: GatewayTool {
             let force = (o["force"] as? Bool) ?? false
 
             if newStart != nil || newEnd != nil {
-                let effStart = newStart ?? a.startAt ?? s
-                let effEnd = newEnd ?? a.endAt ?? effStart
-                let conflicts = try services.store.scheduleConflicts(start: effStart, end: effEnd, excluding: [node.id])
+                let interval = services.store.effectiveEditInterval(for: node, newStart: newStart, newEnd: newEnd)
+                let conflicts = try services.store.scheduleConflicts(start: interval.start, end: interval.end, excluding: [node.id])
                 if !conflicts.isEmpty && !force {
                     return "NOT changed — the new time conflicts with: " + conflicts.map(eventLine).joined(separator: "; ")
                         + ". Ask the user whether to reschedule, cancel the other event, or keep it anyway — if they confirm, call update_event again with force=true."

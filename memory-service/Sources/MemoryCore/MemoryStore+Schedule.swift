@@ -144,6 +144,25 @@ extension MemoryStore {
     /// canonicalKey, stay scheduled. `location == ""` clears it; nil leaves a field unchanged.
     /// Precondition: caller passes a scheduled event (e.g. a `.found` from `findEditTarget`); this
     /// leaves `status` untouched, so it must not be used to edit a cancelled/done node.
+    /// The effective [start,end) an edit will produce. A start-only move (newStart set, newEnd nil)
+    /// shifts the end by the same delta so the event keeps its duration. Centralized so the
+    /// pre-edit conflict check and the persisted event always agree. Pure (no I/O).
+    public func effectiveEditInterval(for node: Node, newStart: Double?, newEnd: Double?) -> (start: Double, end: Double) {
+        let a = NodeAttributes.from(node.extra)
+        let oldStart = a.startAt ?? newStart ?? 0
+        let oldEnd = a.endAt ?? oldStart
+        let start = newStart ?? oldStart
+        let end: Double
+        if let newEnd {
+            end = newEnd
+        } else if newStart != nil {
+            end = oldEnd + (start - oldStart)   // start-only move preserves duration
+        } else {
+            end = oldEnd
+        }
+        return (start, end)
+    }
+
     @discardableResult
     public func applyEventEdit(_ node: Node, newTitle: String? = nil, newStart: Double? = nil,
                                newEnd: Double? = nil, location: String? = nil, allDay: Bool? = nil) throws -> Node {
@@ -151,8 +170,9 @@ extension MemoryStore {
         var a = NodeAttributes.from(node.extra)
         let trimmed = newTitle?.trimmingCharacters(in: .whitespaces)
         let effTitle = (trimmed?.isEmpty == false) ? trimmed! : node.label
-        if let newStart { a.startAt = newStart }
-        if let newEnd { a.endAt = newEnd }
+        let interval = effectiveEditInterval(for: node, newStart: newStart, newEnd: newEnd)
+        a.startAt = interval.start
+        a.endAt = interval.end
         if let allDay { a.allDay = allDay }
         if let location { a.location = location.isEmpty ? nil : location }
         a.canonicalKey = MemoryText.eventCanonicalKey(title: effTitle, startAt: a.startAt ?? 0)
