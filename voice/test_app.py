@@ -233,3 +233,36 @@ def test_elevenlabs_stt_raises_on_http_error(monkeypatch):
 def test_elevenlabs_stt_requires_api_key():
     with pytest.raises(RuntimeError):
         ElevenLabsScribeSTT(api_key="")
+
+
+def test_make_stt_selects_elevenlabs_when_engine_flag_set(monkeypatch):
+    monkeypatch.delenv("VOICE_FAKE_ENGINES", raising=False)
+    monkeypatch.setenv("STT_ENGINE", "elevenlabs")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "k")
+    monkeypatch.setenv("STT_LANGUAGE", "en")
+    stt = appmod._make_stt()
+    assert isinstance(stt, ElevenLabsScribeSTT)
+    assert stt._language == "en"
+
+
+def test_make_stt_elevenlabs_without_key_raises(monkeypatch):
+    monkeypatch.delenv("VOICE_FAKE_ENGINES", raising=False)
+    monkeypatch.setenv("STT_ENGINE", "elevenlabs")
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    with pytest.raises(RuntimeError):
+        appmod._make_stt()
+
+
+def test_make_stt_fake_when_fake_engines(monkeypatch):
+    monkeypatch.setenv("VOICE_FAKE_ENGINES", "1")
+    from engines import FakeSTT
+    assert isinstance(appmod._make_stt(), FakeSTT)
+
+
+def test_make_stt_implicit_elevenlabs_when_key_present_no_flag(monkeypatch):
+    # No explicit STT_ENGINE, but a key present → implicitly selects ElevenLabs (documents the
+    # "stray key silently switches engine" behavior the startup log line surfaces).
+    monkeypatch.delenv("VOICE_FAKE_ENGINES", raising=False)
+    monkeypatch.delenv("STT_ENGINE", raising=False)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "k")
+    assert isinstance(appmod._make_stt(), ElevenLabsScribeSTT)

@@ -21,6 +21,19 @@ def _make_stt():
     if os.environ.get("VOICE_FAKE_ENGINES") == "1":
         from engines import FakeSTT
         return FakeSTT()
+    engine = os.environ.get("STT_ENGINE", "").lower()
+    api_key = os.environ.get("ELEVENLABS_API_KEY", "")
+    # Opt into ElevenLabs by explicit flag, or implicitly when a key is present and no other engine
+    # was chosen. Fail fast if the flag is set without a key (don't silently fall back to whisper).
+    if engine == "elevenlabs" or (engine == "" and api_key):
+        if not api_key:
+            raise RuntimeError("STT_ENGINE=elevenlabs but ELEVENLABS_API_KEY is not set")
+        from engines import ElevenLabsScribeSTT
+        return ElevenLabsScribeSTT(
+            api_key=api_key,
+            model=os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1"),
+            language=os.environ.get("STT_LANGUAGE") or None,
+        )
     from engines import FasterWhisperSTT
     return FasterWhisperSTT(os.environ.get("WHISPER_MODEL", "small"))
 
@@ -36,6 +49,9 @@ def _make_tts():
 # Built once at import (engines load their models once); fakes when VOICE_FAKE_ENGINES=1.
 _stt = _make_stt()
 _tts = _make_tts()
+# Log the active engines at startup so a silent STT switch (e.g. a stray ELEVENLABS_API_KEY in the
+# env implicitly selecting the cloud engine) is observable in the container logs.
+print(f"[voice] engines: stt={type(_stt).__name__} tts={type(_tts).__name__}", flush=True)
 
 
 def call_agent(text: str, thread_id: str, timezone: str | None, language: str | None = None) -> str:
