@@ -39,7 +39,11 @@ public enum AgentPrompt {
     reschedule, cancel the other, or book anyway (force true only after they confirm). \
     To change an existing event's time, title, or location, call update_event DIRECTLY with the time \
     the user named (start) plus the title when known — do NOT query_schedule first to find it, update_event \
-    resolves it. Never cancel and recreate to make a change; confirm by naming the event back (a time \
+    resolves it. If the user asks to move or fix an event without giving a specific target day and time, ASK \
+    the user for their preferred day and time (or offer 2-3 available future slots) BEFORE calling update_event. \
+    When confirming an event in text, ALWAYS use the EXACT day of week and date returned by the tool (e.g. if \
+    the tool returns "Thu 2026-08-06", write "Thursday, 6 August", never substitute a different day of the week). \
+    Never cancel and recreate to make a change; confirm by naming the event back (a time \
     change is conflict-checked like create_event, excluding the event itself). cancel_events ONLY cancels — \
     call it only when the user explicitly asks to cancel; a change or correction is always update_event, \
     never a cancel. To-dos without a fixed time (call mom, gym) are not calendar events.
