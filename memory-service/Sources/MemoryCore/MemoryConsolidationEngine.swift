@@ -232,32 +232,64 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     }
 
     // MARK: Detect — mine unresolved threads into follow_up nodes
-    private struct FollowUpsOut: Decodable { struct F: Decodable { let text: String; let sources: [String]? }; let followUps: [F] }
+    private struct FollowUpsOut: Decodable {
+        struct F: Decodable { let text: String; let sources: [String]? }
+        let followUps: [F]?
+        let resolvedTexts: [String]?
+    }
 
     /// Detect unresolved intents / open conversational threads from the recent episodes,
-    /// storing them as pending `follow_up` nodes for proactive surfacing on wake.
+    /// storing them as pending `follow_up` nodes for proactive surfacing on wake,
+    /// and marking previously pending follow-ups as completed when resolved.
     public func detectFollowUps(episodeTexts: [String]) async {
         guard !episodeTexts.isEmpty else { return }
         let convo = episodeTexts.joined(separator: "\n")
+        let allNodes = (try? store.allNodes()) ?? []
+        let pendingNodes = allNodes.filter { $0.kind == NodeKind.followUp.rawValue && NodeAttributes.from($0.extra).status != "completed" }
+        let pendingList = pendingNodes.prefix(20).map { "- \($0.body)" }.joined(separator: "\n")
+        let pendingBlock = pendingList.isEmpty ? "None" : pendingList
+
         let prompt = """
-        This is a recent conversation with ONE user. List anything LEFT UNRESOLVED that's worth following up on later: tasks/intentions the user mentioned, open questions, or a topic/story they started but didn't finish. Output JSON only. Don't invent; only genuine loose ends.
-        Example: user said "tengo que llamar al dentista" and "te iba a contar de mi viaje pero…" → {"followUps":[{"text":"call the dentist","sources":[]},{"text":"hear about the user's trip","sources":[]}]}
-        Schema: {"followUps":[{"text":"<short follow-up>","sources":["<entity label>"]}]}
+        This is a recent conversation with ONE user.
+        Current pending follow-ups:
+        \(pendingBlock)
+
+        Tasks:
+        1. List any NEW unresolved loose ends worth following up on later (tasks/intentions, open questions, or unfinished stories).
+        2. List exact texts of any pending follow-ups above that were RESOLVED or COMPLETED in this conversation.
+
+        Output JSON only. Don't invent; only genuine loose ends.
+        Example: {"followUps":[{"text":"call dentist","sources":["dentist"]}],"resolvedTexts":["hear about trip"]}
+        Schema: {"followUps":[{"text":"<short follow-up>","sources":["<entity label>"]}],"resolvedTexts":["<text of resolved follow-up>"]}
         Conversation:
         \(convo)
         JSON:
         """
         guard let out = parse(await generate(prompt, maxTokens: 512), FollowUpsOut.self) else { return }
-        // Label-only resolution (like reflect): a source must match an existing node's label
-        // by dedupKey; unresolvable labels are skipped.
-        let allNodes = (try? store.allNodes()) ?? []
+
+        // Process resolved follow-ups
+        if let resolved = out.resolvedTexts {
+            for resText in resolved {
+                let resKey = MemoryText.dedupKey(resText)
+                if let match = pendingNodes.first(where: { MemoryText.dedupKey($0.body) == resKey || MemoryText.dedupKey($0.label) == resKey }) {
+                    var attrs = NodeAttributes.from(match.extra)
+                    attrs.status = "completed"
+                    var updated = match
+                    updated.extra = attrs.toJSON()
+                    updated.deleted = true
+                    updated.dirty = true
+                    try? store.upsert(updated)
+                }
+            }
+        }
+
         func resolve(_ label: String) -> Node? {
             let key = MemoryText.dedupKey(label)
             return allNodes.first { MemoryText.dedupKey($0.label) == key }
         }
         var existing = Set(allNodes.filter { $0.kind == NodeKind.followUp.rawValue }.map { MemoryText.dedupKey($0.body) })
         var added = 0
-        for f in out.followUps {
+        for f in out.followUps ?? [] {
             let text = f.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let key = MemoryText.dedupKey(text)
             if text.isEmpty || existing.contains(key) { continue }
@@ -274,7 +306,11 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             } else {
                 _ = try? store.upsertMerging(node)
             }
-            // Link the follow_up to each resolved source entity (mirrors reflect()'s source edges).
+            // Link the follow_up to self:user and to each resolved source entity.
+            if let selfNode = try? store.selfNode() {
+                try? store.upsert(Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: node.id, relation: .relatedTo, weight: 1,
+                                       confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+            }
             for src in (f.sources ?? []).compactMap(resolve) where src.id != node.id {
                 try? store.upsert(Edge(id: UUID().uuidString, srcId: node.id, dstId: src.id, relation: .relatedTo, weight: 1,
                                        confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
