@@ -50,15 +50,16 @@ private func eventLine(_ n: Node) -> String {
 
 public struct CurrentTimeGatewayTool: GatewayTool {
     public static let name = "get_current_time"
-    public static let description = "Returns the user's current local date and time. Call this whenever the user asks what time or date it is."
+    public static let description = "Returns the user's current local date, day of week, and time. Call this whenever the user asks what time/date it is or when resolving relative dates."
     public static let parameters: [GatewayToolParam] = []
     public init() {}
 
     public func run(argsJSON: String, services: Services) async -> String {
         let fmt = DateFormatter()
-        fmt.dateStyle = .medium
-        fmt.timeStyle = .short
-        return fmt.string(from: Date())
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = .current
+        fmt.dateFormat = "yyyy-MM-dd (EEEE) HH:mm"
+        return "Current local date and time: \(fmt.string(from: Date()))."
     }
 }
 
@@ -345,6 +346,10 @@ public struct CreateEventGatewayTool: GatewayTool {
         let allDay = (o["allDay"] as? Bool) ?? false
         let location = (o["location"] as? String)?.trimmingCharacters(in: .whitespaces)
         let force = (o["force"] as? Bool) ?? false
+        let now = Date().timeIntervalSince1970
+        if s < now - 60 && !force {
+            return "NOT scheduled — the requested start time (\(epochToHuman(s))) is in the PAST relative to current time (\(epochToHuman(now))). If you meant a future date (e.g. next week), please provide a future date or call create_event again with force=true."
+        }
         do {
             let result = try services.store.createEventChecked(
                 title: title, start: s, end: e, allDay: allDay,
@@ -466,6 +471,11 @@ public struct UpdateEventGatewayTool: GatewayTool {
             let location = o["location"] as? String      // may be "" to clear
             let allDay = o["allDay"] as? Bool
             let force = (o["force"] as? Bool) ?? false
+
+            let now = Date().timeIntervalSince1970
+            if let ns = newStart, ns < now - 60 && !force {
+                return "NOT updated — the new start time (\(epochToHuman(ns))) is in the PAST relative to current time (\(epochToHuman(now))). If you meant a future date (e.g. next week), please provide a future date or call update_event again with force=true."
+            }
 
             if newStart != nil || newEnd != nil {
                 let interval = services.store.effectiveEditInterval(for: node, newStart: newStart, newEnd: newEnd)
