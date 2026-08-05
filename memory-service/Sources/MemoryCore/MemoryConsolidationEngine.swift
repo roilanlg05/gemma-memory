@@ -385,7 +385,109 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     // MARK: Reflect — Abstract (grounded insights)
     private struct InsightsOut: Decodable { struct I: Decodable { let text: String; let sourceEntities: [String]; let confidence: String? }; let insights: [I] }
 
+    // MARK: Reflect Topics — Topic/Event-based implicit synthesis (travel, health, projects)
+    private struct TopicReflectionOut: Decodable {
+        struct Insight: Decodable { let text: String; let sourceEntities: [String]? }
+        struct ImplicitTask: Decodable { let text: String; let horizon: String? }
+        let insights: [Insight]?
+        let implicitTasks: [ImplicitTask]?
+        let companions: [String]?
+    }
+
+    public func reflectTopics() async {
+        let allNodes = (try? store.allNodes()) ?? []
+        let topics = allNodes.filter {
+            $0.kind == NodeKind.event.rawValue || $0.kind == NodeKind.plan.rawValue || $0.kind == NodeKind.topic.rawValue
+        }
+        guard !topics.isEmpty else { return }
+
+        var addedInsights = 0
+        var addedTasks = 0
+
+        for topic in topics.prefix(15) {
+            let edges = (try? store.edges(from: topic.id)) ?? []
+            let neighbors = edges.compactMap { try? store.node(id: $0.dstId) }
+            let memberText = ([topic] + neighbors).map { "\($0.kind): \($0.label) (\($0.body))" }.joined(separator: "\n")
+
+            let prompt = """
+            Today is \(todayString()). Analyze this topic/event/plan about the user:
+            Topic: \(topic.label) (\(topic.body))
+            Associated entities:
+            \(memberText)
+
+            Synthesize implicit knowledge about this topic:
+            1. `insights`: Higher-level grounded facts or patterns about the user and this topic.
+            2. `implicitTasks`: IMPLICIT preparation needs, requirements, packing, flights, reservations, or follow-up tasks logically implied by this topic that the user may not have explicitly stated.
+            3. `companions`: Exact names of people involved or traveling/participating with the user.
+
+            Output JSON only.
+            Schema: {"insights":[{"text":"...","sourceEntities":["..."]}],"implicitTasks":[{"text":"...","horizon":"short|long"}],"companions":["..."]}
+            JSON:
+            """
+            guard let out = parse(await generate(prompt, maxTokens: 512), TopicReflectionOut.self) else { continue }
+
+            let t = now()
+            for ins in out.insights ?? [] {
+                let text = ins.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.isEmpty { continue }
+                let node = Node(id: UUID().uuidString, kind: NodeKind.insight.rawValue, label: String(text.prefix(60)),
+                                body: text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 4,
+                                decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
+                                ttlExpiresAt: nil, sourceRef: topic.id, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
+                let emb = (try? embedder?.embed(node.label)) ?? nil
+                if let embedder, embedder.dimension > 16 {
+                    _ = try? store.upsertMergingSemantic(node, embedding: emb, embedder: embedder, threshold: 0.15)
+                } else {
+                    _ = try? store.upsertMerging(node)
+                }
+                try? store.upsert(Edge(id: UUID().uuidString, srcId: topic.id, dstId: node.id, relation: .derivesFrom,
+                                       weight: 1, confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                if let selfNode = try? store.selfNode() {
+                    try? store.upsert(Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: node.id, relation: .relatedTo,
+                                           weight: 1, confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                }
+                addedInsights += 1
+            }
+
+            for task in out.implicitTasks ?? [] {
+                let text = task.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.isEmpty { continue }
+                var attrs = NodeAttributes(); attrs.status = "pending"; attrs.horizon = task.horizon ?? "short"
+                let node = Node(id: UUID().uuidString, kind: NodeKind.task.rawValue, label: String(text.prefix(60)),
+                                body: text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3,
+                                decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
+                                ttlExpiresAt: nil, sourceRef: topic.id, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
+                let emb = (try? embedder?.embed(node.label)) ?? nil
+                if let embedder, embedder.dimension > 16 {
+                    _ = try? store.upsertMergingSemantic(node, embedding: emb, embedder: embedder, threshold: 0.15)
+                } else {
+                    _ = try? store.upsertMerging(node)
+                }
+                try? store.upsert(Edge(id: UUID().uuidString, srcId: topic.id, dstId: node.id, relation: .relatedTo,
+                                       weight: 1, confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                addedTasks += 1
+            }
+
+            for cName in out.companions ?? [] {
+                let key = MemoryText.dedupKey(cName)
+                if let cNode = allNodes.first(where: { $0.kind == NodeKind.person.rawValue && MemoryText.dedupKey($0.label) == key }) {
+                    try? store.upsert(Edge(id: UUID().uuidString, srcId: topic.id, dstId: cNode.id, relation: .relatedTo,
+                                           weight: 1, confidence: .sure, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                    if let selfNode = try? store.selfNode() {
+                        try? store.upsert(Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: cNode.id, relation: .family,
+                                               weight: 1, confidence: .sure, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                    }
+                }
+            }
+        }
+
+        if addedInsights > 0 || addedTasks > 0 {
+            onProgress?("+\(addedInsights) topic insights, +\(addedTasks) implicit tasks")
+        }
+    }
+
     public func reflect() async {
+        await reflectTopics()
         let clusters = (try? store.clusterNodes()) ?? []
         guard !clusters.isEmpty else { return }
         // Dedup against insights already in the store (runLight reflects frequently over stable clusters).
@@ -419,15 +521,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 existingInsights.insert(key)
                 let t = now()
                 let conf = Confidence(rawValue: ins.confidence ?? "probable") ?? .probable
-                // Identity promotion (CAPA 4): an insight from a substantial cluster (≥4 members),
-                // confidently held, becomes always-injected identity knowledge linked to the self.
-                // KNOWN LIMITATION (B2): a promoted insight is never demoted if its cluster later
-                // shrinks below the threshold — dedup blocks re-mint, so the old identity node persists.
-                // A demotion pass (re-evaluate identity insights vs current cluster membership) is future work.
                 let promote = members.count >= 4 && conf != .maybe
                 let layer: MemoryLayer = promote ? .identity : .daily
-                // 7 (not 8): a derived identity insight ranks just BELOW an asserted permanent fact
-                // (extraction sets those to 8) when coreMemories orders by salience.
                 let node = Node(id: UUID().uuidString, kind: NodeKind.insight.rawValue, label: String(ins.text.prefix(60)),
                                 body: ins.text, layer: layer, createdAt: t, updatedAt: t, lastSeenAt: t,
                                 salience: promote ? 7 : 3, decayRate: Decay.defaultDecayRate(for: layer), confidence: conf,
@@ -743,9 +838,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         if isCancelled() { return }
         await associate()
         if isCancelled() { return }
-        // reflect() is now cluster-dependent (SP-B2) and clustering is sleep-only (SP-B1), so
-        // reflection runs in the full sleep cycle (after cluster()), not on the frequent awake
-        // path — running it here would only re-scan stale clusters and waste model calls.
+        await reflectTopics()
+        if isCancelled() { return }
         await clarify()
     }
 }
