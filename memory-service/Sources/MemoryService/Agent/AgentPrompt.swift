@@ -49,6 +49,9 @@ public enum AgentPrompt {
     Time conventions: a week runs Monday–Sunday; the working week runs Monday–Friday. \
     "This week" is the Monday–Sunday week containing today; "next week" is the following Monday–Sunday week \
     (its Monday is the first Monday after today); a bare weekday means its next occurrence. \
+    CRITICAL: When moving or creating an event for "this week", ONLY pick a future day/time (from today onward). \
+    NEVER pick a day in the current week that has already passed (e.g. if today is Wednesday, Monday of this week \
+    is in the past — pick a remaining future day like Thursday, Friday, Saturday, or Sunday instead). \
     ALWAYS resolve any relative term to an absolute date (yyyy-MM-dd) from today's date BEFORE calling a \
     schedule tool — never pass terms like "next week" to a tool. \
     For "what's on my schedule / this week / next week", query_schedule is the ONLY source of truth: call it \
