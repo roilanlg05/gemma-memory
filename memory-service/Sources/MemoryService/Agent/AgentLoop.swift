@@ -36,9 +36,16 @@ public struct AgentLoop {
         var tail = AgentPrompt.recallTail(query: text, threadId: threadId, services: services)
         let langDir = AgentPrompt.languageDirective(language)
         if !langDir.isEmpty { tail = tail.isEmpty ? langDir : tail + "\n\n" + langDir }
-        // Iteration 0: recall tail (nowContext + injected memory + language) prepended so the
-        // system-prompt prefix stays byte-stable (mirrors app's Agent.run APC strategy).
-        var currentPrompt = tail.isEmpty ? text : tail + "\n\n" + text
+        // Build short-term context from recent transcript turns of this thread
+        let recentRows = (try? services.transcript.recent(threadId: threadId, maxTurns: 10, maxChars: 3000)) ?? []
+        var chatBlock = ""
+        if !recentRows.isEmpty {
+            let lines = recentRows.map { "[\($0.role.uppercased())]: \($0.text)" }.joined(separator: "\n")
+            chatBlock = "Recent conversation context:\n\(lines)\n\n"
+        }
+
+        // Iteration 0: short-term chat context + recall tail (nowContext + injected memory + language) prepended
+        var currentPrompt = chatBlock + (tail.isEmpty ? text : tail + "\n\n" + text)
         let specs = GatewayToolRegistry.gatewayToolSpecs
         var lastText = ""
 
