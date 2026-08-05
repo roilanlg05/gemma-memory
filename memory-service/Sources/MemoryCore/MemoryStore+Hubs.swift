@@ -59,11 +59,36 @@ public extension MemoryStore {
                     "SELECT 1 FROM edge WHERE srcId = ? AND dstId = ? AND relation = ? AND deleted = 0 LIMIT 1",
                     arguments: [hubID, n.id, Relation.belongsToHub.rawValue]) ?? false
                 if !exists {
-                    try Edge(id: UUID().uuidString,
-                             srcId: hubID, dstId: n.id,
-                             relation: .belongsToHub, weight: 1, confidence: .sure,
-                             createdAt: now, updatedAt: now,
-                             dirty: false, deleted: false, extra: nil).insert(db)
+                    let edge = Edge(id: UUID().uuidString, srcId: hubID, dstId: n.id,
+                                    relation: .belongsToHub, weight: 1, confidence: .sure,
+                                    createdAt: now, updatedAt: now, dirty: false, deleted: false, extra: nil)
+                    try edge.insert(db)
+                    created += 1
+                }
+            }
+
+            // Backfill edges connecting `self:user` to atomic nodes that lack connections to self.
+            if let selfNode = try Node.fetchOne(db, key: selfUserID) {
+                let unlinked = try Node.fetchAll(db, sql: """
+                    SELECT n.* FROM node n
+                    WHERE n.deleted = 0
+                      AND n.id != ?
+                      AND n.kind IN ('person', 'place', 'preference', 'fact', 'trait')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM edge e
+                        WHERE e.deleted = 0
+                          AND (e.srcId = ? OR e.dstId = ?)
+                          AND (e.srcId = n.id OR e.dstId = n.id)
+                      )
+                """, arguments: [selfUserID, selfUserID, selfUserID])
+
+                for n in unlinked {
+                    let rel: Relation = (n.kind == NodeKind.preference.rawValue) ? .likes : .relatedTo
+                    let edge = Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: n.id, relation: rel,
+                                    weight: 1, confidence: .sure, createdAt: now, updatedAt: now,
+                                    dirty: true, deleted: false, extra: nil)
+                    try edge.insert(db)
+                    created += 1
                 }
             }
         }

@@ -120,7 +120,14 @@ public struct SaveMemoryGatewayTool: GatewayTool {
         )
         let embedding: [Float]? = try? services.embedder.embed(rawEntity)
         do {
-            _ = try services.store.upsertMergingSemantic(candidate, embedding: embedding, embedder: services.embedder)
+            let savedId = try services.store.upsertMergingSemantic(candidate, embedding: embedding, embedder: services.embedder)
+            if let selfNode = try? services.store.selfNode() {
+                let rel: Relation = (kind == NodeKind.preference.rawValue) ? .likes : .relatedTo
+                let edge = Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: savedId, relation: rel,
+                                weight: 1, confidence: .sure, createdAt: now, updatedAt: now,
+                                dirty: true, deleted: false, extra: nil)
+                try? services.store.upsert(edge)
+            }
             return "Saved: \(rawEntity)"
         } catch { return "memory error: \(error)" }
     }

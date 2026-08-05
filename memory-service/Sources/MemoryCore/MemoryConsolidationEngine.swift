@@ -306,7 +306,11 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         guard let out = parse(await generate(prompt, maxTokens: 512), EdgesOut.self) else { return }
         func resolve(_ label: String) -> Node? {
             let key = MemoryText.dedupKey(label)
+            if key == "self" || key == "user" || key == "me" || key == "yo" {
+                if let selfN = try? store.selfNode() { return selfN }
+            }
             if let n = nodes.first(where: { MemoryText.dedupKey($0.label) == key }) { return n }
+            if let selfN = try? store.selfNode(), MemoryText.dedupKey(selfN.label) == key { return selfN }
             // 0.25 is intentionally looser than upsertMergingSemantic's 0.2 dedup default: linking
             // an edge endpoint tolerates more drift than merging two nodes into one.
             if let emb = (try? embedder?.embed(label)) ?? nil,
