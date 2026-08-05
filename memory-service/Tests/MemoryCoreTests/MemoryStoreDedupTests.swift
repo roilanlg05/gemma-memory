@@ -175,4 +175,30 @@ final class MemoryStoreDedupTests: XCTestCase {
         XCTAssertFalse(labels.contains("tmp"))
         XCTAssertTrue(labels.contains("name"))
     }
+
+    func test_cross_kind_atomic_deduplication() throws {
+        let store = try makeStore()
+        let n1 = node(id: "n1", kind: NodeKind.fact.rawValue, label: "soccer")
+        let n2 = node(id: "n2", kind: NodeKind.preference.rawValue, label: "soccer")
+        _ = try store.upsertMerging(n1)
+        let id2 = try store.upsertMerging(n2)
+        XCTAssertEqual(id2, "n1", "fact and preference nodes with matching dedupKey must merge into the same node")
+        let all = try store.allNodes()
+        XCTAssertEqual(all.count, 1)
+        XCTAssertEqual(all[0].kind, NodeKind.preference.rawValue, "generic fact kind should upgrade to specific preference kind")
+    }
+
+    func test_task_and_plan_deduplicate_on_upsertMergingSemantic() throws {
+        let store = try makeStore()
+        let emb = KeywordEmbedder()
+        let n1 = node(id: "t1", kind: NodeKind.task.rawValue, label: "sushi for lunch")
+        let n2 = node(id: "t2", kind: NodeKind.task.rawValue, label: "get sushi")
+        _ = try store.upsertMergingSemantic(n1, embedding: nil, embedder: emb)
+        let id2 = try store.upsertMergingSemantic(n2, embedding: nil, embedder: emb)
+        XCTAssertEqual(id2, "t1", "task nodes with matching semantic embeddings must merge on upsertMergingSemantic")
+        let tasks = try store.allNodes().filter { $0.kind == NodeKind.task.rawValue }
+        XCTAssertEqual(tasks.count, 1)
+        XCTAssertEqual(tasks[0].mentionCount, 2)
+    }
 }
+

@@ -140,17 +140,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             decayRate: Decay.defaultDecayRate(for: layer), confidence: .probable, mentionCount: 1,
                             ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                             dirty: true, deleted: false, extra: attrs.toJSON())
-            let eventKinds: Set<String> = [NodeKind.task.rawValue, NodeKind.plan.rawValue]
             let emb = (try? embedder?.embed(label)) ?? nil
-            if eventKinds.contains(kind) {
-                // Events are distinct occurrences — never auto-merge (would lose a meeting).
-                // Ambiguous same-vs-different is resolved by clarify() asking the user (Task 3).
-                do {
-                    try store.upsert(node)
-                    if let emb { try store.setEmbedding(nodeId: node.id, emb) }
-                    added += 1
-                } catch {}
-            } else if (try? store.upsertMergingSemantic(node, embedding: emb, embedder: embedder)) != nil {
+            if (try? store.upsertMergingSemantic(node, embedding: emb, embedder: embedder)) != nil {
                 added += 1
             }
         }
@@ -277,7 +268,12 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             body: text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3,
                             decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
                             ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
-            try? store.upsert(node)
+            let fEmb = (try? embedder?.embed(node.label)) ?? nil
+            if let embedder, embedder.dimension > 16 {
+                _ = try? store.upsertMergingSemantic(node, embedding: fEmb, embedder: embedder, threshold: 0.15)
+            } else {
+                _ = try? store.upsertMerging(node)
+            }
             // Link the follow_up to each resolved source entity (mirrors reflect()'s source edges).
             for src in (f.sources ?? []).compactMap(resolve) where src.id != node.id {
                 try? store.upsert(Edge(id: UUID().uuidString, srcId: node.id, dstId: src.id, relation: .relatedTo, weight: 1,
@@ -384,7 +380,12 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                                 salience: promote ? 7 : 3, decayRate: Decay.defaultDecayRate(for: layer), confidence: conf,
                                 mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                                 dirty: true, deleted: false, extra: nil)
-                try? store.upsert(node)
+                let insEmb = (try? embedder?.embed(node.label)) ?? nil
+                if let embedder, embedder.dimension > 16 {
+                    _ = try? store.upsertMergingSemantic(node, embedding: insEmb, embedder: embedder, threshold: 0.15)
+                } else {
+                    _ = try? store.upsertMerging(node)
+                }
                 for s in sources {
                     try? store.upsert(Edge(id: UUID().uuidString, srcId: node.id, dstId: s.id, relation: .derivesFrom, weight: 1,
                                            confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))

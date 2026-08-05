@@ -4,15 +4,41 @@ import GRDB
 /// Consolidation: dedup/merge on write (human memory consolidates, doesn't accumulate
 /// duplicates) + a forgetting sweep. Built on the Phase 1 MemoryStore CRUD + Phase 2 Decay.
 extension MemoryStore {
+    /// Atomic memory kinds that can cross-deduplicate (e.g. preference vs fact for the same entity).
+    public static let atomicKinds: Set<String> = [
+        NodeKind.person.rawValue, NodeKind.place.rawValue, NodeKind.fact.rawValue,
+        NodeKind.preference.rawValue, NodeKind.trait.rawValue
+    ]
+
+    /// Helper to prevent merging distinct occurrences (e.g. tasks/events with explicitly different dates).
+    private func isSameOccurrence(existing: Node, candidate: Node?) -> Bool {
+        guard let candidate else { return true }
+        let eDate = NodeAttributes.from(existing.extra).date
+        let cDate = NodeAttributes.from(candidate.extra).date
+        if let eDate, let cDate, eDate != cDate {
+            return false
+        }
+        return true
+    }
+
     /// Find an existing non-deleted node to merge into, by (kind, canonical label). Uses
     /// MemoryText.dedupKey so "Sushi", "sushi" and "me gusta el sushi" all collapse together —
     /// the cause of the duplicate "Juan ×3 / sushi ×N" rows seen on device.
-    public func findDuplicate(kind: String, label: String) throws -> Node? {
+    /// For atomic kinds (person, place, fact, preference, trait), matches across atomic kinds.
+    public func findDuplicate(kind: String, label: String, candidate: Node? = nil) throws -> Node? {
         let key = MemoryText.dedupKey(label)
+        let isAtomic = Self.atomicKinds.contains(kind)
         return try dbQueue.read { db in
-            try Node.filter(Column("kind") == kind && Column("deleted") == false)
-                .fetchAll(db)
-                .first { MemoryText.dedupKey($0.label) == key }
+            let nodes: [Node]
+            if isAtomic {
+                nodes = try Node.filter(Column("deleted") == false)
+                    .fetchAll(db)
+                    .filter { Self.atomicKinds.contains($0.kind) }
+            } else {
+                nodes = try Node.filter(Column("kind") == kind && Column("deleted") == false)
+                    .fetchAll(db)
+            }
+            return nodes.first { MemoryText.dedupKey($0.label) == key && isSameOccurrence(existing: $0, candidate: candidate) }
         }
     }
 
@@ -20,7 +46,7 @@ extension MemoryStore {
     /// maybe promote to identity); else insert the candidate. Returns the resulting node id.
     @discardableResult
     public func upsertMerging(_ candidate: Node) throws -> String {
-        if let existing = try findDuplicate(kind: candidate.kind, label: candidate.label) {
+        if let existing = try findDuplicate(kind: candidate.kind, label: candidate.label, candidate: candidate) {
             let merged = mergeReinforced(existing: existing, candidate: candidate)
             try upsert(merged)
             return merged.id
@@ -30,13 +56,18 @@ extension MemoryStore {
         }
     }
 
-    /// Nearest same-kind, non-deleted node within `threshold` cosine distance, or nil.
-    /// Fetches a generous candidate set (k=64) and filters to `kind` AFTER, so a same-kind
-    /// duplicate ranked beyond the global top-8 (because closer other-kind vectors crowd it out)
-    /// isn't silently missed. `nearest` scans the whole table anyway, so a larger k is cheap.
-    public func findSemanticDuplicate(kind: String, embedding: [Float], threshold: Double) throws -> Node? {
+    /// Nearest same-kind (or atomic-kind), non-deleted node within `threshold` cosine distance, or nil.
+    /// Fetches a generous candidate set (k=64) and filters AFTER, so a duplicate ranked beyond top-8
+    /// isn't silently missed.
+    public func findSemanticDuplicate(kind: String, embedding: [Float], threshold: Double, candidate: Node? = nil) throws -> Node? {
+        let isAtomic = Self.atomicKinds.contains(kind)
         for hit in try nearest(to: embedding, k: 64) where hit.distance <= threshold {
-            if let n = try node(id: hit.id), !n.deleted, n.kind == kind { return n }
+            if let n = try node(id: hit.id), !n.deleted {
+                let matchesKind = (n.kind == kind) || (isAtomic && Self.atomicKinds.contains(n.kind) && candidate != nil && MemoryText.dedupKey(n.label) == MemoryText.dedupKey(candidate!.label))
+                if matchesKind && isSameOccurrence(existing: n, candidate: candidate) {
+                    return n
+                }
+            }
         }
         return nil
     }
@@ -52,8 +83,8 @@ extension MemoryStore {
         if embedding == nil, let embedder { embedding = try? embedder.embed(candidate.label) }
 
         var existing: Node? = nil
-        if let embedding { existing = try findSemanticDuplicate(kind: candidate.kind, embedding: embedding, threshold: threshold) }
-        if existing == nil { existing = try findDuplicate(kind: candidate.kind, label: candidate.label) }
+        if let embedding { existing = try findSemanticDuplicate(kind: candidate.kind, embedding: embedding, threshold: threshold, candidate: candidate) }
+        if existing == nil { existing = try findDuplicate(kind: candidate.kind, label: candidate.label, candidate: candidate) }
 
         if let existing {
             let merged = mergeReinforced(existing: existing, candidate: candidate)
@@ -73,6 +104,10 @@ extension MemoryStore {
     /// Shared merge: EMA-reinforce salience, bump mentionCount, refresh times, promote if due.
     private func mergeReinforced(existing: Node, candidate: Node) -> Node {
         var merged = existing
+        // Upgrade generic `fact` to a more specific atomic kind if candidate is specific
+        if existing.kind == NodeKind.fact.rawValue && candidate.kind != NodeKind.fact.rawValue && Self.atomicKinds.contains(candidate.kind) {
+            merged.kind = candidate.kind
+        }
         merged.salience = Decay.reinforceEMA(current: existing.salience, beta: Decay.beta(for: existing.layer))
         merged.mentionCount = existing.mentionCount + 1
         merged.lastSeenAt = candidate.lastSeenAt
