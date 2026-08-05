@@ -108,7 +108,18 @@ public enum AgentPrompt {
         // conversation across turns (the gateway was previously stateless per turn).
         let history = conversationBlock(threadId: threadId, services: services)
         let qv = try? services.embedder.embed(query)
-        let nodes = (try? services.retriever.retrieve(query: query, queryVector: qv)) ?? []
+        var nodes = (try? services.retriever.retrieve(query: query, queryVector: qv)) ?? []
+        // Graph expansion: automatically include family members and close person nodes connected to self:user
+        if let selfNode = try? services.store.selfNode(),
+           let edges = try? services.store.edges(from: selfNode.id) {
+            for edge in edges {
+                if (edge.relation == .family || edge.relation == .knows || edge.relation == .worksWith),
+                   let personNode = try? services.store.node(id: edge.dstId),
+                   !nodes.contains(where: { $0.id == personNode.id }) {
+                    nodes.append(personNode)
+                }
+            }
+        }
         let recall = services.retriever.injectionBlock(for: nodes)
         return [now, history, recall].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }

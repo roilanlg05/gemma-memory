@@ -141,7 +141,20 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                             dirty: true, deleted: false, extra: attrs.toJSON())
             let emb = (try? embedder?.embed(label)) ?? nil
-            if (try? store.upsertMergingSemantic(node, embedding: emb, embedder: embedder)) != nil {
+            if let savedId = try? store.upsertMergingSemantic(node, embedding: emb, embedder: embedder) {
+                if kind == NodeKind.person.rawValue, let selfNode = try? store.selfNode() {
+                    let detailLower = (e.detail ?? "").lowercased()
+                    let rel: Relation
+                    if detailLower.contains("esposa") || detailLower.contains("hija") || detailLower.contains("hijo") || detailLower.contains("madre") || detailLower.contains("padre") || detailLower.contains("hermano") || detailLower.contains("hermana") || detailLower.contains("wife") || detailLower.contains("daughter") || detailLower.contains("son") {
+                        rel = .family
+                    } else if detailLower.contains("trabaj") || detailLower.contains("colabor") || detailLower.contains("boss") || detailLower.contains("coworker") || detailLower.contains("work") {
+                        rel = .worksWith
+                    } else {
+                        rel = .knows
+                    }
+                    try? store.upsert(Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: savedId, relation: rel,
+                                           weight: 1, confidence: .sure, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
+                }
                 added += 1
             }
         }
