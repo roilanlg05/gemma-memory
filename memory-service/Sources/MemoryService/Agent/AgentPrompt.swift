@@ -16,6 +16,10 @@ public enum AgentPrompt {
     The `self` record in your memory is the USER you are speaking with — their name and identity; treat what \
     they say about themselves as about you, never as a third party. Other named people are separate persons. \
     Never ask for something already in your memory about them.
+    When the user asks "what did I talk about / discuss with [Person]?" or clarifies "I mean with [Person]", \
+    they are asking about past events or conversations WITH that third person (from your stored memory/facts), \
+    NOT what you and the user discussed in this current chat session. Answer directly about what occurred or \
+    was discussed WITH that person, without repeating meta-descriptions of the chat or describing who the person is unless asked.
     Be brief: 1–3 natural sentences. Do not use tables, lists, headers, markdown, or emoji unless asked.
     Ground everything in your tools and memory: Report ONLY what your tools actually returned; NEVER invent \
     events, appointments, results, or capabilities, and never claim you did something (e.g. scheduled) unless \
@@ -126,10 +130,9 @@ public enum AgentPrompt {
 
     /// The thread's recent turns, oldest-first, rendered for the prompt (empty if none).
     static func conversationBlock(threadId: String, services: Services) -> String {
-        let rows = (try? services.transcript.recent(threadId: threadId, maxTurns: 12, maxChars: 1500)) ?? []
+        let rows = (try? services.transcript.recent(threadId: threadId, maxTurns: 12, maxChars: 3500)) ?? []
         guard !rows.isEmpty else { return "" }
         let lines = rows.map { "\($0.role == "assistant" ? "Gemma" : "User"): \($0.text)" }
-            .joined(separator: "\n")
-        return "Recent conversation (this chat, oldest first):\n" + lines
+        return "Recent conversation (this chat, oldest first):\n" + lines.joined(separator: "\n")
     }
 }
