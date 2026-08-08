@@ -66,7 +66,7 @@ public struct AgentLoop {
             • Someone near the user is stating something FACTUALLY INCORRECT that could cause the user real harm, financial loss, health risk, or significant confusion — AND you know the correct fact.
             • There is an immediate safety or security threat that the user needs to know about RIGHT NOW.
             
-            You MUST stay silent (reply "IGNORE") for ALL of the following:
+            You MUST stay silent (set intervene to false) for ALL of the following:
             • Normal conversation between people, even if interesting or related to you
             • Casual discussion, opinions, small talk, jokes, stories
             • Questions that aren't addressed to you
@@ -75,20 +75,38 @@ public struct AgentLoop {
             • Anything where staying quiet is equally valid
             • When in doubt
             
-            If you must intervene: reply with ONE short natural sentence only — no preamble, no explanation.
-            Otherwise reply with exactly the single word: IGNORE
+            Respond with JSON only. If you decide to intervene, set intervene to true and reply with ONE short natural sentence in 'reply'. Otherwise, set intervene to false and leave 'reply' empty.
+            
+            Schema: {"intervene": false, "reply": ""}
             """
 
             do {
                 let gate = try await client.complete(
                     systemPrompt: passiveSystemPrompt,
-                    userPrompt: "Decide: IGNORE or one-sentence intervention?",
+                    userPrompt: "Output JSON deciding whether to intervene or not.",
                     tools: []
                 )
-                let result = gate.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                // Any response that starts with IGNORE (case-insensitive) = silence
-                if result.uppercased().hasPrefix("IGNORE") || result.isEmpty { return "" }
-                return result
+                let cleanedText = gate.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                struct PassiveDecision: Decodable {
+                    let intervene: Bool
+                    let reply: String?
+                }
+                
+                // Helper to extract JSON from raw response block
+                func extractJSON(_ s: String) -> String? {
+                    guard let a = s.firstIndex(of: "{"), let b = s.lastIndex(of: "}"), a < b else { return nil }
+                    return String(s[a...b])
+                }
+                
+                if let jsonStr = extractJSON(cleanedText),
+                   let jsonData = jsonStr.data(using: .utf8),
+                   let decision = try? JSONDecoder().decode(PassiveDecision.self, from: jsonData) {
+                    if decision.intervene, let reply = decision.reply, !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        return reply.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                }
+                return ""
             } catch {
                 return ""
             }
