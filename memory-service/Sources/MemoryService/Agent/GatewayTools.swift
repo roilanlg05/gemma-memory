@@ -21,6 +21,21 @@ private func isoToEpoch(_ s: String) -> Double? {
     return f.date(from: t)?.timeIntervalSince1970
 }
 
+/// Parses the same date formats, but automatically shifts date-only strings (yyyy-MM-dd) to the end of the day.
+private func isoToEpochEnd(_ s: String) -> Double? {
+    let t = s.trimmingCharacters(in: .whitespaces)
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = .current
+    for fmt in ["yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd HH:mm", "yyyy-MM-dd'T'HH:mm:ss"] {
+        f.dateFormat = fmt
+        if let d = f.date(from: t) { return d.timeIntervalSince1970 }
+    }
+    f.dateFormat = "yyyy-MM-dd"
+    guard let d = f.date(from: t) else { return nil }
+    return d.timeIntervalSince1970 + 86399
+}
+
 /// Human-readable epoch → "EEE yyyy-MM-dd HH:mm" in local time.
 private func epochToHuman(_ e: Double) -> String {
     let f = DateFormatter()
@@ -387,7 +402,7 @@ public struct QueryScheduleGatewayTool: GatewayTool {
     public func run(argsJSON: String, services: Services) async -> String {
         let o = Self.args(argsJSON)
         guard let f = (o["from"] as? String).flatMap(isoToEpoch),
-              let t = (o["to"] as? String).flatMap(isoToEpoch) else {
+              let t = (o["to"] as? String).flatMap(isoToEpochEnd) else {
             return "I need a from/to range (e.g. 2026-06-09 to 2026-06-16)."
         }
         let includeCancelled = (o["includeCancelled"] as? Bool) ?? false
@@ -416,7 +431,7 @@ public struct CancelEventsGatewayTool: GatewayTool {
     public func run(argsJSON: String, services: Services) async -> String {
         let o = Self.args(argsJSON)
         guard let f = (o["from"] as? String).flatMap(isoToEpoch),
-              let t = (o["to"] as? String).flatMap(isoToEpoch) else {
+              let t = (o["to"] as? String).flatMap(isoToEpochEnd) else {
             return "I need a from/to range to cancel."
         }
         do {
