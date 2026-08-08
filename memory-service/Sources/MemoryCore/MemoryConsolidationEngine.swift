@@ -129,6 +129,21 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             let label = entityKinds.contains(rawKind) ? MemoryText.canonicalEntityLabel(e.entity)
                                                       : MemoryText.cleanLabel(e.entity)
             if MemoryText.isJunkLabel(label) { continue }
+            // Guard: never store temporal/relative date references as permanent fact nodes.
+            // "today", "hoy", "tomorrow", "mañana", "ayer", "yesterday" are conversation context,
+            // not durable facts. A bare date string ("5 August", "agosto 5") as a fact label is
+            // also ephemeral. Dates belong in attributes.date on event/plan/task nodes only.
+            let temporalLabels: Set<String> = [
+                "today", "hoy", "tomorrow", "mañana", "manana", "yesterday", "ayer",
+                "this week", "esta semana", "next week", "la proxima semana", "la próxima semana",
+                "tonight", "esta noche", "now", "ahora"
+            ]
+            let labelLower = label.lowercased()
+            if rawKind == NodeKind.fact.rawValue && temporalLabels.contains(labelLower) { continue }
+            // Also discard fact nodes whose label is just a date (e.g. "5 August", "agosto 5", "2026-08-08")
+            let datePattern = #"^\d{4}-\d{2}-\d{2}$|^\d{1,2}\s+\w+|^\w+\s+\d{1,2}$"#
+            if rawKind == NodeKind.fact.rawValue,
+               (try? NSRegularExpression(pattern: datePattern).firstMatch(in: labelLower, range: NSRange(labelLower.startIndex..., in: labelLower))) != nil { continue }
             let kind = rawKind
             let layer: MemoryLayer = (e.permanent ?? false) ? .identity : .daily
             var attrs = NodeAttributes(); attrs.status = e.attributes?.status; attrs.horizon = e.attributes?.horizon; attrs.date = e.attributes?.date

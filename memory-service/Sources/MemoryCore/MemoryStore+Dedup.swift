@@ -129,18 +129,33 @@ extension MemoryStore {
         return merged
     }
 
-    /// Sweep existing insight nodes and merge near-duplicates (cosine distance <= threshold).
+    /// Sweep existing insight, task, follow_up, and summary nodes, and merge near-duplicates (cosine distance <= threshold).
     /// Keeps the highest-salience node as canonical, sums mentionCount, soft-deletes the rest with a
-    /// `sameAs` edge to the canonical. Non-destructive. Idempotent. Returns the number merged.
+    /// `sameAs` edge to the canonical. Non-destructive. Idempotent. Returns the total number merged.
     @discardableResult
     public func compressInsights(embedder: Embedder?, threshold: Double = 0.15) throws -> Int {
-        let insights = try allNodes()
-            .filter { $0.kind == NodeKind.insight.rawValue }
+        let kindsToCompress: [String] = [
+            NodeKind.insight.rawValue,
+            NodeKind.task.rawValue,
+            NodeKind.followUp.rawValue,
+            NodeKind.summary.rawValue
+        ]
+        var totalMerged = 0
+        for kind in kindsToCompress {
+            let t = (kind == NodeKind.summary.rawValue) ? 0.10 : threshold
+            totalMerged += try compressKind(kind, embedder: embedder, threshold: t)
+        }
+        return totalMerged
+    }
+
+    private func compressKind(_ kind: String, embedder: Embedder?, threshold: Double) throws -> Int {
+        let nodes = try allNodes()
+            .filter { $0.kind == kind && !$0.deleted }
             .sorted { ($0.salience, Double($0.mentionCount)) > ($1.salience, Double($1.mentionCount)) }
         var kept: [(id: String, emb: [Float])] = []
         var merged = 0
         let t = Date().timeIntervalSince1970
-        for n in insights {
+        for n in nodes {
             guard let emb = try embeddingFor(nodeId: n.id, label: n.label, embedder: embedder) else { continue }
             if let hit = kept.first(where: { Self.cosineDistance($0.emb, emb) <= threshold }) {
                 if var canon = try node(id: hit.id) {
