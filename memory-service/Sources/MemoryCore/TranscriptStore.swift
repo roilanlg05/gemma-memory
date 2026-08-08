@@ -46,8 +46,11 @@ public final class TranscriptStore: @unchecked Sendable {
     /// char budget (newest kept when capping).
     public func recent(threadId: String, maxTurns: Int, maxChars: Int) throws -> [TranscriptRow] {
         let newestFirst: [TranscriptRow] = try dbQueue.read { db in
-            try TranscriptRow
-                .filter(Column("threadId") == threadId)
+            var req = TranscriptRow.all()
+            if threadId != "main" && threadId != "global" && !threadId.isEmpty {
+                req = req.filter(Column("threadId") == threadId)
+            }
+            return try req
                 // role.asc as the final tiebreaker: in this newest-first fetch (later reversed to
                 // oldest-first) "assistant" (a<u) sorts before "user" within an equal-timestamp turn,
                 // so after reversed() the user precedes the assistant.
