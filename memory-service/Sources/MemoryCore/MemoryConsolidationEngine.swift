@@ -431,7 +431,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             \(memberText)
 
             Synthesize implicit knowledge about this topic:
-            1. `insights`: Higher-level grounded facts or patterns about the user and this topic.
+            1. `insights`: Higher-level grounded facts or patterns about the user and this topic. CRITICAL: Insights MUST describe persistent user habits, preferences, relations, or long-term patterns. NEVER output an insight describing a single specific event, a specific date, or containing temporal words like 'today', 'hoy', 'tomorrow', 'mañana', 'yesterday', 'ayer', 'this weekend', etc. Generalize instead.
             2. `implicitTasks`: IMPLICIT preparation needs, requirements, packing, flights, reservations, or follow-up tasks logically implied by this topic that the user may not have explicitly stated.
             3. `companions`: Exact names of people involved or traveling/participating with the user.
 
@@ -517,6 +517,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             let prompt = """
             These memories form ONE thematic group about the user. Infer 1-2 higher-level insights or patterns they reveal. Output JSON only.
             Each insight MUST be grounded in at least TWO of the listed entities (cite their exact labels in sourceEntities). Do not speculate beyond the evidence.
+            CRITICAL: Insights MUST describe persistent user habits, preferences, relations, or long-term patterns. NEVER output an insight describing a single specific event, a specific date, or containing temporal words like 'today', 'hoy', 'tomorrow', 'mañana', 'yesterday', 'ayer', 'this weekend', etc. Generalize instead.
             Example: from `preference: sushi`, `preference: ramen` → {"insights":[{"text":"enjoys Japanese food","sourceEntities":["sushi","ramen"],"confidence":"probable"}]}
             Schema: {"insights":[{"text":"...","sourceEntities":["label1","label2"],"confidence":"probable|maybe"}]}
             Memories:

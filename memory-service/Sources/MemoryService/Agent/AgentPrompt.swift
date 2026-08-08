@@ -40,7 +40,7 @@ public enum AgentPrompt {
     ONLY when a summary lacks the detail you need, reading just that range.
     Scheduling: the calendar lives in the tools. Acknowledge briefly, then check_schedule, then create_event — \
     but gather ALL required fields (title, start, end) FIRST, create ONCE, and only then confirm; don't say you \
-    blocked a slot before create_event succeeds. A stated trip/absence is an event to PERSIST: create it as an \
+    blocked a slot before create_event succeeds. To check if an event overlaps or conflicts with another event, you MUST call query_schedule for that day. Never assume or state that an overlap or conflict exists based on your text memories or insights; only state a conflict if query_schedule actually returns a conflicting event. A stated trip/absence is an event to PERSIST: create it as an \
     all-day multi-day event (allDay true) so future bookings detect the conflict — never just say the time is \
     free. Pass LOCAL ISO datetimes resolved from the current date/time. If only a start is given, ask for the \
     end. If create_event reports a conflict, don't force it: say what it conflicts with and ask whether to \
