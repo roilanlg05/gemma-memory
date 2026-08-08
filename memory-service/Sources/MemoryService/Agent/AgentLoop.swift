@@ -28,7 +28,42 @@ public struct AgentLoop {
     ///               "Reply in <Language>." directive rides the per-turn tail to pin the reply
     ///               language to what the user actually spoke (the prompt's general rule alone
     ///               sometimes flips EN↔ES on voice turns).
-    public func run(text: String, threadId: String, services: Services, language: String? = nil) async -> String {
+    public func run(text: String, threadId: String, services: Services, language: String? = nil, isPassive: Bool = false) async -> String {
+        if isPassive {
+            let passiveSystemPrompt = """
+            You are a silent, passive AI assistant listening to background conversation around your user.
+            The user is NOT talking to you unless they explicitly ask you or mention your name, or unless it's a critical moment.
+            
+            Read the background text:
+            "\(text)"
+            
+            Determine if you should intervene. You MUST remain silent (reply with "IGNORE") unless:
+            1. There is an immediate safety/security hazard or warning you must give.
+            2. Someone is giving the user incorrect/misleading information about a fact you know.
+            3. You have a highly relevant, crucial piece of information or fact that would immediately help the user in this exact moment.
+            
+            If none of these apply, or if it is a normal/casual conversation, or nonsense/silence, reply with exactly the word:
+            IGNORE
+            
+            Otherwise, if you MUST intervene, reply with the short, natural sentence you want to say to help or warn the user.
+            """
+            
+            do {
+                let classification = try await client.complete(
+                    systemPrompt: passiveSystemPrompt,
+                    userPrompt: "Analyze the conversation.",
+                    tools: []
+                )
+                let cleaned = classification.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if cleaned.uppercased().contains("IGNORE") {
+                    return ""
+                }
+                return cleaned
+            } catch {
+                return ""
+            }
+        }
+
         // The general language rule ("reply in the same language the user is using") lives in the
         // system prompt. The per-turn directive below (from the STT-detected language) is firmer and
         // rides the tail so the system prefix stays byte-stable (mirrors app's APC strategy).

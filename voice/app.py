@@ -54,13 +54,15 @@ _tts = _make_tts()
 print(f"[voice] engines: stt={type(_stt).__name__} tts={type(_tts).__name__}", flush=True)
 
 
-def call_agent(text: str, thread_id: str, timezone: str | None, language: str | None = None) -> str:
+def call_agent(text: str, thread_id: str, timezone: str | None, language: str | None = None, is_passive: bool = False) -> str:
     """POST to the Swift agent gateway and return its reply text. Raises on transport/HTTP error."""
     body = {"text": text, "threadId": thread_id}
     if timezone:
         body["timezone"] = timezone
     if language:  # STT-detected language -> agent pins the reply to the language the user spoke
         body["language"] = language
+    if is_passive:
+        body["isPassive"] = True
     headers = {"Authorization": f"Bearer {MEMORY_BEARER}", "Content-Type": "application/json"}
     r = httpx.post(f"{MEMORY_URL}/v1/agent/turn", json=body, headers=headers, timeout=180)
     r.raise_for_status()
@@ -87,6 +89,7 @@ async def voice_turn(
     audio: UploadFile = File(...),
     threadId: str = Form(default="voice"),
     timezone: str | None = Form(default=None),
+    x_voice_passive: str | None = Header(default=None, alias="X-Voice-Passive"),
 ):
     wav = await audio.read()
     if not wav or len(wav) < 200:  # WAV header is 44 bytes; under 200 is never a real utterance
@@ -102,11 +105,17 @@ async def voice_turn(
     if not text.strip():  # silence/noise -> client just re-listens
         return Response(status_code=400, headers={"X-STT-Text": ""})
 
+    is_passive = (x_voice_passive == "true")
     try:
-        reply = call_agent(text, threadId, timezone, lang)
+        reply = call_agent(text, threadId, timezone, lang, is_passive)
     except httpx.HTTPError:  # transport error or non-2xx from the agent
         reply = AGENT_FALLBACK  # agent unreachable -> speak the failure, still 200
     t_agent = time.perf_counter()
+
+    if is_passive and not reply.strip():
+        # Passive turn requiring no intervention -> remain silent
+        print(f"[voice] passive turn: no intervention needed for text='{text}'", flush=True)
+        return Response(status_code=204, headers={"X-STT-Text": quote(text)})
 
     try:
         out = _tts.synthesize(reply, lang)
