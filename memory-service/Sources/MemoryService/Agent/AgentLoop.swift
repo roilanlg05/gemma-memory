@@ -30,57 +30,63 @@ public struct AgentLoop {
     ///               sometimes flips EN↔ES on voice turns).
     public func run(text: String, threadId: String, services: Services, language: String? = nil, isPassive: Bool = false) async -> String {
         if isPassive {
-            // Pre-filter: discard transcription artifacts that are NEVER worth sending to the LLM.
-            // These are produced by Whisper when it hears noise, silence, or background room sounds.
-            let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-            let noisePatterns = [
-                "\\[.*?\\]",    // [sniffs], [typing], [clears throat], [silence], [music], etc.
-                "\\(.*?\\)",    // (sighs), (coughs), etc.
-            ]
-            var cleaned = lower
-            for pattern in noisePatterns {
-                cleaned = cleaned.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
-            }
-            cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-            // Empty after cleaning → pure noise, skip LLM entirely.
+            // ── Tier 1: Pure noise artifacts ─────────────────────────────────────────────
+            // Whisper emits bracketed labels ([sniffs], [silence], [typing], [Music], etc.)
+            // when it hears non-speech sounds. Strip them and see if any real words remain.
+            // If nothing is left, this is pure noise — discard entirely (no memory, no LLM).
+            var cleaned = text
+            // Remove [bracket] and (paren) noise markers produced by Whisper
+            cleaned = cleaned.replacingOccurrences(of: "\\[[^\\]]*\\]", with: "", options: .regularExpression)
+            cleaned = cleaned.replacingOccurrences(of: "\\([^\\)]*\\)", with: "", options: .regularExpression)
+            // Collapse whitespace
+            cleaned = cleaned.components(separatedBy: .whitespacesAndNewlines)
+                             .filter { !$0.isEmpty }.joined(separator: " ")
+            // Discard if nothing real remains — pure noise/silence, skip everything
             if cleaned.isEmpty { return "" }
-            // Very short interjections that are clearly not directed to Gemma (ok, mhm, yeah, sí, no, etc.)
-            let shortInterjections: Set<String> = [
-                "ok", "okay", "mhm", "mm", "mmm", "uh", "uhh", "um", "umm", "ah", "ahh",
-                "yeah", "yes", "no", "sí", "si", "nope", "sure", "right", "got it",
-                "alright", "fine", "cool", "wow", "oh", "hmm", "hm", "er"
-            ]
-            if shortInterjections.contains(cleaned) { return "" }
 
+            // ── Tier 2: Passive ambient gate ─────────────────────────────────────────────
+            // Real words were spoken (by anyone in the room). The user turn WILL be stored
+            // in the transcript by the handler for ambient context — Gemma learns what's
+            // happening around the user. Now decide if a vocal response is warranted.
+            // The bar is extremely high: Gemma behaves like a smart friend in the room —
+            // fully aware, almost always silent, only speaks when it truly matters.
             let passiveSystemPrompt = """
-            You are a SILENT passive observer. The user's microphone picks up everything in the room.
-            You hear background conversations and ambient sounds, but you NEVER respond to them.
-
-            The transcribed audio is: "\(text)"
-
-            Your default action is ALWAYS silence. You reply with the SINGLE WORD "IGNORE" unless ALL of the following are true simultaneously:
-            1. Someone is giving the user FACTUALLY INCORRECT information that could cause real harm or significant confusion.
-            2. There is an immediate safety emergency or security threat the user must know about RIGHT NOW.
-            3. You have a single, critically important fact the user urgently needs in THIS exact moment.
-
-            ALWAYS respond with "IGNORE" for:
-            - Normal chit-chat, casual conversation between people
-            - Questions between other people that don't require your expertise
-            - Background TV, radio, music, or media content
-            - Affirmations, acknowledgments, or conversational filler
-            - Anything where staying quiet is equally or more appropriate
-            - If you are even slightly uncertain whether to intervene
-
-            Respond with ONLY "IGNORE" or a single short sentence of intervention. Nothing else.
+            You are Gemma, a personal AI assistant. Right now you are in passive listening mode.
+            You can hear everything in the room via the microphone, but you are NOT being spoken to.
+            
+            Transcribed ambient audio: "\(text)"
+            
+            Your role is like a brilliant, discreet friend sitting nearby:
+            - You absorb everything happening around the user as context.
+            - You NEVER comment on normal conversations, even interesting ones.
+            - You NEVER volunteer opinions, suggestions, or information unprompted.
+            - You stay completely silent unless a very specific critical threshold is met.
+            
+            You MAY speak ONLY if the following condition is clearly true:
+            • Someone near the user is stating something FACTUALLY INCORRECT that could cause the user real harm, financial loss, health risk, or significant confusion — AND you know the correct fact.
+            • There is an immediate safety or security threat that the user needs to know about RIGHT NOW.
+            
+            You MUST stay silent (reply "IGNORE") for ALL of the following:
+            • Normal conversation between people, even if interesting or related to you
+            • Casual discussion, opinions, small talk, jokes, stories
+            • Questions that aren't addressed to you
+            • Background TV, radio, music, podcasts
+            • Someone speaking to someone else (not the user)
+            • Anything where staying quiet is equally valid
+            • When in doubt
+            
+            If you must intervene: reply with ONE short natural sentence only — no preamble, no explanation.
+            Otherwise reply with exactly the single word: IGNORE
             """
 
             do {
-                let classification = try await client.complete(
+                let gate = try await client.complete(
                     systemPrompt: passiveSystemPrompt,
-                    userPrompt: "Analyze and decide: IGNORE or intervene?",
+                    userPrompt: "Decide: IGNORE or one-sentence intervention?",
                     tools: []
                 )
-                let result = classification.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let result = gate.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Any response that starts with IGNORE (case-insensitive) = silence
                 if result.uppercased().hasPrefix("IGNORE") || result.isEmpty { return "" }
                 return result
             } catch {
