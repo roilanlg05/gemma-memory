@@ -30,35 +30,59 @@ public struct AgentLoop {
     ///               sometimes flips EN↔ES on voice turns).
     public func run(text: String, threadId: String, services: Services, language: String? = nil, isPassive: Bool = false) async -> String {
         if isPassive {
+            // Pre-filter: discard transcription artifacts that are NEVER worth sending to the LLM.
+            // These are produced by Whisper when it hears noise, silence, or background room sounds.
+            let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            let noisePatterns = [
+                "\\[.*?\\]",    // [sniffs], [typing], [clears throat], [silence], [music], etc.
+                "\\(.*?\\)",    // (sighs), (coughs), etc.
+            ]
+            var cleaned = lower
+            for pattern in noisePatterns {
+                cleaned = cleaned.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+            }
+            cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Empty after cleaning → pure noise, skip LLM entirely.
+            if cleaned.isEmpty { return "" }
+            // Very short interjections that are clearly not directed to Gemma (ok, mhm, yeah, sí, no, etc.)
+            let shortInterjections: Set<String> = [
+                "ok", "okay", "mhm", "mm", "mmm", "uh", "uhh", "um", "umm", "ah", "ahh",
+                "yeah", "yes", "no", "sí", "si", "nope", "sure", "right", "got it",
+                "alright", "fine", "cool", "wow", "oh", "hmm", "hm", "er"
+            ]
+            if shortInterjections.contains(cleaned) { return "" }
+
             let passiveSystemPrompt = """
-            You are a silent, passive AI assistant listening to background conversation around your user.
-            The user is NOT talking to you unless they explicitly ask you or mention your name, or unless it's a critical moment.
-            
-            Read the background text:
-            "\(text)"
-            
-            Determine if you should intervene. You MUST remain silent (reply with "IGNORE") unless:
-            1. There is an immediate safety/security hazard or warning you must give.
-            2. Someone is giving the user incorrect/misleading information about a fact you know.
-            3. You have a highly relevant, crucial piece of information or fact that would immediately help the user in this exact moment.
-            
-            If none of these apply, or if it is a normal/casual conversation, or nonsense/silence, reply with exactly the word:
-            IGNORE
-            
-            Otherwise, if you MUST intervene, reply with the short, natural sentence you want to say to help or warn the user.
+            You are a SILENT passive observer. The user's microphone picks up everything in the room.
+            You hear background conversations and ambient sounds, but you NEVER respond to them.
+
+            The transcribed audio is: "\(text)"
+
+            Your default action is ALWAYS silence. You reply with the SINGLE WORD "IGNORE" unless ALL of the following are true simultaneously:
+            1. Someone is giving the user FACTUALLY INCORRECT information that could cause real harm or significant confusion.
+            2. There is an immediate safety emergency or security threat the user must know about RIGHT NOW.
+            3. You have a single, critically important fact the user urgently needs in THIS exact moment.
+
+            ALWAYS respond with "IGNORE" for:
+            - Normal chit-chat, casual conversation between people
+            - Questions between other people that don't require your expertise
+            - Background TV, radio, music, or media content
+            - Affirmations, acknowledgments, or conversational filler
+            - Anything where staying quiet is equally or more appropriate
+            - If you are even slightly uncertain whether to intervene
+
+            Respond with ONLY "IGNORE" or a single short sentence of intervention. Nothing else.
             """
-            
+
             do {
                 let classification = try await client.complete(
                     systemPrompt: passiveSystemPrompt,
-                    userPrompt: "Analyze the conversation.",
+                    userPrompt: "Analyze and decide: IGNORE or intervene?",
                     tools: []
                 )
-                let cleaned = classification.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if cleaned.uppercased().contains("IGNORE") {
-                    return ""
-                }
-                return cleaned
+                let result = classification.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if result.uppercased().hasPrefix("IGNORE") || result.isEmpty { return "" }
+                return result
             } catch {
                 return ""
             }

@@ -2,6 +2,7 @@
 -> TTS, exposing POST /v1/voice/turn (audio in -> audio out). CPU-only; runs on the i3.
 All audio processing lives here; devices are thin clients."""
 import os
+import re
 import time
 from urllib.parse import quote
 
@@ -84,6 +85,26 @@ def healthz():
     return {"status": "ok"}
 
 
+TERMINATION_PHRASES = {
+    "eso es todo", "eso es todo gracias", "gracias", "de acuerdo gracias", "no gracias",
+    "that is all", "thats all", "that's all", "thank you", "thanks", "no thanks",
+    "bye", "adiós", "adios", "hasta luego", "apágate", "apagarse", "desactívate", "desactivarse",
+    "eso sería todo", "eso seria todo", "nada más", "nada mas", "ok", "vale", "listo"
+}
+
+def clean_and_validate_stt(text: str) -> str:
+    # Remove bracketed noises like [typing], [sniffs], [clears throat], [silence], etc.
+    cleaned = re.sub(r'\[[^\]]*\]', '', text)
+    cleaned = re.sub(r'\([^\)]*\)', '', cleaned)
+    # Remove extra spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    return cleaned.strip()
+
+def is_termination_phrase(text: str) -> bool:
+    normalized = re.sub(r'[^\w\s]', '', text.lower().strip())
+    return normalized in TERMINATION_PHRASES
+
+
 @app.post("/v1/voice/turn", dependencies=[Depends(require_bearer)])
 async def voice_turn(
     audio: UploadFile = File(...),
@@ -97,15 +118,19 @@ async def voice_turn(
 
     t0 = time.perf_counter()
     try:
-        text, lang = _stt.transcribe(wav)
+        raw_text, lang = _stt.transcribe(wav)
     except Exception as exc:  # STT failure
         raise HTTPException(status_code=502, detail=f"stt failed: {exc}")
     t_stt = time.perf_counter()
 
-    if not text.strip():  # silence/noise -> client just re-listens
+    text = clean_and_validate_stt(raw_text)
+    if not text:  # silence/noise/typing only -> client just re-listens
+        print(f"[voice] discarded noise-only transcription: '{raw_text}'", flush=True)
         return Response(status_code=400, headers={"X-STT-Text": ""})
 
     is_passive = (x_voice_passive == "true")
+    should_stop = is_termination_phrase(text)
+
     try:
         reply = call_agent(text, threadId, timezone, lang, is_passive)
     except httpx.HTTPError:  # transport error or non-2xx from the agent
@@ -117,6 +142,10 @@ async def voice_turn(
         print(f"[voice] passive turn: no intervention needed for text='{text}'", flush=True)
         return Response(status_code=204, headers={"X-STT-Text": quote(text)})
 
+    headers = {"X-STT-Text": quote(text), "X-Reply-Text": quote(reply)}
+    if should_stop:
+        headers["X-Voice-Action"] = "stop"
+
     try:
         out = _tts.synthesize(reply, lang)
         t_tts = time.perf_counter()
@@ -124,14 +153,14 @@ async def voice_turn(
               f"tts={t_tts-t_agent:.2f}s total={t_tts-t0:.2f}s reply_chars={len(reply)}", flush=True)
     except Exception as exc:  # TTS failure -> 502, but surface the (unspoken) text
         print(f"[voice] tts failed: {exc!r}")  # full detail in the server log only
+        headers["X-Error"] = f"tts: {type(exc).__name__}"
         return Response(
             status_code=502,
-            # Header carries the exception TYPE, not the message (avoid leaking paths/model names).
-            headers={"X-STT-Text": quote(text), "X-Reply-Text": quote(reply), "X-Error": f"tts: {type(exc).__name__}"},
+            headers=headers,
         )
 
     return Response(
         content=out,
         media_type="audio/wav",
-        headers={"X-STT-Text": quote(text), "X-Reply-Text": quote(reply)},
+        headers=headers,
     )
