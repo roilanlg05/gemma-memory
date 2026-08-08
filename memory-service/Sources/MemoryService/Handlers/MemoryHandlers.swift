@@ -136,26 +136,17 @@ struct MemoryHandlers {
         do { retrieved = try services.retriever.retrieve(query: body.query, k: limit, queryVector: qv) }
         catch { return jsonError(.internalServerError, "recall_failed", "\(error)") }
 
-        // Recent relevant turns from OTHER threads (or previous session / current day) —
-        // ensures Gemma retains context of what was talked about last time even when starting a new chat.
+        // Short-Term Memory: Surface recent turns from past chats ONLY when semantically relevant
+        // to the user's query via vector search. Keeps prompt lean and token-efficient.
         var recentTurns: [(role: String, text: String)] = []
         if let qv {
-            let hits = (try? services.store.nearestTranscript(to: qv, k: limit * 3)) ?? []
+            let hits = (try? services.store.nearestTranscript(to: qv, k: limit * 2)) ?? []
             let turns = (try? services.transcript.rows(ids: hits.map { $0.turnId })) ?? []
             let byId = Dictionary(turns.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             for hit in hits {
                 guard let t = byId[hit.turnId], t.threadId != body.threadId else { continue }
                 recentTurns.append((t.role, t.text))
-                if recentTurns.count >= 6 { break }
-            }
-        }
-        if recentTurns.count < 6 {
-            let allRecent = (try? services.transcript.recent(threadId: "main", maxTurns: 8, maxChars: 2500)) ?? []
-            for t in allRecent {
-                if t.threadId != body.threadId, !recentTurns.contains(where: { $0.text == t.text }) {
-                    recentTurns.append((t.role, t.text))
-                    if recentTurns.count >= 8 { break }
-                }
+                if recentTurns.count >= 4 { break }
             }
         }
 
