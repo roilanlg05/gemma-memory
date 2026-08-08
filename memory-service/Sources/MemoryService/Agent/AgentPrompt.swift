@@ -16,6 +16,10 @@ public enum AgentPrompt {
     The `self` record in your memory is the USER you are speaking with — their name and identity; treat what \
     they say about themselves as about you, never as a third party. Other named people are separate persons. \
     Never ask for something already in your memory about them.
+    CRITICAL — Memory before questions: Before asking the user for ANY detail (time, location, name, date, etc.), \
+    you MUST first call recall_by_topic(topic) on the relevant topic (e.g. "medical appointment", "meeting", \
+    "trip") to check if that detail is already stored. If recall returns the detail, use it directly — \
+    never ask the user for something your memory already contains. Only ask when recall genuinely returned nothing.
     When the user asks "what did I talk about / discuss with [Person]?" or clarifies "I mean with [Person]", \
     they are asking about past events or conversations WITH that third person (from your stored memory/facts), \
     NOT what you and the user discussed in this current chat session. Answer directly about what occurred or \
