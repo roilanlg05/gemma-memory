@@ -52,11 +52,18 @@ struct AgentHandlers {
         let now = Date().timeIntervalSince1970
         // Don't persist failure placeholders (model-unreachable / incomplete) as assistant turns —
         // they'd pollute future recall + consolidation. The user turn is still recorded.
+        // For passive turns: only persist if there was an actual intervention reply — pure
+        // ambient noise / IGNORE turns must NOT pollute the transcript at all.
+        let isPassiveTurn = body.isPassive ?? false
+        let passiveHasValue = isPassiveTurn && !reply.isEmpty && !AgentLoop.fallbackReplies.contains(reply)
         let persistAssistant = !reply.isEmpty && !AgentLoop.fallbackReplies.contains(reply)
+        let persistUser = !isPassiveTurn || passiveHasValue  // skip ambient noise user turns
         do {
-            _ = try services.transcript.append(threadId: threadId, turnIndex: 0,
-                                               role: "user", text: body.text, now: now)
-            if persistAssistant {
+            if persistUser {
+                _ = try services.transcript.append(threadId: threadId, turnIndex: 0,
+                                                   role: "user", text: body.text, now: now)
+            }
+            if persistAssistant && persistUser {
                 _ = try services.transcript.append(threadId: threadId, turnIndex: 0,
                                                    role: "assistant", text: reply, now: now + 0.001)
             }
