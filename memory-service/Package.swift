@@ -33,7 +33,8 @@ let package = Package(
             ]),
         .testTarget(
             name: "MemoryCoreTests",
-            dependencies: ["MemoryCore"]),
+            dependencies: ["MemoryCore"],
+            resources: [.copy("Fixtures")]),
         .testTarget(
             name: "MemoryServiceTests",
             dependencies: [
