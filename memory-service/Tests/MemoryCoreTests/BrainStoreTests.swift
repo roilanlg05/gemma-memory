@@ -308,4 +308,66 @@ final class BrainStoreTests: XCTestCase {
         XCTAssertEqual(try brain.revision(), 1)
         XCTAssertEqual(try upgraded.node(id: original.id), original)
     }
+
+    func testReconciliationCannotPublishOrRetireOutsideSubjectAndScope() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let legacy = Node(id: "legacy-future", kind: "fact", label: "tone", body: "old legacy", layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1, salience: 1, decayRate: 0, confidence: .maybe, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: #"{"subjectId":"self:user","ownerId":"user"}"#)
+        try db.upsert(legacy)
+        let future: Double = 20
+        let binding = BrainLegacyBinding(claimID: "future", subject: "self:user", predicate: "tone", nodeIDs: [legacy.id])
+        let writerAuth = BrainAuthorization(principal: "user", owner: "user", subjects: ["self:user"], scopes: [.user], threads: ["thread-1"], sourceSpeakers: [.userMessage: ["self:user"]], mayProject: true, legacyBindings: [binding], mayCommitClaims: true)
+        let writer = BrainStore(store: db, authorization: writerAuth, clock: { 10 })
+        let futureClaim = BrainClaim(id: "future", revision: 0, subject: "self:user", predicate: "tone", value: .string("blue"), modality: .asserted, status: .active, validFrom: future, recordedAt: future - 1, evidenceIDs: ["e1"])
+        XCTAssertEqual(try writer.commit(request("future-op", futureClaim, 0, evidence: [evidence()])).disposition, .committed)
+        XCTAssertEqual(try db.node(id: legacy.id)?.deleted, false)
+        XCTAssertEqual(try db.node(id: "brain-claim:future")?.deleted, true)
+        let unrelated = BrainAuthorization(principal: "worker", owner: "user", subjects: ["self:agent"], scopes: [.user], threads: ["thread-1"], sourceSpeakers: [:], mayProject: true, allowDelegated: true)
+        try BrainStore(store: db, authorization: unrelated).reconcileProjections(now: future + 1)
+        XCTAssertEqual(try db.node(id: legacy.id)?.deleted, false)
+        XCTAssertEqual(try db.node(id: "brain-claim:future")?.deleted, true)
+        let threadOnly = BrainAuthorization(principal: "worker", owner: "user", subjects: ["self:agent"], scopes: [.thread], threads: ["thread-1"], sourceSpeakers: [.assistantMessage: ["self:agent"]], mayProject: true, allowDelegated: true, mayCommitClaims: true)
+        let actor = BrainStore(store: db, authorization: threadOnly, clock: { 25 })
+        XCTAssertThrowsError(try actor.reconcileProjections(now: future + 1)) { XCTAssertEqual($0 as? BrainStoreError, .denied) }
+        let threadEvidence = BrainEvidence(id: "agent-e", sourceKind: .assistantMessage, speakerID: "self:agent", threadID: "thread-1", observedAt: future, recordedAt: future, accessScope: .thread, text: "synthetic agent statement")
+        let threadClaim = BrainClaim(id: "agent-c", revision: 0, subject: "self:agent", predicate: "status", value: .string("ready"), modality: .asserted, status: .active, validFrom: future, recordedAt: future, evidenceIDs: ["agent-e"])
+        XCTAssertEqual(try actor.commit(request("agent-op", threadClaim, 1, evidence: [threadEvidence])).disposition, .committed)
+        XCTAssertEqual(try db.node(id: legacy.id)?.deleted, false)
+        XCTAssertEqual(try db.node(id: "brain-claim:future")?.deleted, true)
+        try writer.reconcileProjections(now: future + 1)
+        XCTAssertEqual(try db.node(id: legacy.id)?.deleted, true)
+        XCTAssertEqual(try db.node(id: "brain-claim:future")?.deleted, false)
+    }
+    func testLegacyDedupSkipsManagedProjectionForExactAndSemanticCandidates() throws {
+        for semantic in [false, true] {
+            let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+            let brain = BrainStore(store: db, authorization: auth)
+            XCTAssertEqual(try brain.commit(request("one", claim(), 0, evidence: [evidence()])).disposition, .committed)
+            let projected = try XCTUnwrap(db.node(id: "brain-claim:c1"))
+            try db.setEmbedding(nodeId: projected.id, [1, 0, 0, 0])
+            let candidate = Node(id: "legacy-new", kind: "fact", label: "color", body: "new candidate", layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1, salience: 1, decayRate: 0, confidence: .maybe, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: #"{"subjectId":"self:user","ownerId":"user"}"#)
+            if semantic {
+                XCTAssertNil(try db.findSemanticDuplicate(kind: "fact", embedding: [1, 0, 0, 0], threshold: 0.2, candidate: candidate))
+                XCTAssertEqual(try db.upsertMergingSemantic(candidate, embedding: [1, 0, 0, 0], embedder: nil), candidate.id)
+            } else {
+                XCTAssertNil(try db.findDuplicate(kind: "fact", label: "color", candidate: candidate))
+                XCTAssertEqual(try db.upsertMerging(candidate), candidate.id)
+            }
+            XCTAssertEqual(try db.node(id: projected.id)?.body, "blue")
+            XCTAssertThrowsError(try db.upsertMerging(projected))
+        }
+    }
+    func testLegacyDedupSkipsPendingManagedBinding() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let legacy = Node(id: "bound", kind: "fact", label: "color", body: "legacy original", layer: .daily, createdAt: 1, updatedAt: 1, lastSeenAt: 1, salience: 1, decayRate: 0, confidence: .maybe, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: #"{"subjectId":"self:user","ownerId":"user"}"#)
+        try db.upsert(legacy)
+        let binding = BrainLegacyBinding(claimID: "c1", subject: "self:user", predicate: "color", nodeIDs: [legacy.id])
+        let granted = BrainAuthorization(principal: "user", owner: "user", subjects: ["self:user"], scopes: [.user], threads: ["thread-1"], sourceSpeakers: [.userMessage: ["self:user"]], mayProject: true, legacyBindings: [binding], mayCommitClaims: true)
+        let brain = BrainStore(store: db, authorization: granted, clock: { 10 })
+        let future: Double = 20
+        XCTAssertEqual(try brain.commit(request("one", claim(time: future), 0, evidence: [evidence()])).disposition, .committed)
+        var candidate = legacy; candidate.id = "new-legacy"
+        XCTAssertEqual(try db.upsertMerging(candidate), candidate.id)
+        XCTAssertEqual(try db.node(id: legacy.id)?.body, "legacy original")
+        XCTAssertThrowsError(try db.upsertMerging(legacy))
+    }
 }

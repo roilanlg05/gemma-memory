@@ -6,10 +6,10 @@ extension BrainStore {
     // The coordinator calls this before serving current legacy views. No scheduler is implied.
     public func reconcileProjections(now: Double) throws {
         try requirePrincipal()
-        guard authorization.mayProject, now.isFinite else { throw BrainStoreError.denied }
+        guard authorization.mayProject, authorization.scopes.contains(.user), now.isFinite else { throw BrainStoreError.denied }
         try store.dbQueue.write { db in
             try checkOwner(db, bind: false)
-            try reconcile(db: db, now: now)
+            try reconcile(db: db, now: now, claimIDs: nil, mayPublish: true)
         }
     }
     func project(_ claim: BrainClaim, evidence: [BrainEvidence], db: Database) throws {
@@ -55,7 +55,10 @@ extension BrainStore {
         try node.insert(db)
         try db.execute(sql: "INSERT INTO brain_projection(node_id, claim_id) VALUES (?, ?)", arguments: [nodeID, claim.id])
     }
-    func reconcile(db: Database, now: Double) throws {
+    // claimIDs limits commit-time work to that commit. Public reconciliation may
+    // publish only subjects and the user scope granted by the trusted context.
+    func reconcile(db: Database, now: Double, claimIDs: Set<String>?, mayPublish: Bool) throws {
+        guard now.isFinite else { throw BrainStoreError.invalid }
         let payloads = try String.fetchAll(db, sql: "SELECT payload FROM brain_claim")
         let claims = try payloads.map { try Self.decode(BrainClaim.self, $0) }
         let byID = Dictionary(uniqueKeysWithValues: claims.map { ($0.id, $0) })
@@ -66,13 +69,14 @@ extension BrainStore {
             let claimID: String = row["claim_id"]
             let suppressed: Bool = row["suppressed"]
             guard let claim = byID[claimID], let node = try Node.fetchOne(db, key: nodeID) else { throw BrainStoreError.invalid }
+            guard authorization.subjects.contains(claim.subject), claimIDs.map({ $0.contains(claimID) }) ?? true else { continue }
             let active = !suppressed && claim.validFrom <= now && (claim.validTo.map { now < $0 } ?? true) && !superseded.contains(claimID)
-            if active == node.deleted {
+            if active == node.deleted && (mayPublish || !active) {
                 try db.execute(sql: "UPDATE node SET deleted=?, dirty=1 WHERE id=?", arguments: [!active, nodeID])
                 try db.execute(sql: "DELETE FROM node_fts WHERE node_id=?", arguments: [nodeID])
                 if active { try db.execute(sql: "INSERT INTO node_fts(node_id,label,body) VALUES (?,?,?)", arguments: [nodeID, node.label, node.body]) }
             }
-            if active {
+            if active && mayPublish {
                 let oldIDs = try String.fetchAll(db, sql: "SELECT node_id FROM brain_legacy_binding WHERE claim_id=? AND retired=0", arguments: [claimID])
                 for oldID in oldIDs {
                     try db.execute(sql: "UPDATE node SET deleted=1, dirty=1 WHERE id=?", arguments: [oldID])

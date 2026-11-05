@@ -128,6 +128,10 @@ extension MemoryStore {
         return true
     }
 
+    private static func managedNodeIDs(_ db: Database) throws -> Set<String> {
+        Set(try String.fetchAll(db, sql: "SELECT node_id FROM brain_projection UNION SELECT node_id FROM brain_legacy_binding"))
+    }
+
     /// Find an existing non-deleted node to merge into, by (kind, canonical label). Uses
     /// MemoryText.dedupKey so "Sushi", "sushi" and "me gusta el sushi" all collapse together —
     /// the cause of the duplicate "Juan ×3 / sushi ×N" rows seen on device.
@@ -136,6 +140,7 @@ extension MemoryStore {
         let key = MemoryText.dedupKey(label)
         let isAtomic = Self.atomicKinds.contains(kind)
         return try dbQueue.read { db in
+            let managed = try Self.managedNodeIDs(db)
             let nodes: [Node]
             if isAtomic {
                 nodes = try Node.filter(Column("deleted") == false)
@@ -146,7 +151,7 @@ extension MemoryStore {
                     .fetchAll(db)
             }
             return nodes.first { existing in
-                MemoryText.dedupKey(existing.label) == key && isSameOccurrence(existing: existing, candidate: candidate)
+                !managed.contains(existing.id) && MemoryText.dedupKey(existing.label) == key && isSameOccurrence(existing: existing, candidate: candidate)
                     && (candidate.map { isSameSubject(existing: existing, candidate: $0) } ?? true)
             }
         }
@@ -172,7 +177,9 @@ extension MemoryStore {
     /// isn't silently missed.
     public func findSemanticDuplicate(kind: String, embedding: [Float], threshold: Double, candidate: Node? = nil) throws -> Node? {
         let isAtomic = Self.atomicKinds.contains(kind)
-        for hit in try nearest(to: embedding, k: 64) where hit.distance <= threshold {
+        let managed = try dbQueue.read { try Self.managedNodeIDs($0) }
+        // Managed vectors must not crowd eligible legacy candidates out of the top 64.
+        for hit in try nearest(to: embedding, k: 64 + managed.count) where hit.distance <= threshold && !managed.contains(hit.id) {
             if let n = try node(id: hit.id), !n.deleted {
                 let matchesKind = (n.kind == kind) || (isAtomic && Self.atomicKinds.contains(n.kind) && candidate != nil && MemoryText.dedupKey(n.label) == MemoryText.dedupKey(candidate!.label))
                 if matchesKind && isSameOccurrence(existing: n, candidate: candidate)

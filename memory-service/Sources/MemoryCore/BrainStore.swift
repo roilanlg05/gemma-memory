@@ -33,7 +33,10 @@ public enum BrainStoreError: Error, Equatable { case denied, invalid, conflict, 
 public final class BrainStore {
     let store: MemoryStore
     let authorization: BrainAuthorization
-    public init(store: MemoryStore, authorization: BrainAuthorization = .deny) { self.store = store; self.authorization = authorization }
+    let clock: () -> Double
+    public init(store: MemoryStore, authorization: BrainAuthorization = .deny, clock: @escaping () -> Double = { Date().timeIntervalSince1970 }) {
+        self.store = store; self.authorization = authorization; self.clock = clock
+    }
     func requirePrincipal() throws {
         guard !authorization.principal.isEmpty, !authorization.owner.isEmpty,
               authorization.principal == authorization.owner || authorization.allowDelegated else { throw BrainStoreError.denied }

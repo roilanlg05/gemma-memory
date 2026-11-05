@@ -81,8 +81,10 @@ extension BrainStore {
                 try project(saved, evidence: sources, db: db)
                 ids.append(saved.id)
             }
-            // Re-evaluate existing projections even when this writer cannot create one.
-            try reconcile(db: db, now: Date().timeIntervalSince1970)
+            // A commit may withdraw its own superseded projection without publishing unrelated rows.
+            let affected = Set(ids).union(request.updates.compactMap { $0.claim.supersedesID })
+            let mayPublish = authorization.mayProject && authorization.scopes.contains(.user)
+            try reconcile(db: db, now: clock(), claimIDs: affected, mayPublish: mayPublish)
             try db.execute(sql: "UPDATE brain_meta SET revision=? WHERE id=1", arguments: [next])
             let result = BrainCommitResult(clientOperationID: request.clientOperationID, state: .committed, revision: next, claimIDs: ids, disposition: .committed)
             try db.execute(sql: "INSERT INTO brain_commit VALUES (?, ?, ?, ?)", arguments: [authorization.principal, request.clientOperationID, payload, try Self.encode(result)])
