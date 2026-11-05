@@ -202,6 +202,20 @@ final class MemoryIntegrityTests: XCTestCase {
         XCTAssertEqual(conflict["extra"] as? String, alternate.extra)
         XCTAssertEqual(conflict["sourceRef"] as? String, "synthetic:turn:8")
     }
+    func testCanonicalSummaryReplayDoesNotBecomeAnAlternative() throws {
+        let s = try store()
+        let canonical = node("summary", body: "First gist", kind: .summary, time: 100,
+                             extra: #"{"threadId":"synthetic-one","turnRange":[1,2]}"#)
+        try s.upsert(canonical)
+        _ = try s.upsertMerging(node("other", body: "Other gist", kind: .summary, time: 900,
+                                    source: "synthetic:turn:8",
+                                    extra: #"{"threadId":"synthetic-two","turnRange":[7,8]}"#))
+        _ = try s.upsertMerging(canonical)
+        let alternatives = try conflicts(XCTUnwrap(s.node(id: "summary")))
+        XCTAssertEqual(alternatives.count, 1)
+        XCTAssertEqual(alternatives.first?["body"] as? String, "Other gist")
+    }
+
     func testSameIDCannotSilentlyReassignKnownSubject() throws {
         let s = try store()
         try s.upsert(node("canonical", extra: #"{"subjectId":"self:user"}"#))

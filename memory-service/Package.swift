@@ -22,6 +22,7 @@ let package = Package(
         .target(
             name: "MemoryCore",
             dependencies: [
+                "BrainContract",
                 .product(name: "GRDB", package: "GRDB.swift"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Crypto", package: "swift-crypto"),

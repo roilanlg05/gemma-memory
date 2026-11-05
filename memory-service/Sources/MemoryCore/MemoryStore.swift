@@ -183,12 +183,27 @@ public final class MemoryStore: @unchecked Sendable {
                 )
                 """)
         }
+        m.registerMigration("v11-brain-store") { db in
+            try db.execute(sql: """
+                CREATE TABLE brain_meta (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL, owner TEXT);
+                INSERT INTO brain_meta VALUES (1, 0, NULL);
+                CREATE TABLE brain_evidence (id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL);
+                CREATE TABLE brain_evidence_operations (principal TEXT NOT NULL, operation TEXT NOT NULL, payload TEXT NOT NULL, evidence_id TEXT NOT NULL, PRIMARY KEY(principal, operation));
+                CREATE TABLE brain_claim (id TEXT PRIMARY KEY NOT NULL, subject TEXT NOT NULL, predicate TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL);
+                CREATE INDEX brain_claim_subject ON brain_claim(subject, revision);
+                CREATE TABLE brain_commit (principal TEXT NOT NULL, operation TEXT NOT NULL, payload TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(principal, operation));
+                CREATE TABLE brain_projection (node_id TEXT PRIMARY KEY NOT NULL, claim_id TEXT NOT NULL UNIQUE, suppressed INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE brain_legacy_binding (node_id TEXT PRIMARY KEY NOT NULL, claim_id TEXT NOT NULL, subject TEXT NOT NULL, predicate TEXT NOT NULL, owner TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0);
+                """)
+        }
         return m
     }
 
     // MARK: CRUD
     public func upsert(_ node: Node) throws {
         try dbQueue.write { db in
+            let managed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_projection WHERE node_id=? UNION ALL SELECT 1 FROM brain_legacy_binding WHERE node_id=?)", arguments: [node.id, node.id]) ?? false
+            guard !managed else { throw BrainStoreError.denied }
             try node.save(db)
             try db.execute(sql: "DELETE FROM node_fts WHERE node_id = ?", arguments: [node.id])
             if node.deleted {
@@ -293,6 +308,7 @@ public final class MemoryStore: @unchecked Sendable {
 
     public func softDelete(nodeId: String) throws {
         try dbQueue.write { db in
+            try db.execute(sql: "UPDATE brain_projection SET suppressed=1 WHERE node_id=?", arguments: [nodeId])
             try db.execute(sql: "UPDATE node SET deleted=1, dirty=1, updatedAt=? WHERE id=?",
                            arguments: [Date().timeIntervalSince1970, nodeId])
             try db.execute(sql: "DELETE FROM node_fts WHERE node_id=?", arguments: [nodeId])

@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 
 /// Hybrid associative recall: vector (semantic) + FTS (keyword) + recency + 1-hop graph
 /// spreading-activation, ranked by similarity × salience × recency. Produces a compact
@@ -67,8 +68,20 @@ public final class MemoryRetriever: @unchecked Sendable {
     /// Summaries (the "ruta") come first so the model gets the gist before individual facts.
     public func injectionBlock(for nodes: [Node]) -> String {
         guard !nodes.isEmpty else { return "" }
-        let summaries = nodes.filter { $0.kind == NodeKind.summary.rawValue }
-        let rest = nodes.filter { $0.kind != NodeKind.summary.rawValue }
+        // Only store-owned mapping rows can establish source-bound classification.
+        guard let mapping = try? store.dbQueue.read({ db -> (Set<String>, Set<String>, [String: Node]) in
+            let retired = Set(try String.fetchAll(db, sql: "SELECT node_id FROM brain_legacy_binding WHERE retired=1"))
+            let projected = Set(try String.fetchAll(db, sql: "SELECT node_id FROM brain_projection"))
+            let active = try Node.fetchAll(db, sql: "SELECT n.* FROM brain_projection p JOIN node n ON n.id=p.node_id WHERE n.deleted=0")
+            return (retired, projected, Dictionary(uniqueKeysWithValues: active.map { ($0.id, $0) }))
+        }) else { return "" }
+        let allowed: [Node] = nodes.compactMap { node in
+            guard !mapping.0.contains(node.id) else { return nil }
+            if mapping.1.contains(node.id) { return mapping.2[node.id] }
+            return node.deleted ? nil : node
+        }
+        let summaries = allowed.filter { $0.kind == NodeKind.summary.rawValue }
+        let rest = allowed.filter { $0.kind != NodeKind.summary.rawValue }
         let formatter = ISO8601DateFormatter()
         func evidence(origin: Origin, confidence: Confidence, date: Double, source: String?) -> String {
             var label = "origin=\(origin.rawValue) confidence=\(confidence.rawValue) date=\(formatter.string(from: Date(timeIntervalSince1970: date)))"
@@ -93,7 +106,8 @@ public final class MemoryRetriever: @unchecked Sendable {
         }
         let lines = (summaries + rest).map { node in
             let conflicts = MemoryStore.mergeConflicts(in: node)
-            let status = conflicts.isEmpty ? "" : "unresolved conflict; resolve before asserting; "
+            let classification = mapping.1.contains(node.id) ? "source-bound classification, unverified; " : "unverified legacy, historical; do not assert as current; "
+            let status = classification + (conflicts.isEmpty ? "" : "unresolved conflict; resolve before asserting; ")
             let provenance = evidence(origin: node.origin, confidence: node.confidence,
                                       date: MemoryStore.evidenceDate(for: node), source: node.sourceRef)
                 + " " + scope(extra: node.extra, id: node.id)

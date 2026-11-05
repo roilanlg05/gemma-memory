@@ -62,6 +62,7 @@ public struct BrainClaim: Codable, Equatable, Sendable {
     public let recordedAt: Double
     public let evidenceIDs: [String]
     public let supersedesID: String?
+    public let contradictsIDs: [String]
 
     public init(
         id: String,
@@ -75,7 +76,8 @@ public struct BrainClaim: Codable, Equatable, Sendable {
         validTo: Double? = nil,
         recordedAt: Double,
         evidenceIDs: [String],
-        supersedesID: String? = nil
+        supersedesID: String? = nil,
+        contradictsIDs: [String] = []
     ) {
         self.id = id
         self.revision = revision
@@ -89,10 +91,11 @@ public struct BrainClaim: Codable, Equatable, Sendable {
         self.recordedAt = recordedAt
         self.evidenceIDs = evidenceIDs
         self.supersedesID = supersedesID
+        self.contradictsIDs = contradictsIDs
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, revision, subject, predicate, value, modality, status, validFrom, validTo, recordedAt, evidenceIDs, supersedesID
+        case id, revision, subject, predicate, value, modality, status, validFrom, validTo, recordedAt, evidenceIDs, supersedesID, contradictsIDs
     }
 
     public init(from decoder: Decoder) throws {
@@ -109,7 +112,8 @@ public struct BrainClaim: Codable, Equatable, Sendable {
             validTo: try c.decodeIfPresent(Double.self, forKey: .validTo),
             recordedAt: try c.decode(Double.self, forKey: .recordedAt),
             evidenceIDs: try c.decode([String].self, forKey: .evidenceIDs),
-            supersedesID: try c.decodeIfPresent(String.self, forKey: .supersedesID)
+            supersedesID: try c.decodeIfPresent(String.self, forKey: .supersedesID),
+            contradictsIDs: try c.decodeIfPresent([String].self, forKey: .contradictsIDs) ?? []
         )
     }
 }

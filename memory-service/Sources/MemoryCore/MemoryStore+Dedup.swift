@@ -244,8 +244,18 @@ extension MemoryStore {
                 merged.updatedAt = candidate.updatedAt
             } else {
                 merged.updatedAt = existing.updatedAt
+                // Compare source metadata without internal conflict bookkeeping or JSON key order.
+                func normalizedExtra(_ node: Node) -> String? {
+                    let extra = revision(of: node).extra
+                    guard let data = extra?.data(using: .utf8),
+                          let object = try? JSONSerialization.jsonObject(with: data),
+                          JSONSerialization.isValidJSONObject(object),
+                          let normalized = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+                    else { return extra }
+                    return String(data: normalized, encoding: .utf8)
+                }
                 if summaryEvidenceOrder(existing: existing, candidate: candidate) == nil,
-                   existing.body != candidate.body || existing.extra != candidate.extra || existing.sourceRef != candidate.sourceRef {
+                   existing.body != candidate.body || normalizedExtra(existing) != normalizedExtra(candidate) || existing.sourceRef != candidate.sourceRef {
                     retain(revision(of: candidate))
                 }
             }
