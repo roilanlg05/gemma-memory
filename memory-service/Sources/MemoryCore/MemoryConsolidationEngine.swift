@@ -145,13 +145,14 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             if rawKind == NodeKind.fact.rawValue,
                (try? NSRegularExpression(pattern: datePattern).firstMatch(in: labelLower, range: NSRange(labelLower.startIndex..., in: labelLower))) != nil { continue }
             let kind = rawKind
-            let layer: MemoryLayer = (e.permanent ?? false) ? .identity : .daily
+            // A model's permanence flag is a proposal, not user authorization of identity.
+            let layer: MemoryLayer = .daily
             var attrs = NodeAttributes(); attrs.status = e.attributes?.status; attrs.horizon = e.attributes?.horizon; attrs.date = e.attributes?.date
             let t = now()
             let baseBody = e.detail ?? label
             let body = (attrs.date != nil) ? baseBody + " (fecha: \(attrs.date!))" : baseBody
             let node = Node(id: UUID().uuidString, kind: kind, label: label, body: body, layer: layer,
-                            createdAt: t, updatedAt: t, lastSeenAt: t, salience: (e.permanent ?? false) ? 8 : 3,
+                            createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3,
                             decayRate: Decay.defaultDecayRate(for: layer), confidence: .probable, mentionCount: 1,
                             ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                             dirty: true, deleted: false, extra: attrs.toJSON())
@@ -537,11 +538,11 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 existingInsights.insert(key)
                 let t = now()
                 let conf = Confidence(rawValue: ins.confidence ?? "probable") ?? .probable
-                let promote = members.count >= 4 && conf != .maybe
-                let layer: MemoryLayer = promote ? .identity : .daily
+                // Cluster size and model confidence do not supply independent identity evidence.
+                let layer: MemoryLayer = .daily
                 let node = Node(id: UUID().uuidString, kind: NodeKind.insight.rawValue, label: String(ins.text.prefix(60)),
                                 body: ins.text, layer: layer, createdAt: t, updatedAt: t, lastSeenAt: t,
-                                salience: promote ? 7 : 3, decayRate: Decay.defaultDecayRate(for: layer), confidence: conf,
+                                salience: 3, decayRate: Decay.defaultDecayRate(for: layer), confidence: conf,
                                 mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                                 dirty: true, deleted: false, extra: nil)
                 let insEmb = (try? embedder?.embed(node.label)) ?? nil
@@ -552,10 +553,6 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 }
                 for s in sources {
                     try? store.upsert(Edge(id: UUID().uuidString, srcId: node.id, dstId: s.id, relation: .derivesFrom, weight: 1,
-                                           confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                }
-                if promote, (try? store.node(id: selfUserID)) != nil {
-                    try? store.upsert(Edge(id: UUID().uuidString, srcId: selfUserID, dstId: node.id, relation: .relatedTo, weight: 1,
                                            confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
                 }
                 added += 1

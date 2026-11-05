@@ -1,6 +1,22 @@
 import Foundation
 import GRDB
 
+/// An unresolved alternative is evidence to consider, never an accepted replacement.
+/// Stored additively in Node.extra until source-bound claims become available.
+struct MemoryMergeConflict: Codable, Equatable {
+    var label: String
+    var body: String
+    var sourceRef: String?
+    var origin: Origin
+    var confidence: Confidence
+    var updatedAt: Double
+    var extra: String?
+}
+
+enum MemoryMergeError: Error {
+    case incompatibleSubject(String)
+}
+
 /// Consolidation: dedup/merge on write (human memory consolidates, doesn't accumulate
 /// duplicates) + a forgetting sweep. Built on the Phase 1 MemoryStore CRUD + Phase 2 Decay.
 extension MemoryStore {
@@ -9,6 +25,97 @@ extension MemoryStore {
         NodeKind.person.rawValue, NodeKind.place.rawValue, NodeKind.fact.rawValue,
         NodeKind.preference.rawValue, NodeKind.trait.rawValue
     ]
+
+    private static func extraObject(_ extra: String?) -> [String: Any] {
+        guard let data = extra?.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        return object
+    }
+
+    static func mergeConflicts(in node: Node) -> [MemoryMergeConflict] {
+        guard let values = extraObject(node.extra)["mergeConflicts"],
+              let data = try? JSONSerialization.data(withJSONObject: values),
+              let conflicts = try? JSONDecoder().decode([MemoryMergeConflict].self, from: data) else { return [] }
+        return conflicts
+    }
+
+    static func evidenceDate(for node: Node) -> Double {
+        (extraObject(node.extra)["memoryEvidenceUpdatedAt"] as? Double) ?? node.updatedAt
+    }
+
+    private func revision(of node: Node) -> MemoryMergeConflict {
+        var extra = node.extra
+        var object = Self.extraObject(extra)
+        if object["mergeConflicts"] != nil || object["memoryEvidenceUpdatedAt"] != nil {
+            object.removeValue(forKey: "mergeConflicts")
+            object.removeValue(forKey: "memoryEvidenceUpdatedAt")
+            extra = object.isEmpty ? nil : (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+                .flatMap { String(data: $0, encoding: .utf8) }
+        }
+        return MemoryMergeConflict(label: node.label, body: node.body, sourceRef: node.sourceRef,
+                                   origin: node.origin, confidence: node.confidence,
+                                   updatedAt: Self.evidenceDate(for: node), extra: extra)
+    }
+
+    private func metadata(extra: String?, conflicts: [MemoryMergeConflict], evidenceDate: Double? = nil) -> String? {
+        guard !conflicts.isEmpty || evidenceDate != nil else { return extra }
+        var object = Self.extraObject(extra)
+        // Preserve an opaque legacy extra rather than discard it when adding integrity metadata.
+        if object.isEmpty, let extra, !extra.isEmpty, extra != "{}" { object["legacyExtra"] = extra }
+        if !conflicts.isEmpty, let data = try? JSONEncoder().encode(conflicts),
+           let values = try? JSONSerialization.jsonObject(with: data) { object["mergeConflicts"] = values }
+        if let evidenceDate { object["memoryEvidenceUpdatedAt"] = evidenceDate }
+        return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    /// Explicit scope is authoritative. Missing scope cannot fill in a known owner/subject.
+    private func isSameSubject(existing: Node, candidate: Node) -> Bool {
+        let reserved: Set<String> = [selfUserID, "self:agent", "relationship:user:agent"]
+        if existing.id != candidate.id, reserved.contains(existing.id) || reserved.contains(candidate.id) { return false }
+        func scope(_ node: Node, keys: [String]) -> (values: Set<String>, valid: Bool) {
+            let object = Self.extraObject(node.extra)
+            var values = Set<String>()
+            for key in keys where object[key] != nil {
+                guard let value = object[key] as? String, !value.isEmpty else { return ([], false) }
+                values.insert(value)
+            }
+            return (values, values.count <= 1)
+        }
+        let subjects = ["subjectId", "subjectID", "subject"]
+        let owners = ["ownerId", "ownerID", "owner"]
+        let es = scope(existing, keys: subjects), cs = scope(candidate, keys: subjects)
+        let eo = scope(existing, keys: owners), co = scope(candidate, keys: owners)
+        guard es.valid, cs.valid, eo.valid, co.valid, es.values == cs.values, eo.values == co.values else { return false }
+        // Shared ownership is not proof that two identity nodes describe the same subject.
+        if existing.id != candidate.id, existing.layer == .identity || candidate.layer == .identity,
+           es.values.isEmpty { return false }
+        return true
+    }
+
+    private func sameIDTarget(for candidate: Node) throws -> Node? {
+        guard let existing = try node(id: candidate.id) else { return nil }
+        guard isSameSubject(existing: existing, candidate: candidate) else {
+            throw MemoryMergeError.incompatibleSubject(candidate.id)
+        }
+        return existing.deleted ? nil : existing
+    }
+
+    /// Order evidence only when one valid range extends beyond the other in the same thread.
+    /// Consolidation timestamps alone cannot establish which summary is faithful.
+    private func summaryEvidenceOrder(existing: Node, candidate: Node) -> Int? {
+        func range(_ node: Node) -> (String, [Int])? {
+            let object = Self.extraObject(node.extra)
+            guard let thread = object["threadId"] as? String, !thread.isEmpty,
+                  let range = object["turnRange"] as? [Int], range.count == 2,
+                  range[0] >= 0, range[1] >= range[0] else { return nil }
+            return (thread, range)
+        }
+        guard let e = range(existing), let c = range(candidate), e.0 == c.0 else { return nil }
+        if c.1[0] >= e.1[0], c.1[1] > e.1[1] { return 1 }
+        if c.1[0] <= e.1[0], c.1[1] < e.1[1] { return -1 }
+        return nil
+    }
 
     /// Helper to prevent merging distinct occurrences (e.g. tasks/events with explicitly different dates).
     private func isSameOccurrence(existing: Node, candidate: Node?) -> Bool {
@@ -38,15 +145,19 @@ extension MemoryStore {
                 nodes = try Node.filter(Column("kind") == kind && Column("deleted") == false)
                     .fetchAll(db)
             }
-            return nodes.first { MemoryText.dedupKey($0.label) == key && isSameOccurrence(existing: $0, candidate: candidate) }
+            return nodes.first { existing in
+                MemoryText.dedupKey(existing.label) == key && isSameOccurrence(existing: existing, candidate: candidate)
+                    && (candidate.map { isSameSubject(existing: existing, candidate: $0) } ?? true)
+            }
         }
     }
 
     /// Upsert with dedup: if a duplicate exists, reinforce it (bump salience, mentionCount++,
-    /// maybe promote to identity); else insert the candidate. Returns the resulting node id.
+    /// preserve deliberate identity); else insert the candidate. Returns the resulting node id.
     @discardableResult
     public func upsertMerging(_ candidate: Node) throws -> String {
-        if let existing = try findDuplicate(kind: candidate.kind, label: candidate.label, candidate: candidate) {
+        if let existing = try sameIDTarget(for: candidate)
+            ?? findDuplicate(kind: candidate.kind, label: candidate.label, candidate: candidate) {
             let merged = mergeReinforced(existing: existing, candidate: candidate)
             try upsert(merged)
             return merged.id
@@ -64,7 +175,8 @@ extension MemoryStore {
         for hit in try nearest(to: embedding, k: 64) where hit.distance <= threshold {
             if let n = try node(id: hit.id), !n.deleted {
                 let matchesKind = (n.kind == kind) || (isAtomic && Self.atomicKinds.contains(n.kind) && candidate != nil && MemoryText.dedupKey(n.label) == MemoryText.dedupKey(candidate!.label))
-                if matchesKind && isSameOccurrence(existing: n, candidate: candidate) {
+                if matchesKind && isSameOccurrence(existing: n, candidate: candidate)
+                    && (candidate.map { isSameSubject(existing: n, candidate: $0) } ?? true) {
                     return n
                 }
             }
@@ -82,8 +194,8 @@ extension MemoryStore {
         var embedding = embedding
         if embedding == nil, let embedder { embedding = try? embedder.embed(candidate.label) }
 
-        var existing: Node? = nil
-        if let embedding { existing = try findSemanticDuplicate(kind: candidate.kind, embedding: embedding, threshold: threshold, candidate: candidate) }
+        var existing = try sameIDTarget(for: candidate)
+        if existing == nil, let embedding { existing = try findSemanticDuplicate(kind: candidate.kind, embedding: embedding, threshold: threshold, candidate: candidate) }
         if existing == nil { existing = try findDuplicate(kind: candidate.kind, label: candidate.label, candidate: candidate) }
 
         if let existing {
@@ -101,29 +213,56 @@ extension MemoryStore {
         }
     }
 
-    /// Shared merge: EMA-reinforce salience, bump mentionCount, refresh times, promote if due.
+    /// Salience may increase with repetition; authority and identity never do.
     private func mergeReinforced(existing: Node, candidate: Node) -> Node {
         var merged = existing
-        // Upgrade generic `fact` to a more specific atomic kind if candidate is specific
         if existing.kind == NodeKind.fact.rawValue && candidate.kind != NodeKind.fact.rawValue && Self.atomicKinds.contains(candidate.kind) {
             merged.kind = candidate.kind
         }
         merged.salience = Decay.reinforceEMA(current: existing.salience, beta: Decay.beta(for: existing.layer))
         merged.mentionCount = existing.mentionCount + 1
-        merged.lastSeenAt = candidate.lastSeenAt
-        merged.updatedAt = candidate.updatedAt
-        if merged.body.isEmpty { merged.body = candidate.body }
-        if Decay.shouldPromote(mentionCount: merged.mentionCount, origin: merged.origin,
-                               permanent: merged.layer == .identity) {
-            merged.layer = .identity
-            merged.ttlExpiresAt = nil
-            merged.decayRate = Decay.defaultDecayRate(for: .identity)
+        merged.lastSeenAt = max(existing.lastSeenAt, candidate.lastSeenAt)
+        merged.updatedAt = max(existing.updatedAt, candidate.updatedAt)
+        var conflicts = Self.mergeConflicts(in: existing)
+        func retain(_ alternative: MemoryMergeConflict) {
+            // Repeated copies of one proposal do not create additional independent evidence.
+            if !conflicts.contains(where: {
+                $0.body == alternative.body && $0.label == alternative.label && $0.sourceRef == alternative.sourceRef
+                    && $0.origin == alternative.origin && $0.confidence == alternative.confidence && $0.extra == alternative.extra
+            }) { conflicts.append(alternative) }
         }
-        // Summaries: adopt the latest segment's reference so expand_context drill-down points at
-        // the most recent conversation behind the topic (extra holds threadId/turnRange/concepts).
-        // Scoped to summary kind — entity `extra` (NodeAttributes) must keep the existing value.
-        if merged.kind == NodeKind.summary.rawValue, let e = candidate.extra, !e.isEmpty {
-            merged.extra = e
+        for alternative in Self.mergeConflicts(in: candidate) { retain(alternative) }
+
+        if existing.kind == NodeKind.summary.rawValue && candidate.kind == NodeKind.summary.rawValue {
+            if summaryEvidenceOrder(existing: existing, candidate: candidate) == 1 {
+                merged.label = candidate.label
+                merged.body = candidate.body
+                merged.extra = candidate.extra
+                merged.sourceRef = candidate.sourceRef
+                merged.origin = candidate.origin
+                merged.confidence = candidate.confidence
+                merged.updatedAt = candidate.updatedAt
+            } else {
+                merged.updatedAt = existing.updatedAt
+                if summaryEvidenceOrder(existing: existing, candidate: candidate) == nil,
+                   existing.body != candidate.body || existing.extra != candidate.extra || existing.sourceRef != candidate.sourceRef {
+                    retain(revision(of: candidate))
+                }
+            }
+            merged.extra = metadata(extra: merged.extra, conflicts: conflicts)
+        } else {
+            var evidenceDate = Self.evidenceDate(for: existing)
+            if existing.body.isEmpty, !candidate.body.isEmpty {
+                merged.body = candidate.body
+                merged.extra = candidate.extra
+                merged.sourceRef = candidate.sourceRef
+                merged.origin = candidate.origin
+                merged.confidence = candidate.confidence
+                evidenceDate = Self.evidenceDate(for: candidate)
+            } else if !candidate.body.isEmpty, candidate.body != existing.body {
+                retain(revision(of: candidate))
+            }
+            merged.extra = metadata(extra: merged.extra, conflicts: conflicts, evidenceDate: evidenceDate)
         }
         merged.dirty = true
         return merged
@@ -152,26 +291,29 @@ extension MemoryStore {
         let nodes = try allNodes()
             .filter { $0.kind == kind && !$0.deleted }
             .sorted { ($0.salience, Double($0.mentionCount)) > ($1.salience, Double($1.mentionCount)) }
-        var kept: [(id: String, emb: [Float])] = []
+        var kept: [(node: Node, emb: [Float])] = []
         var merged = 0
         let t = Date().timeIntervalSince1970
         for n in nodes {
             guard let emb = try embeddingFor(nodeId: n.id, label: n.label, embedder: embedder) else { continue }
-            if let hit = kept.first(where: { Self.cosineDistance($0.emb, emb) <= threshold }) {
-                if var canon = try node(id: hit.id) {
-                    canon.mentionCount += n.mentionCount
-                    canon.salience = max(canon.salience, n.salience)
-                    canon.updatedAt = t; canon.dirty = true
+            if let hit = kept.first(where: {
+                Self.cosineDistance($0.emb, emb) <= threshold && isSameSubject(existing: $0.node, candidate: n)
+                    && isSameOccurrence(existing: $0.node, candidate: n)
+            }) {
+                if let canonical = try node(id: hit.node.id) {
+                    var canon = mergeReinforced(existing: canonical, candidate: n)
+                    canon.mentionCount = canonical.mentionCount + n.mentionCount
+                    canon.salience = max(canonical.salience, n.salience)
                     try upsert(canon)
                 }
                 try softDelete(nodeId: n.id)
-                try upsert(Edge(id: UUID().uuidString, srcId: n.id, dstId: hit.id, relation: .sameAs,
+                try upsert(Edge(id: UUID().uuidString, srcId: n.id, dstId: hit.node.id, relation: .sameAs,
                                 weight: 1, confidence: .probable, createdAt: t, updatedAt: t,
                                 dirty: true, deleted: false, extra: nil))
                 merged += 1
             } else {
                 try setEmbedding(nodeId: n.id, emb)
-                kept.append((n.id, emb))
+                kept.append((n, emb))
             }
         }
         return merged

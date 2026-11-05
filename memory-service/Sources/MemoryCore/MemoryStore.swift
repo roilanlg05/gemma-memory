@@ -191,13 +191,17 @@ public final class MemoryStore: @unchecked Sendable {
         try dbQueue.write { db in
             try node.save(db)
             try db.execute(sql: "DELETE FROM node_fts WHERE node_id = ?", arguments: [node.id])
-            try db.execute(sql: "INSERT INTO node_fts(node_id, label, body) VALUES (?, ?, ?)",
-                           arguments: [node.id, node.label, node.body])
+            if node.deleted {
+                try db.execute(sql: "DELETE FROM node_embedding WHERE node_id = ?", arguments: [node.id])
+            } else {
+                try db.execute(sql: "INSERT INTO node_fts(node_id, label, body) VALUES (?, ?, ?)",
+                               arguments: [node.id, node.label, node.body])
+            }
         }
         // Auto-link to kind hub so the graph stays navigable from a single anchor per kind.
         // Skips hub-kind nodes themselves and free-form kinds outside the NodeKind enum.
         // Failures are swallowed: a missing hub link is not worth aborting an upsert.
-        try? linkToHub(nodeId: node.id, kindRaw: node.kind)
+        if !node.deleted { try? linkToHub(nodeId: node.id, kindRaw: node.kind) }
     }
     public func upsert(_ edge: Edge) throws { try dbQueue.write { try edge.save($0) } }
     public func node(id: String) throws -> Node? { try dbQueue.read { try Node.fetchOne($0, key: id) } }
@@ -292,6 +296,7 @@ public final class MemoryStore: @unchecked Sendable {
             try db.execute(sql: "UPDATE node SET deleted=1, dirty=1, updatedAt=? WHERE id=?",
                            arguments: [Date().timeIntervalSince1970, nodeId])
             try db.execute(sql: "DELETE FROM node_fts WHERE node_id=?", arguments: [nodeId])
+            try db.execute(sql: "DELETE FROM node_embedding WHERE node_id=?", arguments: [nodeId])
         }
     }
     public func searchFTS(query: String, limit: Int) throws -> [Node] {

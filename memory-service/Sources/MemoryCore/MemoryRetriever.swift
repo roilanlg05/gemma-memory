@@ -69,7 +69,43 @@ public final class MemoryRetriever: @unchecked Sendable {
         guard !nodes.isEmpty else { return "" }
         let summaries = nodes.filter { $0.kind == NodeKind.summary.rawValue }
         let rest = nodes.filter { $0.kind != NodeKind.summary.rawValue }
-        let lines = (summaries + rest).map { "- [\($0.kind)] \($0.label): \($0.body.isEmpty ? $0.label : $0.body)" }
-        return "What you remember about the user (use if relevant):\n" + lines.joined(separator: "\n")
+        let formatter = ISO8601DateFormatter()
+        func evidence(origin: Origin, confidence: Confidence, date: Double, source: String?) -> String {
+            var label = "origin=\(origin.rawValue) confidence=\(confidence.rawValue) date=\(formatter.string(from: Date(timeIntervalSince1970: date)))"
+            if let source { label += " source=\(source)" }
+            return label
+        }
+        func scope(extra: String?, id: String? = nil) -> String {
+            let object = extra.flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            var labels: [String] = []
+            for (name, keys) in [("subject", ["subjectId", "subjectID", "subject"]),
+                                  ("owner", ["ownerId", "ownerID", "owner"])] {
+                let values = Set(keys.compactMap { object[$0] as? String }.filter { !$0.isEmpty }).sorted()
+                if !values.isEmpty {
+                    labels.append("\(name)=\(values.joined(separator: "|"))")
+                } else if name == "subject" {
+                    let reserved: Set<String> = [selfUserID, "self:agent", "relationship:user:agent"]
+                    labels.append("subject=\(id.flatMap { reserved.contains($0) ? $0 : nil } ?? "unknown")")
+                }
+            }
+            return labels.joined(separator: " ")
+        }
+        let lines = (summaries + rest).map { node in
+            let conflicts = MemoryStore.mergeConflicts(in: node)
+            let status = conflicts.isEmpty ? "" : "unresolved conflict; resolve before asserting; "
+            let provenance = evidence(origin: node.origin, confidence: node.confidence,
+                                      date: MemoryStore.evidenceDate(for: node), source: node.sourceRef)
+                + " " + scope(extra: node.extra, id: node.id)
+            var line = "- [\(node.kind); \(status)\(provenance)] \(node.label): \(node.body.isEmpty ? node.label : node.body)"
+            for alternative in conflicts {
+                let provenance = evidence(origin: alternative.origin, confidence: alternative.confidence,
+                                          date: alternative.updatedAt, source: alternative.sourceRef)
+                    + " " + scope(extra: alternative.extra)
+                line += "\n  alternative [\(provenance)]: \(alternative.body)"
+            }
+            return line
+        }
+        return "Relevant memories (use if relevant):\n" + lines.joined(separator: "\n")
     }
 }

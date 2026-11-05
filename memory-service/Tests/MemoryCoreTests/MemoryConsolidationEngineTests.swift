@@ -26,6 +26,18 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertEqual(NodeAttributes.from(task?.extra).status, "pending")
     }
 
+    func test_consolidate_model_permanence_is_not_identity_authorization() async throws {
+        let store = try makeStore()
+        let json = #"{"entities":[{"entity":"synthetic hobby","kind":"preference","detail":"Tentative interest","permanent":true}]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: CannedRuntime([json]))
+        await engine.consolidate(episodeTexts: ["A synthetic conversation about a possible hobby"])
+        let saved = try XCTUnwrap(try store.allNodes().first { $0.kind == "preference" })
+        XCTAssertEqual(saved.layer, .daily)
+        XCTAssertEqual(saved.origin, .extracted)
+        XCTAssertEqual(saved.salience, 3)
+        XCTAssertTrue(try store.coreMemories().isEmpty)
+    }
+
     func test_associate_creates_edges_between_existing_nodes() async throws {
         let store = try makeStore()
         let now = Date().timeIntervalSince1970
@@ -556,7 +568,7 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         XCTAssertTrue(try store.edges(from: ins.id).allSatisfy { $0.relation != .relatedTo })  // no relatedTo
     }
 
-    func test_reflect_promotes_large_confident_cluster_to_identity() async throws {
+    func test_reflect_keeps_large_confident_cluster_in_daily_layer() async throws {
         let store = try MemoryStore(inMemory: true, embeddingDim: 4)
         _ = try store.upsertSelf(name: "Roilan", detail: nil, embedder: nil)
         func mk(_ id: String) -> Node {
@@ -574,11 +586,11 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         let engine = MemoryConsolidationEngine(store: store, embedder: FakeEmbedder(dimension: 4), runtime: CannedRuntime([json]))
         await engine.reflect()
         let ins = try XCTUnwrap(try store.allNodes().filter { $0.kind == NodeKind.insight.rawValue }.first)
-        XCTAssertEqual(ins.layer, .identity)                                   // promoted (≥4 members, conf≥probable)
-        XCTAssertEqual(ins.salience, 7)                                        // derived identity insight (below asserted facts at 8)
+        XCTAssertEqual(ins.layer, .daily) // Model inference and member count do not authorize identity.
+        XCTAssertEqual(ins.salience, 3)
         let selfLink = (try store.edges(from: selfUserID)).filter { $0.dstId == ins.id }
-        XCTAssertEqual(selfLink.count, 1)                                      // self → insight edge
-        XCTAssertTrue(try store.coreMemories(limit: 10).contains { $0.id == ins.id })   // injected as identity
+        XCTAssertTrue(selfLink.isEmpty)
+        XCTAssertFalse(try store.coreMemories(limit: 10).contains { $0.id == ins.id })
     }
 }
 

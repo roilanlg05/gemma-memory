@@ -32,9 +32,10 @@ public enum Decay {
         min(cap, beta * current + (1 - beta) * signal)
     }
 
-    /// Whether a node should be promoted L2(daily) → L4(identity).
+    /// Only a deliberately selected permanent node keeps identity authority.
+    /// Origin and repetition affect neither authorization nor permanence.
     public static func shouldPromote(mentionCount: Int, origin: Origin, permanent: Bool, threshold: Int = 3) -> Bool {
-        permanent || origin == .explicit || mentionCount >= threshold
+        permanent
     }
 
     /// Whether a node is eligible for forgetting (soft-delete). Identity never forgets.

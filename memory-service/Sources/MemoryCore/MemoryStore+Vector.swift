@@ -17,7 +17,7 @@ extension MemoryStore {
     /// KNN via cosine similarity. `distance` = 1 - cosine; returns ascending distance.
     public func nearest(to vector: [Float], k: Int) throws -> [(id: String, distance: Double)] {
         let rows: [(String, [Float])] = try dbQueue.read { db in
-            try Row.fetchAll(db, sql: "SELECT node_id, embedding FROM node_embedding")
+            try Row.fetchAll(db, sql: "SELECT e.node_id, e.embedding FROM node_embedding e JOIN node n ON n.id = e.node_id WHERE n.deleted = 0")
                 .map { ($0["node_id"] as String, Self.blobToFloats($0["embedding"] as Data)) }
         }
         let qn = sqrt(vector.reduce(Float(0)) { $0 + $1 * $1 })
@@ -69,7 +69,7 @@ extension MemoryStore {
     /// All stored node embeddings (one query) — input for clustering.
     public func allEmbeddings() throws -> [(id: String, vec: [Float])] {
         try dbQueue.read { db in
-            try Row.fetchAll(db, sql: "SELECT node_id, embedding FROM node_embedding")
+            try Row.fetchAll(db, sql: "SELECT e.node_id, e.embedding FROM node_embedding e JOIN node n ON n.id = e.node_id WHERE n.deleted = 0")
                 .map { (id: $0["node_id"] as String, vec: Self.blobToFloats($0["embedding"] as Data)) }
         }
     }

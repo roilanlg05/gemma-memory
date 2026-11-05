@@ -44,10 +44,10 @@ final class MemoryStoreDedupTests: XCTestCase {
         XCTAssertEqual(nodes.count, 1, "different phrasings of the same entity must merge; got: \(nodes.map { $0.label })")
     }
 
-    func testPromotesToIdentityAtThreshold() throws {
+    func testRepeatedMentionsRemainDaily() throws {
         let store = try makeStore()
         for _ in 0..<3 { _ = try store.upsertMerging(node(kind: NodeKind.person.rawValue, label: "Juan")) }
-        XCTAssertEqual(try store.allNodes().first?.layer, .identity)
+        XCTAssertEqual(try store.allNodes().first?.layer, .daily)
     }
 
     func test_semantic_dedup_merges_phrasing_variants() throws {

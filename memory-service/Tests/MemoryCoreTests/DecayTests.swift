@@ -15,8 +15,8 @@ final class DecayTests: XCTestCase {
     }
 
     func testPromote() {
-        XCTAssertTrue(Decay.shouldPromote(mentionCount: 3, origin: .extracted, permanent: false))
-        XCTAssertTrue(Decay.shouldPromote(mentionCount: 1, origin: .explicit, permanent: false))
+        XCTAssertFalse(Decay.shouldPromote(mentionCount: 3, origin: .extracted, permanent: false))
+        XCTAssertFalse(Decay.shouldPromote(mentionCount: 1, origin: .explicit, permanent: false))
         XCTAssertTrue(Decay.shouldPromote(mentionCount: 1, origin: .extracted, permanent: true))
         XCTAssertFalse(Decay.shouldPromote(mentionCount: 1, origin: .extracted, permanent: false))
     }
