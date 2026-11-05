@@ -59,6 +59,7 @@ public final class Services: @unchecked Sendable {
     public let engine: MemoryConsolidationEngine
     public let scheduler: ConsolidationScheduler
     public let modelConfig: ModelConfigStore
+    public let connectionServices: ConnectionServicesStore
     /// Tool-calling client used by the agentic gateway (`POST /v1/agent/turn`).
     public let agentClient: any AgentModelClient
 
@@ -75,9 +76,12 @@ public final class Services: @unchecked Sendable {
         self.embedder = embedder
         self.retriever = MemoryRetriever(store: store, embedder: embedder)
         self.bearerToken = config.bearerToken
+        let crypto = ConfigCrypto(bearerToken: config.bearerToken)
         let modelConfig = ModelConfigStore(dbQueue: store.dbQueue,
-                                           crypto: ConfigCrypto(bearerToken: config.bearerToken))
+                                           crypto: crypto)
         self.modelConfig = modelConfig
+        self.connectionServices = ConnectionServicesStore(dbQueue: store.dbQueue,
+                                                          crypto: crypto)
         let modelClient = RemoteModelClient(configStore: modelConfig,
                                             defaultBaseURL: URL(string: config.modelURL)!.appendingPathComponent("v1"),
                                             defaultModel: config.modelName)
@@ -122,9 +126,12 @@ public final class Services: @unchecked Sendable {
             isReady: { true },
             hasPendingCycle: { (try? store.loadSleepCycle()) != nil }
         )
+        let crypto = ConfigCrypto(bearerToken: bearerToken)
         let modelConfig = ModelConfigStore(dbQueue: store.dbQueue,
-                                            crypto: ConfigCrypto(bearerToken: bearerToken))
+                                            crypto: crypto)
         self.modelConfig = modelConfig
+        self.connectionServices = ConnectionServicesStore(dbQueue: store.dbQueue,
+                                                          crypto: crypto)
         self.agentClient = agentClient ?? ToolCallingClient(
             configStore: modelConfig,
             defaultBaseURL: URL(string: "http://host.docker.internal:8080/v1")!
@@ -201,6 +208,7 @@ public func buildApp(services: Services, port: Int) async throws -> some Applica
     ScheduleHandlers(services: services).register(on: v1)
     InspectorHandlers(services: services).register(on: v1)
     ConfigHandlers(services: services).register(on: v1)
+    ConnectionServicesHandlers(services: services).register(on: v1)
     AgentHandlers(services: services).register(on: v1)
     v1.get("/echo") { _, _ -> Response in
         return Response(

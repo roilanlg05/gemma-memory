@@ -37,7 +37,7 @@ final class AgentPromptTests: XCTestCase {
         let s = try await MainActor.run { try services() }   // empty store + empty thread
         let tail = AgentPrompt.recallTail(query: "anything", threadId: "T", services: s)
         // Empty-injection branch: tail is exactly the nowContext line — no "\n\n"-joined block appended.
-        XCTAssertTrue(tail.hasPrefix("Current date and time:"), tail)
+        XCTAssertTrue(tail.hasPrefix("[Reference datetime:"), tail)
         XCTAssertFalse(tail.contains("\n\n"), "no injection block should be appended, got: \(tail)")
     }
 

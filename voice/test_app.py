@@ -72,7 +72,7 @@ def _wav_16k(seconds: float = 0.5) -> bytes:
 
 
 def test_voice_turn_returns_audio_and_headers(monkeypatch):
-    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz, lang=None: "hola Roilan")
+    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz, lang=None, is_passive=False: "hola Roilan")
     r = client.post(
         "/v1/voice/turn", headers=AUTH,
         files={"audio": ("u.wav", _wav_16k(), "audio/wav")},
@@ -90,7 +90,7 @@ def test_voice_turn_forwards_stt_language_to_agent(monkeypatch):
     monkeypatch.setattr(appmod, "_stt", FakeSTT(text="hello", lang="en"))
     captured = {}
 
-    def fake_agent(text, tid, tz, language=None):
+    def fake_agent(text, tid, tz, language=None, is_passive=False):
         captured["language"] = language
         return "hi Roilan"
 
@@ -144,7 +144,7 @@ def test_voice_turn_missing_audio_is_400():
 def test_voice_turn_agent_error_speaks_fallback(monkeypatch):
     import httpx
 
-    def boom(text, tid, tz, lang=None):
+    def boom(text, tid, tz, lang=None, is_passive=False):
         raise httpx.ConnectError("memory down")  # transport failure -> spoken fallback, 200
     monkeypatch.setattr(appmod, "call_agent", boom)
     r = client.post("/v1/voice/turn", headers=AUTH,
@@ -168,7 +168,7 @@ def test_voice_turn_tts_failure_is_502(monkeypatch):
     class BoomTTS:
         def synthesize(self, text, lang):
             raise RuntimeError("tts down")
-    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz, lang=None: "una respuesta")
+    monkeypatch.setattr(appmod, "call_agent", lambda text, tid, tz, lang=None, is_passive=False: "una respuesta")
     monkeypatch.setattr(appmod, "_tts", BoomTTS())
     r = client.post("/v1/voice/turn", headers=AUTH,
                     files={"audio": ("u.wav", _wav_16k(), "audio/wav")})

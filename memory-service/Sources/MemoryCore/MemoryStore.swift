@@ -174,6 +174,15 @@ public final class MemoryStore: @unchecked Sendable {
             }
             try db.create(indexOn: "node_tags", columns: ["tag"])
         }
+        m.registerMigration("v10-connection-services") { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS connection_services (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    payloadCipher BLOB NOT NULL,
+                    updatedAt REAL NOT NULL
+                )
+                """)
+        }
         return m
     }
 
@@ -267,7 +276,13 @@ public final class MemoryStore: @unchecked Sendable {
     @discardableResult
     public func forgetByLabel(_ label: String) throws -> Int {
         let key = MemoryText.dedupKey(label)
-        let matches = try allNodes().filter { MemoryText.dedupKey($0.label) == key }
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let matches = try allNodes().filter {
+            MemoryText.dedupKey($0.label) == key ||
+            $0.label.lowercased().contains(trimmed) ||
+            trimmed.contains($0.label.lowercased()) ||
+            (!trimmed.isEmpty && $0.body.lowercased().contains(trimmed))
+        }
         for n in matches { try softDelete(nodeId: n.id) }
         return matches.count
     }

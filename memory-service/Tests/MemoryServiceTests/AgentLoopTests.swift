@@ -32,10 +32,13 @@ final class AgentLoopTests: XCTestCase {
         }
     }
 
-    /// A client that always returns a tool call (never converges to a final answer).
+    /// A client that returns a tool call when tools are available (never converges on its own).
     final class InfiniteToolClient: AgentModelClient, @unchecked Sendable {
         func complete(systemPrompt: String, userPrompt: String, tools: [[String: Any]]) async throws -> AgentModelResult {
-            AgentModelResult(text: "thinking…", toolCalls: [AgentToolCall(name: "get_current_time", args: "{}")])
+            if tools.isEmpty {
+                return AgentModelResult(text: "thinking…", toolCalls: [])
+            }
+            return AgentModelResult(text: "thinking…", toolCalls: [AgentToolCall(name: "get_current_time", args: "{}")])
         }
     }
 

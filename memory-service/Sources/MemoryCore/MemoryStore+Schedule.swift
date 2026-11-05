@@ -48,7 +48,12 @@ extension MemoryStore {
     public func createEventChecked(title: String, start: Double, end: Double, allDay: Bool,
                                    location: String?, origin: Origin, force: Bool)
         throws -> (id: String?, conflicts: [Node]) {
-        let conflicts = try scheduleConflicts(start: start, end: end)
+        let key = MemoryText.eventCanonicalKey(title: title, startAt: start)
+        let existing = try allNodes().first { node in
+            node.kind == NodeKind.event.rawValue && NodeAttributes.from(node.extra).canonicalKey == key
+        }
+        let excludingIds: Set<String> = existing != nil ? [existing!.id] : []
+        let conflicts = try scheduleConflicts(start: start, end: end, excluding: excludingIds)
         if !conflicts.isEmpty && !force { return (nil, conflicts) }
         let id = try upsertEvent(title: title, start: start, end: end,
                                  allDay: allDay, location: location, origin: origin)

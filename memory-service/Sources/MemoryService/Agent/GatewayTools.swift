@@ -402,9 +402,10 @@ public struct QueryScheduleGatewayTool: GatewayTool {
     public func run(argsJSON: String, services: Services) async -> String {
         let o = Self.args(argsJSON)
         guard let f = (o["from"] as? String).flatMap(isoToEpoch),
-              let t = (o["to"] as? String).flatMap(isoToEpochEnd) else {
+              var t = (o["to"] as? String).flatMap(isoToEpochEnd) else {
             return "I need a from/to range (e.g. 2026-06-09 to 2026-06-16)."
         }
+        if t <= f { t = f + 86400 }
         let includeCancelled = (o["includeCancelled"] as? Bool) ?? false
         do {
             let events = try services.store.scheduleWindow(from: f, to: t, includeCancelled: includeCancelled)

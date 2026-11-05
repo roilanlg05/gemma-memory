@@ -25,15 +25,40 @@ public struct RemoteModelClient: ModelTextClient {
         self.defaultModel = defaultModel; self.session = session; self.timeout = timeout
     }
 
-    private func resolve() -> (baseURL: URL, model: String, apiKey: String?, isLocal: Bool) {
+    private func resolve() -> (baseURL: URL, model: String, apiKey: String?, isLocal: Bool, isClaude: Bool) {
         if let c = try? configStore?.load() ?? nil, let url = URL(string: c.baseURL) {
-            return (url, c.model, c.apiKey, c.provider == "local")
+            let isClaude = c.provider == "claude" || url.absoluteString.contains("anthropic.com")
+            return (url, c.model, c.apiKey, c.provider == "local", isClaude)
         }
-        return (defaultBaseURL, defaultModel, nil, true)
+        return (defaultBaseURL, defaultModel, nil, true, false)
     }
 
     public func generate(prompt: String, options: ModelTextOptions) async throws -> String {
         let r = resolve()
+        if r.isClaude {
+            let body: [String: Any] = [
+                "model": r.model,
+                "messages": [["role": "user", "content": prompt]],
+                "max_tokens": options.maxTokens,
+            ]
+            var urlReq = URLRequest(url: r.baseURL.appendingPathComponent("messages"))
+            urlReq.httpMethod = "POST"
+            urlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            urlReq.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            if let key = r.apiKey, !key.isEmpty { urlReq.setValue(key, forHTTPHeaderField: "x-api-key") }
+            urlReq.timeoutInterval = timeout
+            urlReq.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+            let (data, resp) = try await session.data(for: urlReq)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                throw ModelClientError.remoteFailed(status: (resp as? HTTPURLResponse)?.statusCode ?? -1)
+            }
+            struct AnthropicBlock: Decodable { let type: String; let text: String? }
+            struct AnthropicResp: Decodable { let content: [AnthropicBlock] }
+            let parsed = try JSONDecoder().decode(AnthropicResp.self, from: data)
+            return parsed.content.first(where: { $0.type == "text" })?.text ?? ""
+        }
+
         var body: [String: Any] = [
             "model": r.model,
             "messages": [["role": "user", "content": prompt]],
