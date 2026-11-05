@@ -3,10 +3,11 @@ import PackageDescription
 
 let package = Package(
     name: "MemoryService",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
         .executable(name: "memory-service", targets: ["MemoryService"]),
         .library(name: "MemoryCore", targets: ["MemoryCore"]),
+        .library(name: "BrainContract", targets: ["BrainContract"]),
     ],
     dependencies: [
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.4.0"),
@@ -16,6 +17,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
     ],
     targets: [
+        .target(name: "BrainContract"),
+        .testTarget(name: "BrainContractTests", dependencies: ["BrainContract"]),
         .target(
             name: "MemoryCore",
             dependencies: [
