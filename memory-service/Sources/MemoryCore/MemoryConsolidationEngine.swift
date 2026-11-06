@@ -99,7 +99,10 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     private func persist<T>(_ code: String, _ body: () throws -> T) -> Result<T, PersistProblem> {
         do { return .success(try body()) }
         catch BrainStoreError.denied { return .failure(.refused(.init(code: code + "_withheld"))) }
-        catch is MemoryMergeError { return .failure(.refused(.init(code: code + "_subject_conflict"))) }
+        // A subject conflict is the store rejecting the write, not lawfully withholding it: two
+        // different people are not one memory. Retrying cannot change that, so it is a
+        // non-retryable failure and the material it came from stays un-consolidated.
+        catch is MemoryMergeError { return .failure(.failed(.constraint(code + "_subject_conflict"))) }
         catch { return .failure(.failed(.persist(code))) }
     }
 
@@ -136,7 +139,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         }
     }
 
-    // MARK: shared — per-item replay guards
+    // MARK: shared — per-item replay guards and write helpers
 
     /// True when this job already committed this item in an earlier attempt. Outside a job (direct
     /// phase calls, light reflection) there is nothing to replay, so the item always runs.
@@ -148,13 +151,104 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         return receipt.succeeded
     }
 
-    /// Record that this job committed this item, so a retry after a partial failure neither
-    /// duplicates it nor reinforces it a second time.
-    private func noteCommitted(_ phase: SleepPhase, item key: String) {
-        guard let job = currentJob else { return }
-        try? store.recordConsolidationReceipt(jobID: job.id, .committed(phase, 1),
-                                              operationID: job.operationID(for: phase, item: key),
-                                              at: now())
+    /// The checkpoint that marks this item done, for the store to write *inside* the same
+    /// transaction as the item's own content.
+    ///
+    /// Written separately, the content and its receipt leave a window in which the content
+    /// survives an interruption and the receipt does not; the replay then reinforces a memory it
+    /// had already stored. Handing the checkpoint down to the write closes that window: either
+    /// both land or neither does, so a replay of a committed item is a genuine no-op.
+    ///
+    /// Outside a job there is nothing to replay, so there is no checkpoint.
+    private func itemCheckpoint(_ phase: SleepPhase, item key: String) -> ConsolidationCheckpoint? {
+        guard let job = currentJob else { return nil }
+        return ConsolidationCheckpoint(jobID: job.id, operationID: job.operationID(for: phase, item: key),
+                                       phase: phase, at: now())
+    }
+
+    /// Record that this job disposed of an item that stored no content of its own — an event
+    /// blocked by a conflict, say, where the outcome is a question to the user rather than a node.
+    ///
+    /// With nothing written there is nothing a replay could duplicate, so this receipt has no
+    /// transaction to share. It is still a write, so a failure is reported rather than swallowed.
+    private func recordItemDisposition(_ phase: SleepPhase, item key: String) -> Result<Void, PersistProblem> {
+        guard let checkpoint = itemCheckpoint(phase, item: key) else { return .success(()) }
+        return persist("item_receipt") {
+            try store.recordConsolidationReceipt(jobID: checkpoint.jobID, .committed(phase, 1),
+                                                 operationID: checkpoint.operationID, at: checkpoint.at)
+        }
+    }
+
+    /// The embedder, but only when it spans an embedding space wide enough to mean anything.
+    ///
+    /// Distances in a space a dozen dimensions wide are noise, and a tight cosine bound over noise
+    /// merges unrelated memories. Below that width the dedup key is the only trustworthy signal.
+    private var semanticEmbedder: Embedder? {
+        guard let embedder, embedder.dimension > 16 else { return nil }
+        return embedder
+    }
+
+    /// Store a node through the store's dedup path, checkpointing the write in the same transaction
+    /// when the caller supplies one.
+    ///
+    /// `tightThreshold` is for the kinds whose duplicates have to be near-identical before they may
+    /// be folded together — insights, follow-ups, implicit tasks. It is only honoured when there is
+    /// a real embedding space to measure it in; with none, the store falls back to the dedup key,
+    /// because consolidation must work with no embedder configured at all.
+    ///
+    /// The embedding itself is stored by the dedup path right after the node, in its own
+    /// transaction, so an interruption between them can leave a checkpointed node without a vector.
+    /// That is recoverable and recovered: the `embeddings` phase backfills whatever is missing.
+    private func persistMerging(_ code: String, _ node: Node, embedding: [Float]? = nil,
+                                tightThreshold: Double? = nil,
+                                checkpoint: ConsolidationCheckpoint? = nil) -> Result<String, PersistProblem> {
+        persist(code) { () -> String in
+            guard let tightThreshold else {
+                return try store.upsertMergingSemantic(node, embedding: embedding, embedder: embedder,
+                                                       checkpoint: checkpoint)
+            }
+            guard let embedder = semanticEmbedder else {
+                return try store.upsertMerging(node, checkpoint: checkpoint)
+            }
+            return try store.upsertMergingSemantic(node, embedding: embedding, embedder: embedder,
+                                                   threshold: tightThreshold, checkpoint: checkpoint)
+        }
+    }
+
+    /// The scopes an identity assertion in this slice must be judged against.
+    ///
+    /// Both halves are read off what the cycle actually holds — the authorization it builds for
+    /// these threads, and an evidence record actually adapted from these rows — rather than
+    /// restated as literals at the call site. Literals would keep asserting "user scope" after the
+    /// authorization stopped granting it, which is a scope check that cannot fail and therefore
+    /// checks nothing.
+    ///
+    /// Nil when no row in the slice adapts into a user-spoken evidence record: there is then no
+    /// source for the claim, which the caller reports as such.
+    private func identityScopes(for segment: ConsolidationSegment)
+        -> (permitted: Set<BrainAccessScope>, evidence: BrainAccessScope)? {
+        let authorization = ConsolidationEvidenceAdapter
+            .authorization(threads: Set(segment.rows.map { $0.threadId }))
+        guard let evidence = segment.rows
+            .compactMap({ ConsolidationEvidenceAdapter.evidence(for: $0) })
+            .first(where: { $0.sourceKind == .userMessage })
+        else { return nil }
+        return (authorization.scopes, evidence.accessScope)
+    }
+
+    /// Link two nodes.
+    ///
+    /// An edge carries no content of its own and is derived from the nodes it joins, so it is never
+    /// checkpointed: the item receipt belongs to the node write it accompanies. A replay re-derives
+    /// the same edge, and `pruneDanglingEdges` clears any whose endpoints went away.
+    private func persistEdge(_ code: String, from src: String, to dst: String, relation: Relation,
+                             confidence: Confidence, at t: Double,
+                             weight: Double = 1) -> Result<Void, PersistProblem> {
+        persist(code) {
+            try store.upsert(Edge(id: UUID().uuidString, srcId: src, dstId: dst, relation: relation,
+                                  weight: weight, confidence: confidence, createdAt: t, updatedAt: t,
+                                  dirty: true, deleted: false, extra: nil))
+        }
     }
 
     /// Machine-native consolidation phase order (SP-B): embed → cluster → tag → reflect/compress/
@@ -163,6 +257,19 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         .nrem, .summarize, .detect, .embeddings, .cluster, .tag,
         .reflect, .compress, .curate, .rem, .clarify, .shy,
     ]
+
+    /// How many characters of transcript one generation unit of an input phase may carry.
+    ///
+    /// Summarize is deliberately unbudgeted: a summary records the seq range it was distilled
+    /// from, so splitting a thread would claim a range wider than the text it actually read.
+    /// Extraction and follow-up detection are budgeted, because a long slice degrades the model's
+    /// recall and one bad slice should not take a whole thread down with it.
+    ///
+    /// One place, so the units a completion recomputes from receipts are identical to the units
+    /// the phases actually ran.
+    static func unitBudget(_ phase: SleepPhase) -> Int {
+        phase == .summarize ? .max : 6_000
+    }
 
     // MARK: NREM — Consolidate
 
@@ -228,17 +335,22 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                     let allDay = e.attributes?.allDay ?? false
                     switch persist("event", {
                         try store.createEventChecked(title: evLabel, start: st, end: en, allDay: allDay,
-                                                     location: e.attributes?.location, origin: .extracted, force: false)
+                                                     location: e.attributes?.location, origin: .extracted,
+                                                     force: false,
+                                                     checkpoint: itemCheckpoint(.nrem, item: itemKey))
                     }) {
                     case .failure(let problem): tally.note(problem)
                     case .success(let result):
                         if let evId = result.id {
                             if let emb = (try? embedder?.embed(evLabel)) ?? nil { try? store.setEmbedding(nodeId: evId, emb) }
                             tally.committed += 1
-                            noteCommitted(.nrem, item: itemKey)
                         } else {
+                            // Blocked by a conflict: the outcome is a question to the user, not an
+                            // event, so nothing was written for the checkpoint to ride along with.
                             emitConflictClarification(title: evLabel, date: date, time: startTime, conflicts: result.conflicts)
-                            noteCommitted(.nrem, item: itemKey)
+                            if case .failure(let problem) = recordItemDisposition(.nrem, item: itemKey) {
+                                tally.note(problem)
+                            }
                         }
                     }
                 }
@@ -247,14 +359,26 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             // The user's own identity → the singleton self node (never a generic person/fact), and
             // only when the user themselves asserted it in a turn we can point at.
             if e.kind == NodeKind.selfUser.rawValue {
+                guard let scopes = identityScopes(for: segment) else {
+                    // Nothing in this slice adapts into a turn the user is the speaker of, so there
+                    // is no source an identity assertion could rest on.
+                    tally.refuse("self_" + SelfAssertionRejection.noUserSource.rawValue)
+                    continue
+                }
                 switch SelfAssertionValidator.validate(label: e.entity, sources: segment.rows,
-                                                       permittedScopes: [.user], evidenceScope: .user) {
+                                                       permittedScopes: scopes.permitted,
+                                                       evidenceScope: scopes.evidence) {
                 case .failure(let rejection):
                     tally.refuse("self_" + rejection.rawValue)
                 case .success(let support):
                     let selfLabel = MemoryText.canonicalEntityLabel(e.entity)
-                    let itemKey = "self|\(selfLabel)|\(support.evidenceID)"
-                    if alreadyCommitted(.nrem, item: itemKey) { continue }
+                    // No item checkpoint here, deliberately. This item is two writes in two stores
+                    // — the legacy self node, then the claim — and a checkpoint can only ride with
+                    // one of them; riding with the node would let a replay skip an item whose claim
+                    // never landed. Both writes are idempotent instead: the claim is keyed on a
+                    // deterministic operation id and short-circuits when the active value already
+                    // matches, and the node merges onto itself. A replay therefore costs one
+                    // `mentionCount` bump on `self:user` and nothing else.
                     switch persist("self", {
                         try store.upsertSelf(name: selfLabel, detail: e.detail, embedder: embedder,
                                              now: now(), sourceRef: support.evidenceID)
@@ -267,7 +391,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                         let row = segment.rows.first { $0.id == support.rowID }
                         switch commitAssertedIdentity(value: selfLabel, row: row) {
                         case .failure(let problem): tally.note(problem)
-                        case .success: tally.committed += 1; noteCommitted(.nrem, item: itemKey)
+                        case .success: tally.committed += 1
                         }
                     }
                 }
@@ -309,7 +433,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                             dirty: true, deleted: false, extra: attrs.toJSON())
             let emb = (try? embedder?.embed(label)) ?? nil
-            switch persist("entity", { try store.upsertMergingSemantic(node, embedding: emb, embedder: embedder) }) {
+            switch persistMerging("entity", node, embedding: emb,
+                                  checkpoint: itemCheckpoint(.nrem, item: itemKey)) {
             case .failure(let problem): tally.note(problem)
             case .success(let savedId):
                 if kind == NodeKind.person.rawValue, let selfNode = try? store.selfNode() {
@@ -322,13 +447,10 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                     } else {
                         rel = .knows
                     }
-                    if case .failure(let problem) = persist("person_link", {
-                        try store.upsert(Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: savedId, relation: rel,
-                                              weight: 1, confidence: .sure, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                    }) { tally.note(problem) }
+                    if case .failure(let problem) = persistEdge("person_link", from: selfNode.id, to: savedId,
+                                                                relation: rel, confidence: .sure, at: t) { tally.note(problem) }
                 }
                 tally.committed += 1
-                noteCommitted(.nrem, item: itemKey)
             }
         }
         onProgress?("+\(tally.committed) entities")
@@ -410,11 +532,11 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                         dirty: true, deleted: false, extra: extraJSON)
         let conceptText = ([topic] + out.concepts).joined(separator: " ")
         let emb = (try? embedder?.embed(conceptText)) ?? nil
-        switch persist("summary", { try store.upsertMergingSemantic(node, embedding: emb, embedder: embedder) }) {
+        switch persistMerging("summary", node, embedding: emb,
+                              checkpoint: itemCheckpoint(.summarize, item: itemKey)) {
         case .failure(let problem): tally.note(problem)
         case .success:
             tally.committed += 1
-            noteCommitted(.summarize, item: itemKey)
             onProgress?("+1 summary")
         }
         return tally.result
@@ -500,9 +622,11 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             updated.extra = attrs.toJSON()
             updated.deleted = true
             updated.dirty = true
-            switch persist("followup_resolved", { try store.upsert(updated) }) {
+            switch persist("followup_resolved", {
+                try store.upsert(updated, checkpoint: itemCheckpoint(.detect, item: itemKey))
+            }) {
             case .failure(let problem): tally.note(problem)
-            case .success: tally.committed += 1; noteCommitted(.detect, item: itemKey)
+            case .success: tally.committed += 1
             }
         }
 
@@ -526,12 +650,11 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
                             ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
             let fEmb = (try? embedder?.embed(node.label)) ?? nil
-            let saved = persist("followup", { () -> String in
-                if let embedder, embedder.dimension > 16 {
-                    return try store.upsertMergingSemantic(node, embedding: fEmb, embedder: embedder, threshold: 0.15)
-                }
-                return try store.upsertMerging(node)
-            })
+            // The checkpoint rides with the node, which is the part a replay would reinforce. The
+            // links below are derived from it and are reported as failures of the unit, which keeps
+            // the unit's turns un-consolidated, so a later cycle re-derives them under a new job.
+            let saved = persistMerging("followup", node, embedding: fEmb, tightThreshold: 0.15,
+                                       checkpoint: itemCheckpoint(.detect, item: itemKey))
             guard case .success(let canonicalID) = saved else {
                 if case .failure(let problem) = saved { tally.note(problem) }
                 continue
@@ -539,20 +662,15 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             // Link the follow_up to self:user and to each resolved source entity, always using the
             // id the store kept — a merge may have folded this node into an existing one.
             if let selfNode = try? store.selfNode(), selfNode.id != canonicalID {
-                if case .failure(let problem) = persist("followup_self_link", {
-                    try store.upsert(Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: canonicalID, relation: .relatedTo, weight: 1,
-                                          confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                }) { tally.note(problem) }
+                if case .failure(let problem) = persistEdge("followup_self_link", from: selfNode.id, to: canonicalID,
+                                                            relation: .relatedTo, confidence: .probable, at: t) { tally.note(problem) }
             }
             for src in (f.sources ?? []).compactMap(resolve) where src.id != canonicalID {
-                if case .failure(let problem) = persist("followup_source_link", {
-                    try store.upsert(Edge(id: UUID().uuidString, srcId: canonicalID, dstId: src.id, relation: .relatedTo, weight: 1,
-                                          confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                }) { tally.note(problem) }
+                if case .failure(let problem) = persistEdge("followup_source_link", from: canonicalID, to: src.id,
+                                                            relation: .relatedTo, confidence: .probable, at: t) { tally.note(problem) }
             }
             added += 1
             tally.committed += 1
-            noteCommitted(.detect, item: itemKey)
         }
         onProgress?("+\(added) follow-ups")
         return tally.result
@@ -607,10 +725,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             if existing.contains(key) { continue }
             existing.insert(key)
             let t = now()
-            switch persist("edge", {
-                try store.upsert(Edge(id: UUID().uuidString, srcId: s.id, dstId: d.id, relation: rel, weight: 1,
-                                      confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-            }) {
+            switch persistEdge("edge", from: s.id, to: d.id,
+                               relation: rel, confidence: .probable, at: t) {
             case .failure(let problem): tally.note(problem)
             case .success: tally.committed += 1
             }
@@ -679,12 +795,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                                 decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
                                 ttlExpiresAt: nil, sourceRef: topic.id, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
                 let emb = (try? embedder?.embed(node.label)) ?? nil
-                let saved = persist("topic_insight", { () -> String in
-                    if let embedder, embedder.dimension > 16 {
-                        return try store.upsertMergingSemantic(node, embedding: emb, embedder: embedder, threshold: 0.15)
-                    }
-                    return try store.upsertMerging(node)
-                })
+                let saved = persistMerging("topic_insight", node, embedding: emb, tightThreshold: 0.15)
                 guard case .success(let canonicalID) = saved else {
                     if case .failure(let problem) = saved { tally.note(problem) }
                     continue
@@ -692,16 +803,12 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 // Provenance runs FROM the insight TO its source, and always references the id the
                 // store kept: a merged insight must not leave an edge on a pre-merge id.
                 if canonicalID != topic.id {
-                    if case .failure(let problem) = persist("topic_insight_provenance", {
-                        try store.upsert(Edge(id: UUID().uuidString, srcId: canonicalID, dstId: topic.id, relation: .derivesFrom,
-                                              weight: 1, confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                    }) { tally.note(problem) }
+                    if case .failure(let problem) = persistEdge("topic_insight_provenance", from: canonicalID, to: topic.id,
+                                                                relation: .derivesFrom, confidence: .probable, at: t) { tally.note(problem) }
                 }
                 if let selfNode = try? store.selfNode(), selfNode.id != canonicalID {
-                    if case .failure(let problem) = persist("topic_insight_self_link", {
-                        try store.upsert(Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: canonicalID, relation: .relatedTo,
-                                              weight: 1, confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                    }) { tally.note(problem) }
+                    if case .failure(let problem) = persistEdge("topic_insight_self_link", from: selfNode.id, to: canonicalID,
+                                                                relation: .relatedTo, confidence: .probable, at: t) { tally.note(problem) }
                 }
                 addedInsights += 1
                 tally.committed += 1
@@ -716,21 +823,14 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                                 decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
                                 ttlExpiresAt: nil, sourceRef: topic.id, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
                 let emb = (try? embedder?.embed(node.label)) ?? nil
-                let saved = persist("implicit_task", { () -> String in
-                    if let embedder, embedder.dimension > 16 {
-                        return try store.upsertMergingSemantic(node, embedding: emb, embedder: embedder, threshold: 0.15)
-                    }
-                    return try store.upsertMerging(node)
-                })
+                let saved = persistMerging("implicit_task", node, embedding: emb, tightThreshold: 0.15)
                 guard case .success(let canonicalID) = saved else {
                     if case .failure(let problem) = saved { tally.note(problem) }
                     continue
                 }
                 if canonicalID != topic.id {
-                    if case .failure(let problem) = persist("implicit_task_link", {
-                        try store.upsert(Edge(id: UUID().uuidString, srcId: topic.id, dstId: canonicalID, relation: .relatedTo,
-                                              weight: 1, confidence: .probable, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                    }) { tally.note(problem) }
+                    if case .failure(let problem) = persistEdge("implicit_task_link", from: topic.id, to: canonicalID,
+                                                                relation: .relatedTo, confidence: .probable, at: t) { tally.note(problem) }
                 }
                 addedTasks += 1
                 tally.committed += 1
@@ -739,15 +839,11 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             for cName in out.companions ?? [] {
                 let key = MemoryText.dedupKey(cName)
                 if let cNode = allNodes.first(where: { $0.kind == NodeKind.person.rawValue && MemoryText.dedupKey($0.label) == key }) {
-                    if case .failure(let problem) = persist("companion_link", {
-                        try store.upsert(Edge(id: UUID().uuidString, srcId: topic.id, dstId: cNode.id, relation: .relatedTo,
-                                              weight: 1, confidence: .sure, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                    }) { tally.note(problem) }
+                    if case .failure(let problem) = persistEdge("companion_link", from: topic.id, to: cNode.id,
+                                                                relation: .relatedTo, confidence: .sure, at: t) { tally.note(problem) }
                     if let selfNode = try? store.selfNode() {
-                        if case .failure(let problem) = persist("companion_family_link", {
-                            try store.upsert(Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: cNode.id, relation: .family,
-                                                  weight: 1, confidence: .sure, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                        }) { tally.note(problem) }
+                        if case .failure(let problem) = persistEdge("companion_family_link", from: selfNode.id, to: cNode.id,
+                                                                    relation: .family, confidence: .sure, at: t) { tally.note(problem) }
                     }
                 }
             }
@@ -810,22 +906,15 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                                 mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                                 dirty: true, deleted: false, extra: nil)
                 let insEmb = (try? embedder?.embed(node.label)) ?? nil
-                let saved = persist("insight", { () -> String in
-                    if let embedder, embedder.dimension > 16 {
-                        return try store.upsertMergingSemantic(node, embedding: insEmb, embedder: embedder, threshold: 0.15)
-                    }
-                    return try store.upsertMerging(node)
-                })
+                let saved = persistMerging("insight", node, embedding: insEmb, tightThreshold: 0.15)
                 guard case .success(let canonicalID) = saved else {
                     if case .failure(let problem) = saved { tally.note(problem) }
                     continue
                 }
                 // insight → derivesFrom → member, on the id the store kept.
                 for s in sources where s.id != canonicalID {
-                    if case .failure(let problem) = persist("insight_provenance", {
-                        try store.upsert(Edge(id: UUID().uuidString, srcId: canonicalID, dstId: s.id, relation: .derivesFrom, weight: 1,
-                                              confidence: conf, createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                    }) { tally.note(problem) }
+                    if case .failure(let problem) = persistEdge("insight_provenance", from: canonicalID, to: s.id,
+                                                                relation: .derivesFrom, confidence: conf, at: t) { tally.note(problem) }
                 }
                 added += 1
                 tally.committed += 1
@@ -875,11 +964,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             if existing.contains(key) { continue }
             existing.insert(key)
             let t = now()
-            switch persist("provenance_repoint", {
-                try store.upsert(Edge(id: UUID().uuidString, srcId: src, dstId: dst, relation: .derivesFrom,
-                                      weight: e.weight, confidence: e.confidence, createdAt: t, updatedAt: t,
-                                      dirty: true, deleted: false, extra: nil))
-            }) {
+            switch persistEdge("provenance_repoint", from: src, to: dst,
+                               relation: .derivesFrom, confidence: e.confidence, at: t, weight: e.weight) {
             case .failure(let problem): tally.note(problem)
             case .success: moved += 1
             }
@@ -953,11 +1039,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 tally.note(problem); continue
             }
             for memberId in community {
-                if case .failure(let problem) = persist("cluster_member", {
-                    try store.upsert(Edge(id: UUID().uuidString, srcId: anchorId, dstId: memberId,
-                                          relation: .belongsToCluster, weight: 1, confidence: .probable,
-                                          createdAt: t, updatedAt: t, dirty: true, deleted: false, extra: nil))
-                }) { tally.note(problem) }
+                if case .failure(let problem) = persistEdge("cluster_member", from: anchorId, to: memberId,
+                                                            relation: .belongsToCluster, confidence: .probable, at: t) { tally.note(problem) }
             }
             tally.committed += 1
         }
@@ -1252,12 +1335,18 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         //
         // The job is retired even when units failed, deliberately: a job left parked would be
         // resumed by every later cycle, and newly arrived turns would never be looked at.
+        //
+        // What this pass observed in memory covers only the phases this pass ran. A pass that
+        // resumes past the input phases would see no failures at all, so the held-back set is
+        // recomputed from the receipts the job has persisted and unioned with it.
+        unresolved.formUnion(unresolvedFromReceipts(job: job, rows: rows))
         let absorbed = state.episodeIds.filter { !unresolved.contains($0) }
         let committed = report.results.reduce(0) { $0 + $1.committed }
         do {
             try transcriptStore.completeConsolidation(ids: absorbed, jobID: job.id,
                                                       operationID: job.completionOperationID,
-                                                      phase: .shy, committed: committed, at: now())
+                                                      phase: .shy, committed: committed,
+                                                      unresolved: unresolved.count, at: now())
             report.unresolvedInputs = unresolved.count
             report.inputsConsolidated = unresolved.isEmpty
             onProgress?(unresolved.isEmpty ? "done"
@@ -1267,6 +1356,32 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             onProgress?("completion failed — turns kept")
         }
         return report
+    }
+
+    /// Which of the job's turns must be held back, read from the receipts the job has persisted.
+    ///
+    /// The receipts — not this pass's in-memory tally — are the authority on what a job absorbed.
+    /// An interrupted cycle resumes at the phase it had reached, which may be past every input
+    /// phase; without consulting the receipts such a resume would observe no failure and mark the
+    /// turns of a unit that never succeeded, which is exactly the silent loss this task removes.
+    ///
+    /// Unit operation ids are deterministic — the phase plus a digest of the unit's row ids — so
+    /// the units of every input phase can be recomputed from the same rows with the same budget
+    /// and each one's own receipt consulted. A unit with no receipt at all was never reached, so
+    /// its turns are not absorbed either.
+    private func unresolvedFromReceipts(job: ConsolidationJob, rows: [TranscriptRow]) -> Set<String> {
+        var held = Set<String>()
+        for phase in MemoryConsolidationEngine.cycleOrder where phase.consumesJobInputs {
+            for segment in ConsolidationSegment.segments(rows, maxChars: Self.unitBudget(phase)) {
+                let operationID = job.operationID(for: phase, unit: segment.unitKey)
+                let receipt = (try? store.consolidationReceipt(jobID: job.id, operationID: operationID)) ?? nil
+                guard let receipt, receipt.succeeded else {
+                    held.formUnion(segment.inputIDs)
+                    continue
+                }
+            }
+        }
+        return held
     }
 
     private func announce(_ result: ConsolidationPhaseResult, phase: SleepPhase) {
@@ -1301,7 +1416,9 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         case .nrem:
             // Segment-sized generation: one coherent slice of one thread per call, each anchored
             // on when it was spoken, each succeeding or failing on its own.
-            let run = await runOverUnits(.nrem, rows: rows) { await self.consolidate(segment: $0) }
+            let run = await runOverUnits(.nrem, rows: rows, maxChars: Self.unitBudget(.nrem)) {
+                await self.consolidate(segment: $0)
+            }
             // Refine focus to the consolidated entities (semantic, reads naturally) now that
             // NREM has minted nodes. The initial positional focus set at cycle start stays the
             // fallback if NREM produced nothing. Persist so an interrupted resume keeps it.
@@ -1319,11 +1436,13 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             return run
         case .summarize:
             // One summary unit per thread, so a summary's recorded seq range covers the whole slice.
-            return await runOverUnits(.summarize, rows: rows, maxChars: .max) {
+            return await runOverUnits(.summarize, rows: rows, maxChars: Self.unitBudget(.summarize)) {
                 await self.summarize(segment: $0)
             }
         case .detect:
-            return await runOverUnits(.detect, rows: rows) { await self.detectFollowUps(segment: $0) }
+            return await runOverUnits(.detect, rows: rows, maxChars: Self.unitBudget(.detect)) {
+                await self.detectFollowUps(segment: $0)
+            }
         case .embeddings: return PhaseRun(await embedMissingPhase())
         case .cluster: return PhaseRun(await clusterPhase())
         case .tag: return PhaseRun(await tagClustersPhase())
@@ -1339,7 +1458,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     /// Run one input phase unit by unit: skip the units this job already absorbed, record a
     /// receipt per unit with its own stage and reason, and report the turns of the units that
     /// failed so only those are held back.
-    private func runOverUnits(_ phase: SleepPhase, rows: [TranscriptRow], maxChars: Int = 6_000,
+    private func runOverUnits(_ phase: SleepPhase, rows: [TranscriptRow], maxChars: Int,
                               _ body: (ConsolidationSegment) async -> ConsolidationPhaseResult) async -> PhaseRun {
         var tally = PhaseTally(phase)
         var unresolved = Set<String>()

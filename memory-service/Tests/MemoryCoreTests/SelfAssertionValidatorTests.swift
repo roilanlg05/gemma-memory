@@ -33,9 +33,12 @@ final class SelfAssertionValidatorTests: XCTestCase {
                        ConsolidationEvidenceAdapter.evidenceID(threadID: "T", seq: 1, text: "me llamo Roilan"))
     }
 
-    func test_acceptsEnglishAndAccentInsensitiveAssertions() {
+    func test_acceptsEnglishAndAccentInsensitiveNamings() {
         XCTAssertNotNil(try? validate("Roilan", [row("user", "Hi, my name is Roilan")]).get())
-        XCTAssertNotNil(try? validate("Jose", [row("user", "yo soy José")]).get())
+        XCTAssertNotNil(try? validate("Jose", [row("user", "me llamo José")]).get())
+        // A copular self-description is not a naming, even when the label really is the name:
+        // this path writes the `name` predicate, so it accepts only explicit namings.
+        XCTAssertEqual(rejection(validate("Jose", [row("user", "yo soy José")])), .notANameAssertion)
     }
 
     func test_rejectsStatementOnlyTheAgentMade() {
@@ -155,5 +158,85 @@ final class ConsolidationEvidenceAdapterTests: XCTestCase {
         XCTAssertEqual(auth.subjects, [selfUserID])
         XCTAssertEqual(auth.scopes, [.user])
         XCTAssertEqual(auth.threads, ["T"])
+    }
+}
+
+/// `self:user` has exactly one predicate in this task: the user's name. A self-description that is
+/// not a name must not be written as one — it would rename the user and retire their real name as
+/// superseded. Traits and autobiography belong to later tasks with their own vocabulary.
+final class SelfAssertionNamePredicateTests: XCTestCase {
+
+    private func row(_ role: String, _ text: String, seq: Int = 1) -> TranscriptRow {
+        TranscriptRow(id: "r\(seq)", threadId: "T", turnIndex: seq, seq: seq, role: role,
+                      text: text, createdAt: 1_000, consolidated: false)
+    }
+
+    private func rejection(_ label: String, _ text: String) -> SelfAssertionRejection? {
+        let result = SelfAssertionValidator.validate(label: label, sources: [row("user", text)],
+                                                     permittedScopes: [.user], evidenceScope: .user)
+        if case .failure(let r) = result { return r }
+        return nil
+    }
+
+    func test_rejectsACopularSelfDescriptionAsAName() {
+        XCTAssertEqual(rejection("diabético", "soy diabético"), .notANameAssertion,
+                       "'soy diabético' says something true about the user, but it is not their name")
+        XCTAssertEqual(rejection("stubborn", "i am stubborn"), .notANameAssertion)
+        XCTAssertEqual(rejection("tired", "im tired"), .notANameAssertion)
+        XCTAssertEqual(rejection("cubano", "yo soy cubano"), .notANameAssertion)
+    }
+
+    func test_stillAcceptsAnExplicitNaming() {
+        for text in ["me llamo Roilan", "mi nombre es Roilan", "my name is Roilan",
+                     "call me Roilan", "llámame Roilan"] {
+            XCTAssertNil(rejection("Roilan", text), "\(text) names the user explicitly")
+        }
+    }
+
+    func test_aNonNameSelfAssertionNeverReachesTheIdentityNodeOrAClaim() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        try ts.append(threadId: "T", turnIndex: 0, role: "user", text: "soy diabético", now: 1_000)
+        let json = #"{"entities":[{"entity":"diabético","kind":"self","detail":"condición"}]}"#
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil,
+                                               runtime: SchemaAwareRuntime(["entities": json]),
+                                               transcriptStore: ts, now: { 2_000 })
+        let report = await engine.runCycleReporting(isCancelled: { false })
+
+        XCTAssertNil(try store.selfNode(), "the user was not renamed to their condition")
+        let brain = BrainStore(store: store,
+                               authorization: ConsolidationEvidenceAdapter.authorization(threads: ["T"]),
+                               clock: { 9_000 })
+        XCTAssertTrue(try brain.claims(subject: selfUserID, asOf: 9_000, scope: .user).isEmpty,
+                      "and no name claim was committed for it")
+        XCTAssertEqual(report.refusals.map { $0.code }, ["self_notANameAssertion"],
+                       "the refusal records why, rather than passing silently")
+    }
+
+    func test_aNonNameAssertionDoesNotRetireTheRealName() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        try ts.append(threadId: "T", turnIndex: 0, role: "user", text: "me llamo Roilan", now: 1_000)
+        let naming = MemoryConsolidationEngine(
+            store: store, embedder: nil,
+            runtime: SchemaAwareRuntime(["entities": #"{"entities":[{"entity":"Roilan","kind":"self"}]}"#]),
+            transcriptStore: ts, now: { 2_000 })
+        _ = await naming.runCycleReporting(isCancelled: { false })
+
+        try ts.append(threadId: "T", turnIndex: 1, role: "user", text: "soy diabético", now: 3_000)
+        let condition = MemoryConsolidationEngine(
+            store: store, embedder: nil,
+            runtime: SchemaAwareRuntime(["entities": #"{"entities":[{"entity":"diabético","kind":"self"}]}"#]),
+            transcriptStore: ts, now: { 4_000 })
+        _ = await condition.runCycleReporting(isCancelled: { false })
+
+        XCTAssertEqual(try store.selfNode()?.label, "Roilan", "the user is still called Roilan")
+        let brain = BrainStore(store: store,
+                               authorization: ConsolidationEvidenceAdapter.authorization(threads: ["T"]),
+                               clock: { 9_000 })
+        let names = try brain.claims(subject: selfUserID, asOf: 9_000, scope: .user)
+            .filter { $0.predicate == ConsolidationIdentityClaim.namePredicate }
+        XCTAssertEqual(names.map { $0.value }, [.string("Roilan")],
+                       "the real name was not superseded by a condition")
     }
 }

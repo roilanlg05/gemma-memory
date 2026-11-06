@@ -179,9 +179,15 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         engine.onProgress = { progress.append($0) }
         await engine.runCycle(isCancelled: { false })
         XCTAssertNil(try store.loadSleepCycle(), "cycle cleared after completing from .shy")
-        XCTAssertEqual(try ts.unconsolidated(limit: 100).count, 0, ".shy still marks episodes consolidated")
         XCTAssertFalse(progress.contains { $0.contains("entities") || $0.contains("summary") },
                        "resuming from .shy must SKIP nrem/summarize")
+        // This cycle state was handed to the engine already at .shy, so no input phase ever ran
+        // over the turn and no unit receipt vouches for it. The receipts are the authority on what
+        // a job absorbed, so the turn is kept rather than marked: its content was never read, and
+        // marking it would lose it. The cycle is still retired, so the next one starts clean at
+        // .nrem and consolidates it properly.
+        XCTAssertEqual(try ts.unconsolidated(limit: 100).count, 1,
+                       "a turn no input phase ever processed is not absorbed by reaching .shy")
     }
 
     func test_runCycle_cancel_persists_phase_for_resume() async throws {

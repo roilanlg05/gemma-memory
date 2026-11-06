@@ -18,6 +18,9 @@ public enum SelfAssertionRejection: String, Error, Equatable, Sendable, CaseIter
     case noUserSource
     /// The user's turn mentions it, but not as a first-person assertion about themselves.
     case notFirstPersonAssertion
+    /// The user asserted it about themselves, but it is not their name. `self:user` carries only
+    /// the name predicate here; traits and autobiography have their own vocabulary elsewhere.
+    case notANameAssertion
     /// It appears inside a quotation — someone else's words, repeated.
     case quoted
     /// The user denied it.
@@ -46,9 +49,12 @@ public struct SelfAssertionSupport: Equatable, Sendable {
 ///
 /// 1. **The speaker is the user.** Only rows whose transcript `role` is `user` count. An assistant
 ///    turn saying "you are Roilan" is the agent's belief, not the user's assertion.
-/// 2. **It is an actual assertion.** The user's own words must contain a first-person
-///    self-identification of the proposed label, and that clause must not be quoted, negated,
-///    hypothetical, attributed to a third party, or explicitly disavowed.
+/// 2. **It is an actual naming.** The user's own words must *name* them — "me llamo X", "my name
+///    is X", "call me X" — and that clause must not be quoted, negated, hypothetical, attributed
+///    to a third party, or explicitly disavowed. A copular self-description ("soy diabético") is a
+///    genuine first-person assertion and is still refused here, because the only predicate this
+///    path writes is the user's name and a later name supersedes the earlier one: accepting a
+///    condition would rename the user and retire their real name.
 /// 3. **The scope permits it.** The authorization must hold the `user` scope, and the supporting
 ///    evidence must not be agent-scoped or shared.
 ///
@@ -63,19 +69,27 @@ public enum SelfAssertionValidator {
         "self", "user", "usuario", "yo", "me", "i",
     ]
 
-    /// First-person self-identification patterns. `%@` marks where the label must appear.
-    /// Matching is accent- and case-insensitive.
-    private static let assertionPrefixes: [String] = [
-        "me llamo ", "mi nombre es ", "mi nombre completo es ", "yo soy ", "soy ",
-        "llamame ", "llamame  ", "puedes llamarme ", "my name is ", "my full name is ",
-        "i am ", "i'm ", "im ", "call me ", "name's ", "they call me ",
+    /// Explicit namings: the user says what they are *called*. These are the only openings that
+    /// may set the `name` predicate, because that predicate answers "who is the user" and a later
+    /// value supersedes the earlier one.
+    private static let namingPrefixes: [String] = [
+        "me llamo ", "mi nombre es ", "mi nombre completo es ", "llamame ", "puedes llamarme ",
+        "my name is ", "my full name is ", "call me ", "name's ", "they call me ",
+    ]
+
+    /// Copular self-descriptions: the user says what they *are*. "soy diabético" is a true
+    /// first-person assertion and is still not a name, so it is recognised in order to be
+    /// rejected with that reason rather than written as one. Traits and autobiography have their
+    /// own subjects and predicates elsewhere; inventing one here is not this validator's job.
+    private static let copularPrefixes: [String] = [
+        "yo soy ", "soy ", "i am ", "i'm ", "im ", "me llaman ",
     ]
 
     /// Verbs that attribute a statement to somebody other than the speaker.
     private static let attributionMarkers: [String] = [
         "dice ", "dicen ", "dijo ", "dijeron ", "decia ", "cree ", "creen ", "piensa ", "piensan ",
         "says ", "say ", "said ", "told ", "claims ", "claimed ", "thinks ", "think ",
-        "according to ", "segun ", "me dicen ", "me llaman ", "they call ",
+        "according to ", "segun ", "me dicen ",
     ]
 
     private static let negationMarkers: [String] = [
@@ -159,7 +173,10 @@ public enum SelfAssertionValidator {
                 escalate(.hypothetical); continue
             }
             if negationMarkers.contains(where: { prefix.contains($0) }) { escalate(.negated); continue }
-            if assertionPrefixes.contains(where: { prefix.hasSuffix($0) }) { return .success(()) }
+            if namingPrefixes.contains(where: { prefix.hasSuffix($0) }) { return .success(()) }
+            if copularPrefixes.contains(where: { prefix.hasSuffix($0) }) {
+                escalate(.notANameAssertion); continue
+            }
             escalate(.notFirstPersonAssertion)
         }
         return .failure(best)
@@ -170,12 +187,13 @@ public enum SelfAssertionValidator {
         switch rejection {
         case .noUserSource: return 0
         case .notFirstPersonAssertion: return 1
-        case .quoted: return 2
-        case .hypothetical: return 3
-        case .negated: return 4
-        case .thirdPartyAttributed: return 5
-        case .sarcasmMarked: return 6
-        case .emptyStatement, .reservedSubject, .scopeNotPermitted: return 7
+        case .notANameAssertion: return 2
+        case .quoted: return 3
+        case .hypothetical: return 4
+        case .negated: return 5
+        case .thirdPartyAttributed: return 6
+        case .sarcasmMarked: return 7
+        case .emptyStatement, .reservedSubject, .scopeNotPermitted: return 8
         }
     }
 

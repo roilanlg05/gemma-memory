@@ -476,6 +476,7 @@ extension ConsolidationIntegrityTests {
         let completion = try store.consolidationReceipt(jobID: report.jobID,
                                                         operationID: report.jobID + ":complete")
         XCTAssertEqual(completion?.outcome, .committed, "the job carries a completion receipt")
+        XCTAssertEqual(completion?.unresolved, 0, "nothing was held back, and the receipt says so")
     }
 
     func test_failedCycleKeepsItsTurnsAndRetiresTheJob() async throws {
@@ -640,5 +641,146 @@ extension ConsolidationIntegrityTests {
             .consolidate(segment: segment)
         XCTAssertEqual(ranAndFoundNothing.outcome, .empty)
         XCTAssertNil(ranAndFoundNothing.failure, "nothing to extract is a success")
+    }
+}
+
+// MARK: - Resume must not forget that a unit failed
+
+extension ConsolidationIntegrityTests {
+
+    /// A cycle is cancelled after an input unit failed, then resumed from the phase it had reached.
+    ///
+    /// The failed unit's turns must still be held back at the end of the resumed cycle. In-memory
+    /// bookkeeping cannot deliver that: the resumed pass does not run the input phases at all, so
+    /// the persisted receipts have to be what decides.
+    func test_resumedCycleStillHoldsBackAPreviouslyFailedUnit() async throws {
+        let store = try makeStore()
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        let rowA = try ts.append(threadId: "A", turnIndex: 0, role: "user",
+                                 text: "trabajo en Habana", now: 1_000)
+        let rowB = try ts.append(threadId: "B", turnIndex: 0, role: "user",
+                                 text: "me gusta el sushi", now: 1_100)
+        try await store.dbQueue.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER injected_node_failure BEFORE INSERT ON node
+                WHEN NEW.label = 'Habana'
+                BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;
+                """)
+        }
+        let entities: [String: String] = [
+            "Habana": #"{"entities":[{"entity":"Habana","kind":"place","detail":"trabaja ahí"}]}"#,
+            "sushi": #"{"entities":[{"entity":"sushi","kind":"preference","detail":"le gusta"}]}"#,
+        ]
+
+        // First pass: the user starts typing as soon as extraction reports its failure.
+        let cancel = AtomicFlag(false)
+        let first = MemoryConsolidationEngine(store: store, embedder: nil,
+                                              runtime: SchemaAwareRuntime(entitiesByPrompt: entities),
+                                              transcriptStore: ts, now: { 2_000 })
+        first.onProgress = { message in if message.contains("nrem failed") { cancel.set(true) } }
+        let firstReport = await first.runCycleReporting(isCancelled: { cancel.get() })
+        XCTAssertTrue(firstReport.cancelled, "the pass was interrupted, not completed")
+        XCTAssertNotNil(try store.loadSleepCycle(), "the interrupted cycle is left for resume")
+        XCTAssertEqual(try ts.unconsolidated(limit: 10).count, 2, "nothing was marked in the interrupted pass")
+
+        // Second pass resumes wherever the first one stopped — which is past the input phases.
+        let resumed = MemoryConsolidationEngine(store: store, embedder: nil,
+                                                runtime: SchemaAwareRuntime(entitiesByPrompt: entities),
+                                                transcriptStore: ts, now: { 3_000 })
+        let secondReport = await resumed.runCycleReporting(isCancelled: { false })
+
+        XCTAssertEqual(try ts.unconsolidated(limit: 10).map { $0.id }, [rowA],
+                       "the turn whose extraction failed is STILL un-consolidated after the resume")
+        XCTAssertFalse(secondReport.inputsConsolidated)
+        XCTAssertEqual(secondReport.unresolvedInputs, 1, "the resumed cycle reports the turn it kept")
+        XCTAssertNil(try store.allNodes().first { $0.label == "Habana" },
+                     "its content was never extracted, so it must not count as absorbed")
+        XCTAssertNotEqual(rowA, rowB)
+    }
+
+    // MARK: the completion receipt tells the truth about what was left behind
+
+    func test_completionReceiptReportsTheTurnsItCouldNotAbsorb() async throws {
+        let store = try makeStore()
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        let rowA = try ts.append(threadId: "A", turnIndex: 0, role: "user",
+                                 text: "trabajo en Habana", now: 1_000)
+        try ts.append(threadId: "B", turnIndex: 0, role: "user", text: "me gusta el sushi", now: 1_100)
+        try await store.dbQueue.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER injected_node_failure BEFORE INSERT ON node
+                WHEN NEW.label = 'Habana'
+                BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;
+                """)
+        }
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil,
+                                               runtime: SchemaAwareRuntime(entitiesByPrompt: [
+            "Habana": #"{"entities":[{"entity":"Habana","kind":"place","detail":"trabaja ahí"}]}"#,
+            "sushi": #"{"entities":[{"entity":"sushi","kind":"preference","detail":"le gusta"}]}"#,
+        ]), transcriptStore: ts, now: { 2_000 })
+        let report = await engine.runCycleReporting(isCancelled: { false })
+
+        let completion = try XCTUnwrap(try store.consolidationReceipt(
+            jobID: report.jobID, operationID: report.jobID + ":complete"))
+        XCTAssertEqual(completion.outcome, .failed,
+                       "a cycle that left a turn behind did not complete its work, and must not claim it did")
+        XCTAssertEqual(completion.unresolved, 1, "the receipt records how many turns were kept")
+        XCTAssertTrue(completion.retryable, "those turns are still available to a later cycle")
+        XCTAssertGreaterThan(completion.committed, 0, "the work that did land is still counted")
+        XCTAssertEqual(try ts.unconsolidated(limit: 10).map { $0.id }, [rowA])
+    }
+
+    // MARK: an item's receipt and its content are one write
+
+    func test_itemReceiptAndItsContentCommitTogether() async throws {
+        let store = try makeStore()
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        try ts.append(threadId: "A", turnIndex: 0, role: "user", text: "me gusta el sushi", now: 1_000)
+        // The content write succeeds; its checkpoint is what the database rejects. If the two were
+        // separate transactions the node would survive the rejected receipt — and the replay would
+        // then reinforce a memory it had already stored. They are one write, so neither lands.
+        try await store.dbQueue.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER injected_receipt_failure BEFORE INSERT ON consolidation_receipt
+                WHEN NEW.operation LIKE '%:nrem:item:%'
+                BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END;
+                """)
+        }
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil,
+                                               runtime: SchemaAwareRuntime(entitiesByPrompt: [
+            "sushi": #"{"entities":[{"entity":"sushi","kind":"preference","detail":"le gusta"}]}"#,
+        ]), transcriptStore: ts, now: { 2_000 })
+        let report = await engine.runCycleReporting(isCancelled: { false })
+
+        XCTAssertNil(try store.allNodes().first { $0.label == "sushi" },
+                     "the content rolled back with its own checkpoint")
+        XCTAssertFalse(report.inputsConsolidated, "and the turn it came from is kept")
+        XCTAssertEqual(try ts.unconsolidated(limit: 10).count, 1)
+
+        // With the fault cleared, the same material commits — content and checkpoint together.
+        try await store.dbQueue.write { db in try db.execute(sql: "DROP TRIGGER injected_receipt_failure") }
+        let retry = MemoryConsolidationEngine(store: store, embedder: nil,
+                                              runtime: SchemaAwareRuntime(entitiesByPrompt: [
+            "sushi": #"{"entities":[{"entity":"sushi","kind":"preference","detail":"le gusta"}]}"#,
+        ]), transcriptStore: ts, now: { 3_000 })
+        let second = await retry.runCycleReporting(isCancelled: { false })
+        XCTAssertTrue(second.inputsConsolidated)
+        XCTAssertNotNil(try store.allNodes().first { $0.label == "sushi" })
+        let itemReceipts = try store.consolidationReceipts(jobID: second.jobID)
+            .filter { $0.operationID.contains(":nrem:item:") }
+        XCTAssertEqual(itemReceipts.count, 1, "the committed item carries exactly one checkpoint")
+        XCTAssertEqual(itemReceipts.first?.outcome, .committed)
+        XCTAssertNotEqual(report.jobID, "")
+    }
+
+    // MARK: a rejected write is distinguishable from a flaky one
+
+    func test_constraintFailureIsAPersistFailureThatIsNotRetryable() {
+        let flaky = ConsolidationFailure.persist("write")
+        let rejected = ConsolidationFailure.constraint("entity_subject_conflict")
+        XCTAssertEqual(rejected.stage, .persist)
+        XCTAssertFalse(rejected.retryable,
+                       "two different subjects are not one memory, and running it again cannot change that")
+        XCTAssertTrue(flaky.retryable, "an incidental write failure is worth another attempt")
     }
 }

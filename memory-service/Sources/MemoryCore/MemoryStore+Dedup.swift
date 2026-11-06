@@ -160,14 +160,15 @@ extension MemoryStore {
     /// Upsert with dedup: if a duplicate exists, reinforce it (bump salience, mentionCount++,
     /// preserve deliberate identity); else insert the candidate. Returns the resulting node id.
     @discardableResult
-    public func upsertMerging(_ candidate: Node) throws -> String {
+    public func upsertMerging(_ candidate: Node,
+                              checkpoint: ConsolidationCheckpoint? = nil) throws -> String {
         if let existing = try sameIDTarget(for: candidate)
             ?? findDuplicate(kind: candidate.kind, label: candidate.label, candidate: candidate) {
             let merged = mergeReinforced(existing: existing, candidate: candidate)
-            try upsert(merged)
+            try upsert(merged, checkpoint: checkpoint)
             return merged.id
         } else {
-            try upsert(candidate)
+            try upsert(candidate, checkpoint: checkpoint)
             return candidate.id
         }
     }
@@ -195,7 +196,8 @@ extension MemoryStore {
     /// node within `threshold`, else the canonical-label match, else insert. Reinforces via EMA.
     @discardableResult
     public func upsertMergingSemantic(_ candidate: Node, embedding: [Float]?, embedder: Embedder?,
-                                      threshold: Double = 0.2) throws -> String {
+                                      threshold: Double = 0.2,
+                                      checkpoint: ConsolidationCheckpoint? = nil) throws -> String {
         // Fix 2: accept either a precomputed embedding OR an embedder — if no embedding was
         // passed but we have an embedder, compute one from the candidate label.
         var embedding = embedding
@@ -207,14 +209,14 @@ extension MemoryStore {
 
         if let existing {
             let merged = mergeReinforced(existing: existing, candidate: candidate)
-            try upsert(merged)
+            try upsert(merged, checkpoint: checkpoint)
             // Fix 3: don't leave a merged node embedding-less. Re-setting a vector for the same
             // cluster is harmless, so always store the embedding on merge when we have one —
             // this lets future semantic dedup find a node first seen via string-only match.
             if let embedding { try setEmbedding(nodeId: merged.id, embedding) }
             return merged.id
         } else {
-            try upsert(candidate)
+            try upsert(candidate, checkpoint: checkpoint)
             if let embedding { try setEmbedding(nodeId: candidate.id, embedding) }
             return candidate.id
         }

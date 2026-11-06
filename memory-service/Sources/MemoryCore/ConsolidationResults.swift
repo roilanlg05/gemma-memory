@@ -36,6 +36,12 @@ public struct ConsolidationFailure: Error, Equatable, Sendable {
     public static func persist(_ code: String) -> ConsolidationFailure {
         .init(stage: .persist, retryable: true, code: code)
     }
+    /// A write the store rejected on principle rather than by accident — a merge whose subject
+    /// does not match, a constraint the content violates. Running it again changes nothing, so it
+    /// is not retryable, and that distinction is what makes a receipt's `retryable` worth reading.
+    public static func constraint(_ code: String) -> ConsolidationFailure {
+        .init(stage: .persist, retryable: false, code: code)
+    }
 }
 
 /// A write the store lawfully refused. Kept separate from a failure: the refusal *is* the correct
@@ -186,12 +192,31 @@ public struct ConsolidationReceipt: Equatable, Sendable {
     public let outcome: ConsolidationPhaseResult.Outcome
     public let committed: Int
     public let refused: Int
+    /// Input turns this receipt left un-absorbed. Non-zero on a unit that failed and on the
+    /// completion receipt of a cycle that kept turns back.
+    public let unresolved: Int
     public let stage: ConsolidationStage?
     public let retryable: Bool
     public let attempts: Int
     public let at: Double
 
     public var succeeded: Bool { outcome != .failed }
+}
+
+/// A checkpoint to persist in the SAME transaction as the content it accounts for.
+///
+/// An item's write and its receipt in two transactions leaves a window where the write survives
+/// and the checkpoint does not; the replay then reinforces what it already stored. Passing this
+/// down to the store closes that window: either both land or neither does.
+public struct ConsolidationCheckpoint: Sendable {
+    public let jobID: String
+    public let operationID: String
+    public let phase: SleepPhase
+    public let at: Double
+
+    public init(jobID: String, operationID: String, phase: SleepPhase, at: Double) {
+        self.jobID = jobID; self.operationID = operationID; self.phase = phase; self.at = at
+    }
 }
 
 /// One contiguous slice of one thread, sized for a single generation. Carries its own rows so the

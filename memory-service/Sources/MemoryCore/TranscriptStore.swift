@@ -125,24 +125,27 @@ public final class TranscriptStore: @unchecked Sendable {
     /// be possible to observe "turns consolidated" without "cycle finished", or the other way
     /// round. If the process dies before this write, nothing moved and the next cycle re-reads the
     /// same turns; if it dies after, there is nothing left to redo.
+    ///
+    /// `unresolved` is how many of the job's turns could NOT be absorbed. A completion that left
+    /// turns behind is recorded as a failed outcome, not a committed one: the job is retired either
+    /// way — a parked job would starve every later cycle — but the receipt has to say that the
+    /// cycle did not finish its work, or the record would assert a completeness that never
+    /// happened. `committed` still carries what did land, and the outcome is retryable because
+    /// those turns stay available for the next cycle.
     public func completeConsolidation(ids: [String], jobID: String, operationID: String,
-                                      phase: SleepPhase, committed: Int, at: Double) throws {
+                                      phase: SleepPhase, committed: Int, unresolved: Int = 0,
+                                      at: Double) throws {
         try dbQueue.write { db in
             if !ids.isEmpty { try Self.mark(db, ids: ids) }
             try db.execute(sql: "DELETE FROM sleep_cycle WHERE id=1")
             try db.execute(sql: "UPDATE consolidation_job SET completedAt = ? WHERE id = ?",
                            arguments: [at, jobID])
-            let attempts = try Int.fetchOne(db,
-                sql: "SELECT attempts FROM consolidation_receipt WHERE job_id = ? AND operation = ?",
-                arguments: [jobID, operationID]) ?? 0
-            try db.execute(sql: """
-                INSERT INTO consolidation_receipt
-                    (job_id, operation, phase, outcome, committed, refused, stage, retryable, attempts, at)
-                VALUES (?, ?, ?, 'committed', ?, 0, NULL, 0, ?, ?)
-                ON CONFLICT(job_id, operation) DO UPDATE SET
-                    outcome = 'committed', committed = excluded.committed,
-                    attempts = excluded.attempts, at = excluded.at
-                """, arguments: [jobID, operationID, phase.rawValue, committed, attempts + 1, at])
+            // One writer for every receipt, so the completion record cannot drift from the schema
+            // the rest of the cycle's receipts are written against.
+            try MemoryStore.writeReceipt(db, jobID: jobID, operationID: operationID, phase: phase,
+                                         outcome: unresolved == 0 ? .committed : .failed,
+                                         committed: committed, refused: 0, unresolved: unresolved,
+                                         stage: nil, retryable: unresolved > 0, at: at)
         }
     }
 

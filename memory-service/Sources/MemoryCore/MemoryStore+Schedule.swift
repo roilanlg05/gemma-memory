@@ -46,7 +46,8 @@ extension MemoryStore {
     /// Returns (id, conflicts) on create; (nil, conflicts) when blocked by a conflict and !force.
     @discardableResult
     public func createEventChecked(title: String, start: Double, end: Double, allDay: Bool,
-                                   location: String?, origin: Origin, force: Bool)
+                                   location: String?, origin: Origin, force: Bool,
+                                   checkpoint: ConsolidationCheckpoint? = nil)
         throws -> (id: String?, conflicts: [Node]) {
         let key = MemoryText.eventCanonicalKey(title: title, startAt: start)
         let existing = try allNodes().first { node in
@@ -56,14 +57,16 @@ extension MemoryStore {
         let conflicts = try scheduleConflicts(start: start, end: end, excluding: excludingIds)
         if !conflicts.isEmpty && !force { return (nil, conflicts) }
         let id = try upsertEvent(title: title, start: start, end: end,
-                                 allDay: allDay, location: location, origin: origin)
+                                 allDay: allDay, location: location, origin: origin,
+                                 checkpoint: checkpoint)
         return (id, conflicts)
     }
 
     /// Create or update an event, deduping by canonicalKey. Returns the node id.
     @discardableResult
     public func upsertEvent(title: String, start: Double, end: Double, allDay: Bool,
-                            location: String?, origin: Origin) throws -> String {
+                            location: String?, origin: Origin,
+                            checkpoint: ConsolidationCheckpoint? = nil) throws -> String {
         let key = MemoryText.eventCanonicalKey(title: title, startAt: start)
         let existing = try allNodes().first { node in
             node.kind == NodeKind.event.rawValue && NodeAttributes.from(node.extra).canonicalKey == key
@@ -79,7 +82,7 @@ extension MemoryStore {
             }
             node.label = title; node.body = title; node.updatedAt = now; node.lastSeenAt = now
             node.extra = attrs.toJSON(); node.dirty = true
-            try upsert(node)
+            try upsert(node, checkpoint: checkpoint)
             return existing.id
         } else {
             let id = UUID().uuidString
@@ -87,7 +90,7 @@ extension MemoryStore {
                             createdAt: now, updatedAt: now, lastSeenAt: now, salience: 3, decayRate: 0,
                             confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
                             origin: origin, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
-            try upsert(node)
+            try upsert(node, checkpoint: checkpoint)
             return id
         }
     }

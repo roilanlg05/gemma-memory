@@ -250,11 +250,25 @@ public final class MemoryStore: @unchecked Sendable {
                 );
                 """)
         }
+        m.registerMigration("v15-consolidation-unresolved") { db in
+            // How many input turns a receipt left un-absorbed. Without it a receipts-only reader
+            // sees "job committed" for a cycle that kept turns back, which is the same
+            // in-memory-only blind spot that let a resumed cycle mark failed units consolidated.
+            try db.execute(sql: """
+                ALTER TABLE consolidation_receipt ADD COLUMN unresolved INTEGER NOT NULL DEFAULT 0
+                """)
+        }
         return m
     }
 
     // MARK: CRUD
-    public func upsert(_ node: Node) throws {
+
+    /// Write a node, optionally together with the consolidation checkpoint that accounts for it.
+    ///
+    /// `checkpoint` is persisted inside this same transaction, so a crash cannot leave the content
+    /// stored without the receipt that says so — which is what makes a replay a no-op instead of a
+    /// second reinforcement.
+    public func upsert(_ node: Node, checkpoint: ConsolidationCheckpoint? = nil) throws {
         try dbQueue.write { db in
             let managed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_projection WHERE node_id=? UNION ALL SELECT 1 FROM brain_legacy_binding WHERE node_id=?)", arguments: [node.id, node.id]) ?? false
             guard !managed else { throw BrainStoreError.denied }
@@ -272,6 +286,12 @@ public final class MemoryStore: @unchecked Sendable {
             } else {
                 try db.execute(sql: "INSERT INTO node_fts(node_id, label, body) VALUES (?, ?, ?)",
                                arguments: [node.id, node.label, node.body])
+            }
+            if let checkpoint {
+                try Self.writeReceipt(db, jobID: checkpoint.jobID, operationID: checkpoint.operationID,
+                                      phase: checkpoint.phase, outcome: .committed, committed: 1,
+                                      refused: 0, unresolved: 0, stage: nil, retryable: false,
+                                      at: checkpoint.at)
             }
         }
         // Auto-link to kind hub so the graph stays navigable from a single anchor per kind.
