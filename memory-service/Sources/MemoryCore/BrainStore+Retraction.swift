@@ -33,6 +33,7 @@ struct BrainRetractionClosure {
     var subjectIDs = Set<String>()
     var nodeIDs = Set<String>()
     var transcriptIDs = Set<String>()
+    var turnIDs = Set<String>()
     var withdrawnTexts = Set<String>()
 }
 
@@ -285,7 +286,7 @@ extension BrainStore {
         // a source kept alive only by purged claims is orphaned. Each round can feed the next.
         var changed = true
         while changed {
-            changed = false
+            changed = try expandTurnClosure(&closure, db: db)
             for (id, item) in evidence where !closure.evidenceIDs.contains(id) {
                 if !closure.evidenceIDs.isDisjoint(with: item.parentEvidenceIDs ?? []) {
                     closure.evidenceIDs.insert(id); changed = true
@@ -351,7 +352,7 @@ extension BrainStore {
             transcriptThreads[row.id] = row.threadId
             let withdrawnThread = closure.purgeEverything || closure.threadIDs.contains(row.threadId)
             let carriesSource = contains(Self.normalizedContent(row.text), sourceTexts)
-            guard withdrawnThread || carriesSource else { continue }
+            guard withdrawnThread || carriesSource || closure.transcriptIDs.contains(row.id) else { continue }
             closure.transcriptIDs.insert(row.id)
             purgedSeqs[row.threadId, default: []].insert(row.seq)
         }
@@ -491,6 +492,9 @@ extension BrainStore {
     // MARK: Purge
 
     private func purge(_ closure: BrainRetractionClosure, db: Database, revision: Int64) throws {
+        var closure = closure
+        _ = try expandTurnClosure(&closure, db: db)
+        try purgeTurnJournals(closure, db: db)
         // Markers are fingerprinted from the rows as they stand, before anything is deleted.
         var markers = Set<BrainExclusionMarker>()
         for id in closure.nodeIDs {

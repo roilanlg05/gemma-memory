@@ -13,6 +13,11 @@ extension BrainStore {
         }
     }
     public func commit(_ request: BrainCommitRequest) throws -> BrainCommitResult {
+        try commit(request, transactionGuard: { _ in }, didCommit: { _, _ in })
+    }
+    /// Internal turn lifecycle checks run under the same lock/rollback boundary as claim writes.
+    func commit(_ request: BrainCommitRequest, transactionGuard: (Database) throws -> Void,
+                didCommit: (Database, BrainCommitResult) throws -> Void) throws -> BrainCommitResult {
         try requirePrincipal()
         guard authorization.mayCommitClaims else { throw BrainStoreError.denied }
         guard let expected = request.expectedRevision, expected >= 0, request.tastes?.isEmpty != false else { throw BrainStoreError.invalid }
@@ -20,6 +25,7 @@ extension BrainStore {
         do {
             return try store.dbQueue.write { db in
             try checkOwner(db, bind: false)
+            try transactionGuard(db)
             let current = try Self.revision(db)
             if let row = try Row.fetchOne(db, sql: "SELECT payload, result FROM brain_commit WHERE principal=? AND operation=?", arguments: [authorization.principal, request.clientOperationID]) {
                 guard (row["payload"] as String) == payload else {
@@ -95,6 +101,7 @@ extension BrainStore {
             try db.execute(sql: "UPDATE brain_meta SET revision=? WHERE id=1", arguments: [next])
             let result = BrainCommitResult(clientOperationID: request.clientOperationID, state: .committed, revision: next, claimIDs: ids, disposition: .committed)
             try db.execute(sql: "INSERT INTO brain_commit VALUES (?, ?, ?, ?)", arguments: [authorization.principal, request.clientOperationID, payload, try Self.encode(result)])
+            try didCommit(db, result)
             return result
             }
         } catch BrainStoreError.conflict {

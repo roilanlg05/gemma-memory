@@ -32,10 +32,13 @@ public final class TranscriptStore: @unchecked Sendable {
                        now: Double = Date().timeIntervalSince1970) throws -> String {
         let id = UUID().uuidString
         try dbQueue.write { db in
-            let maxSeq = try Int.fetchOne(db,
-                sql: "SELECT COALESCE(MAX(seq), 0) FROM transcript WHERE threadId = ?",
-                arguments: [threadId]) ?? 0
-            let row = TranscriptRow(id: id, threadId: threadId, turnIndex: turnIndex, seq: maxSeq + 1,
+            try db.execute(sql: """
+                INSERT INTO transcript_sequence(threadId, lastSeq) VALUES (?, 1)
+                ON CONFLICT(threadId) DO UPDATE SET lastSeq = lastSeq + 1
+                """, arguments: [threadId])
+            guard let seq = try Int.fetchOne(db, sql: "SELECT lastSeq FROM transcript_sequence WHERE threadId = ?",
+                                             arguments: [threadId]) else { throw BrainStoreError.invalid }
+            let row = TranscriptRow(id: id, threadId: threadId, turnIndex: turnIndex, seq: seq,
                                     role: role, text: text, createdAt: now, consolidated: false)
             try row.insert(db)
         }

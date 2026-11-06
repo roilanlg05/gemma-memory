@@ -258,6 +258,46 @@ public final class MemoryStore: @unchecked Sendable {
                 ALTER TABLE consolidation_receipt ADD COLUMN unresolved INTEGER NOT NULL DEFAULT 0
                 """)
         }
+        m.registerMigration("v16-transcript-sequence-counter") { db in
+            try db.execute(sql: """
+                CREATE TABLE transcript_sequence (threadId TEXT PRIMARY KEY NOT NULL, lastSeq INTEGER NOT NULL);
+                INSERT INTO transcript_sequence(threadId, lastSeq)
+                    SELECT threadId, MAX(seq) FROM transcript GROUP BY threadId;
+                """)
+        }
+        m.registerMigration("v17-brain-turn-journal") { db in
+            try db.execute(sql: """
+                CREATE TABLE brain_turn (
+                    id TEXT PRIMARY KEY NOT NULL, principal TEXT NOT NULL,
+                    thread_id TEXT NOT NULL, subject TEXT NOT NULL,
+                    source_id TEXT NOT NULL, transcript_id TEXT NOT NULL,
+                    state TEXT NOT NULL, updates TEXT, has_pending BOOLEAN NOT NULL,
+                    receipt TEXT, assistant_id TEXT
+                );
+                CREATE TABLE brain_turn_operation (
+                    principal TEXT NOT NULL, namespace TEXT NOT NULL,
+                    operation_hash TEXT NOT NULL, request_hash TEXT,
+                    turn_id TEXT, result_id TEXT, withdrawn BOOLEAN NOT NULL,
+                    PRIMARY KEY(principal, namespace, operation_hash)
+                );
+                CREATE TABLE brain_turn_ref (
+                    turn_id TEXT NOT NULL, evidence_id TEXT NOT NULL, transcript_id TEXT NOT NULL,
+                    PRIMARY KEY(turn_id, evidence_id)
+                );
+                CREATE TABLE brain_turn_claim (
+                    turn_id TEXT NOT NULL, claim_id TEXT NOT NULL, PRIMARY KEY(turn_id, claim_id)
+                );
+                CREATE TABLE brain_turn_outcome (
+                    principal TEXT NOT NULL, operation_hash TEXT NOT NULL,
+                    payload TEXT NOT NULL, redacted BOOLEAN NOT NULL,
+                    PRIMARY KEY(principal, operation_hash)
+                );
+                CREATE TABLE brain_turn_outcome_ref (
+                    principal TEXT NOT NULL, operation_hash TEXT NOT NULL, evidence_id TEXT NOT NULL,
+                    PRIMARY KEY(principal, operation_hash, evidence_id)
+                );
+                """)
+        }
         return m
     }
 
