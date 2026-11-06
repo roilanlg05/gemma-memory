@@ -218,6 +218,38 @@ public final class MemoryStore: @unchecked Sendable {
                 CREATE TABLE brain_exclusion (kind TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, revision INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind, id, fingerprint));
                 """)
         }
+        m.registerMigration("v14-consolidation-receipts") { db in
+            // A consolidation job owns a set of transcript turns, the evidence they were adapted
+            // into, and the timezone its relative dates resolve in. A receipt records what one
+            // phase of that job actually did. Both are keyed on ids the engine can recompute
+            // deterministically, so a process that resumes after a crash finds its own work
+            // instead of redoing it. Neither table holds conversation text: `code`/`stage` come
+            // from a fixed vocabulary the engine writes itself.
+            try db.execute(sql: """
+                CREATE TABLE consolidation_job (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    phase TEXT NOT NULL,
+                    transcriptIds TEXT NOT NULL,
+                    evidenceIds TEXT NOT NULL,
+                    timeZoneId TEXT NOT NULL,
+                    startedAt REAL NOT NULL,
+                    completedAt REAL
+                );
+                CREATE TABLE consolidation_receipt (
+                    job_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    committed INTEGER NOT NULL DEFAULT 0,
+                    refused INTEGER NOT NULL DEFAULT 0,
+                    stage TEXT,
+                    retryable INTEGER NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    at REAL NOT NULL,
+                    PRIMARY KEY(job_id, operation)
+                );
+                """)
+        }
         return m
     }
 

@@ -115,12 +115,42 @@ public final class TranscriptStore: @unchecked Sendable {
 
     public func markConsolidated(ids: [String]) throws {
         guard !ids.isEmpty else { return }
+        try dbQueue.write { db in try Self.mark(db, ids: ids) }
+    }
+
+    /// Close a consolidation job: mark its turns consolidated, retire its resume state and stamp
+    /// its completion receipt — all in ONE transaction.
+    ///
+    /// This is the point where consolidation claims the content is safely absorbed, so it must not
+    /// be possible to observe "turns consolidated" without "cycle finished", or the other way
+    /// round. If the process dies before this write, nothing moved and the next cycle re-reads the
+    /// same turns; if it dies after, there is nothing left to redo.
+    public func completeConsolidation(ids: [String], jobID: String, operationID: String,
+                                      phase: SleepPhase, committed: Int, at: Double) throws {
         try dbQueue.write { db in
-            try TranscriptRow.filter(ids.contains(Column("id")))
-                .updateAll(db, Column("consolidated").set(to: true))
-            let ph = ids.map { _ in "?" }.joined(separator: ",")
-            try db.execute(sql: "DELETE FROM transcript_embedding WHERE turn_id IN (\(ph))",
-                           arguments: StatementArguments(ids))
+            if !ids.isEmpty { try Self.mark(db, ids: ids) }
+            try db.execute(sql: "DELETE FROM sleep_cycle WHERE id=1")
+            try db.execute(sql: "UPDATE consolidation_job SET completedAt = ? WHERE id = ?",
+                           arguments: [at, jobID])
+            let attempts = try Int.fetchOne(db,
+                sql: "SELECT attempts FROM consolidation_receipt WHERE job_id = ? AND operation = ?",
+                arguments: [jobID, operationID]) ?? 0
+            try db.execute(sql: """
+                INSERT INTO consolidation_receipt
+                    (job_id, operation, phase, outcome, committed, refused, stage, retryable, attempts, at)
+                VALUES (?, ?, ?, 'committed', ?, 0, NULL, 0, ?, ?)
+                ON CONFLICT(job_id, operation) DO UPDATE SET
+                    outcome = 'committed', committed = excluded.committed,
+                    attempts = excluded.attempts, at = excluded.at
+                """, arguments: [jobID, operationID, phase.rawValue, committed, attempts + 1, at])
         }
+    }
+
+    private static func mark(_ db: Database, ids: [String]) throws {
+        try TranscriptRow.filter(ids.contains(Column("id")))
+            .updateAll(db, Column("consolidated").set(to: true))
+        let ph = ids.map { _ in "?" }.joined(separator: ",")
+        try db.execute(sql: "DELETE FROM transcript_embedding WHERE turn_id IN (\(ph))",
+                       arguments: StatementArguments(ids))
     }
 }

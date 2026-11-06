@@ -247,11 +247,12 @@ final class MemoryConsolidationEngineTests: XCTestCase {
         let ts = TranscriptStore(dbQueue: store.dbQueue)
         try ts.append(threadId: "A", turnIndex: 0, role: "user", text: "quiero ir a Japón", now: 1)
         try ts.append(threadId: "B", turnIndex: 0, role: "user", text: "me gusta el ajedrez", now: 2)
+        // One generation per thread segment: nrem and detect each run once per conversation.
         let runtime = CannedRuntime([
-            #"{"entities":[]}"#,
+            #"{"entities":[]}"#, #"{"entities":[]}"#,
             #"{"topic":"viaje Japón","concepts":["Japón"],"summary":"viaje"}"#,
             #"{"topic":"ajedrez","concepts":["ajedrez"],"summary":"hobby"}"#,
-            #"{"followUps":[]}"#, #"{"edges":[]}"#, #"{"insights":[]}"#, #"{"questions":[]}"#, #"{"map":{}}"#
+            #"{"followUps":[]}"#, #"{"followUps":[]}"#, #"{"edges":[]}"#
         ])
         let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: runtime, transcriptStore: ts)
         await engine.runCycle(isCancelled: { false })
@@ -401,9 +402,16 @@ final class MemoryConsolidationEngineTests: XCTestCase {
 
     func test_consolidate_routes_self_kind_to_singleton() async throws {
         let store = try makeStore()
+        // Identity is written only against the turn that asserted it, so this goes through the
+        // row-bearing path rather than bare texts.
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        try ts.append(threadId: "T", turnIndex: 0, role: "user",
+                      text: "me llamo Roilan, mi esposa es María", now: 1)
         let json = #"{"entities":[{"entity":"Roilan","kind":"self","detail":"el usuario"},{"entity":"María","kind":"person","detail":"esposa"}]}"#
-        let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: CannedRuntime([json]))
-        await engine.consolidate(episodeTexts: ["User: me llamo Roilan, mi esposa es María"])
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: CannedRuntime([json]),
+                                               transcriptStore: ts)
+        let rows = try ts.unconsolidated(limit: 10)
+        _ = await engine.consolidate(segment: ConsolidationSegment(threadID: "T", rows: rows))
         XCTAssertEqual(try store.selfNode()?.label, "Roilan")
         XCTAssertEqual(try store.selfNode()?.kind, NodeKind.selfUser.rawValue)
         let people = try store.allNodes().filter { $0.kind == NodeKind.person.rawValue }

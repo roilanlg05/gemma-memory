@@ -18,9 +18,10 @@ public final class ConsolidationScheduler {
     public enum State: Equatable, Sendable { case idle, reflecting, sleeping(String), done(String) }
     public private(set) var state: State = .idle
     public var lastSummary: String = ""
-    /// True iff a consolidation cycle (light or full) is currently in flight. Surfaced via
-    /// `/v1/consolidation/state` so the macOS client can disable user input while busy.
-    public var isRunning: Bool { running != nil }
+    /// True iff a consolidation cycle (light or full) is currently in flight — including one that
+    /// has been asked to stop but has not finished yet. Surfaced via `/v1/consolidation/state` so
+    /// the macOS client can disable user input while busy.
+    public var isRunning: Bool { current != nil }
     /// Tracks the most recent `armTurnEnd(threadId:)` invocation for diagnostics.
     public private(set) var lastTurnEndThread: String?
     /// Most recent timezone reported by the app (turn-end/reflect). Used for date resolution in
@@ -33,12 +34,22 @@ public final class ConsolidationScheduler {
     private let isUserBusy: () -> Bool
     private let debounceInterval: Duration
     private var debounceTask: Task<Void, Never>?
-    private var running: Task<Void, Never>?
-    // Thread-safe storage instead of a @MainActor-isolated Bool: the engine's
-    // `isCancelled` closure is called from the cooperative thread pool (engine
-    // is not @MainActor), so `MainActor.assumeIsolated { cancelFlag }` would
-    // trap with a fatal error → SIGILL on Linux. See `AtomicFlag` below.
-    private let cancelFlag = AtomicFlag(false)
+
+    /// One consolidation run. Each run owns its OWN cancellation flag: a replacement run must not
+    /// inherit (or clear) the signal that stopped its predecessor.
+    ///
+    /// Thread-safe storage instead of a @MainActor-isolated Bool: the engine's `isCancelled`
+    /// closure is called from the cooperative thread pool (the engine is not @MainActor), so
+    /// `MainActor.assumeIsolated { … }` would trap with a fatal error → SIGILL on Linux.
+    /// See `AtomicFlag` below.
+    private struct Run {
+        let id: Int
+        let task: Task<Void, Never>
+        let cancel: AtomicFlag
+    }
+    /// The run that currently owns the engine — in flight, or cancelled and still winding down.
+    private var current: Run?
+    private var nextRunID = 0
 
     public init(runner: ConsolidationRunning, isReady: @escaping () -> Bool, hasPendingCycle: @escaping () -> Bool,
                 isUserBusy: @escaping () -> Bool = { false },
@@ -50,9 +61,13 @@ public final class ConsolidationScheduler {
 
     /// Called at the START of every user turn: cancel any running consolidation and any pending
     /// debounce. Does NOT arm the debounce — that happens at turn end via noteTurnEnded().
+    ///
+    /// The cancelled run is deliberately NOT forgotten: `launch` awaits it before starting a
+    /// replacement, so a cancellation followed immediately by new activity can never put two
+    /// engines on the same SQLite file.
     public func noteUserActivity() {
-        cancelFlag.set(true)
-        running?.cancel(); running = nil
+        current?.cancel.set(true)
+        current?.task.cancel()
         debounceTask?.cancel()
         state = .idle
     }
@@ -87,7 +102,7 @@ public final class ConsolidationScheduler {
     /// so callers can correlate the request with the response. Returns nil when the scheduler is
     /// not ready or already running.
     public func runReflectAdHoc(timeZone: TimeZone = .current) -> String? {
-        guard isReady(), running == nil, !isUserBusy() else { return nil }
+        guard isReady(), current == nil, !isUserBusy() else { return nil }
         lastTimeZone = timeZone
         let cycleId = "reflect-\(Int(Date().timeIntervalSince1970 * 1000))"
         launch(light: true)
@@ -95,22 +110,38 @@ public final class ConsolidationScheduler {
     }
 
     private func launch(light: Bool) {
-        guard isReady(), running == nil, !isUserBusy() else { return }
-        cancelFlag.set(false)
-        let isCancelled: @Sendable () -> Bool = { [cancelFlag] in
-            cancelFlag.get()
-        }
+        guard isReady(), !isUserBusy() else { return }
+        // A live run owns the engine; a cancelled one is only winding down and may be replaced.
+        if let current, !current.cancel.get() { return }
+        let predecessor = current
+        let flag = AtomicFlag(false)
+        let isCancelled: @Sendable () -> Bool = { flag.get() }
+        // The timezone is captured per run, so a job keeps the zone it was armed with even if the
+        // next turn arrives from a different one.
         let tz = lastTimeZone
+        nextRunID += 1
+        let id = nextRunID
         state = light ? .reflecting : .sleeping("nrem")
-        running = Task { [weak self, runner] in
+        let task = Task { [weak self, runner] in
+            // Serialize: never two engines on one database. The predecessor has already been
+            // asked to stop; we wait for it to actually be done.
+            await predecessor?.task.value
+            if flag.get() {
+                await MainActor.run { self?.finish(runID: id, light: light) }
+                return
+            }
             if light { await runner.runLight(isCancelled: isCancelled, timeZone: tz) }
             else { await runner.runCycle(isCancelled: isCancelled, timeZone: tz) }
-            await MainActor.run {
-                guard let self else { return }
-                self.running = nil
-                if self.state != .idle { self.state = .done(light ? "reflecting" : "sleeping") }
-            }
+            await MainActor.run { self?.finish(runID: id, light: light) }
         }
+        current = Run(id: id, task: task, cancel: flag)
+    }
+
+    /// Release the engine, unless a replacement run has already taken ownership.
+    private func finish(runID: Int, light: Bool) {
+        guard current?.id == runID else { return }
+        current = nil
+        if state != .idle { state = .done(light ? "reflecting" : "sleeping") }
     }
 }
 

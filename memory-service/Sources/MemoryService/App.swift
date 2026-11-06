@@ -139,8 +139,11 @@ public final class Services: @unchecked Sendable {
     }
 }
 
-/// Default model client used when callers don't provide one (test convenience). Replies with `{}`
-/// — empty JSON parses to "no entities/edges" in the consolidation engine, a no-op cycle.
+/// Default model client used when callers don't provide one (test convenience). Replies with `{}`,
+/// which no longer decodes into any phase's result schema: a cycle driven by it records a parse
+/// failure per phase and therefore leaves the transcript turns un-consolidated rather than
+/// discarding them. A server with no model configured stalls consolidation visibly instead of
+/// quietly throwing conversations away.
 public struct DefaultNoOpModelClient: ModelTextClient {
     public init() {}
     public func generate(prompt: String, options: ModelTextOptions) async throws -> String { "{}" }
