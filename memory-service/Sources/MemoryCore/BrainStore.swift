@@ -16,14 +16,17 @@ public struct BrainAuthorization: Sendable {
     public let owner: String
     public let allowDelegated: Bool
     public let mayCommitClaims: Bool
+    /// Erasure is its own capability. A read grant, a projection grant or `mayCommitClaims`
+    /// never escalates into forgetting, so this defaults to false (default-deny).
+    public let mayForget: Bool
     public let subjects: Set<String>
     public let scopes: Set<BrainAccessScope>
     public let threads: Set<String>
     public let sourceSpeakers: [BrainSourceKind: Set<String>]
     public let mayProject: Bool
     public let legacyBindings: [BrainLegacyBinding]
-    public init(principal: String, owner: String, subjects: Set<String>, scopes: Set<BrainAccessScope>, threads: Set<String>, sourceSpeakers: [BrainSourceKind: Set<String>], mayProject: Bool = false, legacyBindings: [BrainLegacyBinding] = [], allowDelegated: Bool = false, mayCommitClaims: Bool = false) {
-        self.principal = principal; self.owner = owner; self.allowDelegated = allowDelegated; self.mayCommitClaims = mayCommitClaims; self.subjects = subjects
+    public init(principal: String, owner: String, subjects: Set<String>, scopes: Set<BrainAccessScope>, threads: Set<String>, sourceSpeakers: [BrainSourceKind: Set<String>], mayProject: Bool = false, legacyBindings: [BrainLegacyBinding] = [], allowDelegated: Bool = false, mayCommitClaims: Bool = false, mayForget: Bool = false) {
+        self.principal = principal; self.owner = owner; self.allowDelegated = allowDelegated; self.mayCommitClaims = mayCommitClaims; self.mayForget = mayForget; self.subjects = subjects
         self.scopes = scopes; self.threads = threads; self.sourceSpeakers = sourceSpeakers
         self.mayProject = mayProject; self.legacyBindings = legacyBindings
     }

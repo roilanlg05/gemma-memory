@@ -33,6 +33,8 @@ extension BrainStore {
     }
     func validateEvidence(_ evidence: BrainEvidence, db: Database) throws {
         try requirePrincipal()
+        // Retraction is final for that identifier: re-recording it is reingestion, not a new source.
+        guard !(try BrainStore.isExcluded(db, kind: .evidence, id: evidence.id)) else { throw BrainStoreError.denied }
         guard authorization.scopes.contains(evidence.accessScope), authorization.threads.contains(evidence.threadID),
               authorization.sourceSpeakers[evidence.sourceKind]?.contains(evidence.speakerID) == true else { throw BrainStoreError.denied }
         guard !evidence.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,

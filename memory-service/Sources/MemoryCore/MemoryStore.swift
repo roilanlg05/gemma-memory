@@ -196,6 +196,15 @@ public final class MemoryStore: @unchecked Sendable {
                 CREATE TABLE brain_legacy_binding (node_id TEXT PRIMARY KEY NOT NULL, claim_id TEXT NOT NULL, subject TEXT NOT NULL, predicate TEXT NOT NULL, owner TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0);
                 """)
         }
+        m.registerMigration("v12-brain-retraction") { db in
+            // `brain_exclusion` holds identifiers only — never withdrawn content — so a restored
+            // backup can be scrubbed by id without the store retaining what it erased.
+            // `brain_forget_operations` is the idempotency journal, same shape as brain_commit.
+            try db.execute(sql: """
+                CREATE TABLE brain_exclusion (kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind, id));
+                CREATE TABLE brain_forget_operations (principal TEXT NOT NULL, operation TEXT NOT NULL, scope TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(principal, operation));
+                """)
+        }
         return m
     }
 
@@ -204,6 +213,8 @@ public final class MemoryStore: @unchecked Sendable {
         try dbQueue.write { db in
             let managed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_projection WHERE node_id=? UNION ALL SELECT 1 FROM brain_legacy_binding WHERE node_id=?)", arguments: [node.id, node.id]) ?? false
             guard !managed else { throw BrainStoreError.denied }
+            // A retracted node stays retracted: a stale client or backup cannot write it back.
+            guard !(try BrainStore.isExcluded(db, kind: .node, id: node.id)) else { throw BrainStoreError.denied }
             try node.save(db)
             try db.execute(sql: "DELETE FROM node_fts WHERE node_id = ?", arguments: [node.id])
             if node.deleted {

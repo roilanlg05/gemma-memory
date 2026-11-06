@@ -46,6 +46,8 @@ extension BrainStore {
                       !claim.id.isEmpty, claim.validFrom.isFinite, claim.recordedAt.isFinite,
                       claim.validTo.map({ $0.isFinite && $0 > claim.validFrom }) ?? true,
                       claim.status == .active, !ids.contains(claim.id) else { throw BrainStoreError.invalid }
+                // A retracted claim identifier is never reusable: recommitting it is reingestion.
+                guard !(try BrainStore.isExcluded(db, kind: .claim, id: claim.id)) else { throw BrainStoreError.denied }
                 let sources = try availableEvidence(claim.evidenceIDs, db: db)
                 guard let scope = sources.first?.accessScope, let thread = sources.first?.threadID,
                       sources.allSatisfy({ $0.accessScope == scope && (scope != .thread || $0.threadID == thread) }) else { throw BrainStoreError.invalid }
