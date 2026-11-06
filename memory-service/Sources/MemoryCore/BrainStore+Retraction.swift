@@ -246,6 +246,7 @@ extension BrainStore {
             if let decoded = try? Self.decode(BrainEvidence.self, payload) { evidence[id] = decoded }
             else { opaqueEvidence[id] = payload }
         }
+        let sourceIDs = Set(evidence.keys).union(opaqueEvidence.keys)
         var claims = [String: BrainClaim]()
         var claimPayloads = [String: String]()
         var opaqueClaims = Set<String>()
@@ -271,7 +272,9 @@ extension BrainStore {
             closure.evidenceIDs = [target]
         case .subject:
             closure.subjectIDs = [target]
-            closure.claimIDs = Set(claims.filter { $0.value.subject == target }.keys)
+            // The `subject` column is authoritative and readable even when the payload is not, so
+            // a claim about this subject is in scope whether or not it decodes.
+            closure.claimIDs = Set(try String.fetchAll(db, sql: "SELECT id FROM brain_claim WHERE subject=?", arguments: [target]))
         case .claim:
             closure.claimIDs = [target]
         }
@@ -299,15 +302,22 @@ extension BrainStore {
                       closure.evidenceIDs.contains(where: { payload.contains("\"\($0)\"") }) else { continue }
                 closure.claimIDs.insert(id); changed = true
             }
-            // Orphan detection needs every claim's support set to be readable. While an unresolved
-            // claim payload remains, a source it might depend on cannot be proven orphaned, so the
-            // rule stands down rather than erasing evidence another claim may still need.
-            if opaqueClaims.isSubset(of: closure.claimIDs) {
-                let survivors = Set(claims.filter { !closure.claimIDs.contains($0.key) }.values.flatMap(\.evidenceIDs))
-                let purged = Set(claims.filter { closure.claimIDs.contains($0.key) }.values.flatMap(\.evidenceIDs))
-                for id in purged.subtracting(survivors) where !closure.evidenceIDs.contains(id) {
-                    closure.evidenceIDs.insert(id); changed = true
-                }
+            // A source kept alive only by purged claims is orphaned. A surviving claim whose
+            // payload cannot be read still names its sources textually, so those named sources are
+            // support this pass cannot rule out and are spared — but only those. Standing the rule
+            // down store-wide would let one corrupt row turn every later forget into a silent
+            // partial erasure, which is a worse failure than losing shared evidence a genuinely
+            // unprobeable claim may have needed.
+            var protected = Set<String>()
+            for id in opaqueClaims.subtracting(closure.claimIDs) {
+                guard let payload = claimPayloads[id] else { continue }
+                protected.formUnion(sourceIDs.filter { payload.contains("\"\($0)\"") })
+            }
+            let survivors = Set(claims.filter { !closure.claimIDs.contains($0.key) }.values.flatMap(\.evidenceIDs))
+                .union(protected)
+            let purged = Set(claims.filter { closure.claimIDs.contains($0.key) }.values.flatMap(\.evidenceIDs))
+            for id in purged.subtracting(survivors) where !closure.evidenceIDs.contains(id) {
+                closure.evidenceIDs.insert(id); changed = true
             }
             // Content backstop over source rows: an overlapping body is the same withdrawn text.
             let texts = distinctiveTexts(closure.evidenceIDs.compactMap { evidence[$0]?.text })
@@ -382,10 +392,23 @@ extension BrainStore {
         // declares a thread or a subject the principal does not hold.
         closure.withdrawnTexts.formUnion(distinctiveTexts(
             closure.transcriptIDs.compactMap { id in try? String.fetchOne(db, sql: "SELECT text FROM transcript WHERE id=?", arguments: [id]) }.compactMap { $0 }))
-        let knownThreads = Set(transcriptThreads.values)
+        // A thread stays known after its last turn is gone, as long as a source row or a summary
+        // still names it: a `sourceRef` naming a dead thread is attribution, not its absence.
+        var knownThreads = Set(transcriptThreads.values)
+        knownThreads.formUnion(evidence.values.map(\.threadID))
+        knownThreads.formUnion(nodes.compactMap(summaryThread))
+        // Only the owner holds every thread and subject of their own memory, so only the owner's
+        // retraction may sweep a row that declares no attribution at all. A delegated principal is
+        // confined to what it can show to be in its grant.
+        let ownerWide = authorization.principal == authorization.owner
         for node in nodes where !closure.nodeIDs.contains(node.id) {
-            guard !attributedOutsideGrant(node, knownThreads: knownThreads),
-                  contains(Self.normalizedContent(node.label + " " + node.body), closure.withdrawnTexts) else { continue }
+            let attribution = self.attribution(of: node, evidence: evidence, knownThreads: knownThreads)
+            switch attribution {
+            case .outsideGrant: continue
+            case .none where !ownerWide: continue
+            case .none, .insideGrant: break
+            }
+            guard contains(Self.normalizedContent(node.label + " " + node.body), closure.withdrawnTexts) else { continue }
             closure.nodeIDs.insert(node.id)
         }
 
@@ -420,15 +443,33 @@ extension BrainStore {
         return Set(["subject", "subjectId", "subjectID"].compactMap { object[$0] as? String })
     }
 
-    /// True when the row names a thread or a subject the principal does not hold. A row with no
-    /// declared attribution is unattributed, not foreign, and stays reachable by the backstop.
-    private func attributedOutsideGrant(_ node: Node, knownThreads: Set<String>) -> Bool {
+    /// What a row says about where it came from, for bounding the content-similarity backstop.
+    enum BrainRowAttribution { case none, insideGrant, outsideGrant }
+
+    /// A `sourceRef` is resolved through the source rows before being judged, because `project`
+    /// records an evidence id there rather than a thread id — an evidence id belonging to a thread
+    /// the principal does not hold is foreign attribution, not an absence of it. A `sourceRef`
+    /// that resolves to neither a source row nor a known thread (consolidation also records topic
+    /// node ids there) says nothing about origin and leaves the row unattributed.
+    private func attribution(of node: Node, evidence: [String: BrainEvidence], knownThreads: Set<String>) -> BrainRowAttribution {
+        var attributed = false
         let subjects = subjectsDeclared(by: node)
-        if !subjects.isEmpty, !subjects.isSubset(of: authorization.subjects) { return true }
-        if let sourceRef = node.sourceRef, knownThreads.contains(sourceRef),
-           !authorization.threads.contains(sourceRef) { return true }
-        if let thread = summaryThread(node), !authorization.threads.contains(thread) { return true }
-        return false
+        if !subjects.isEmpty {
+            guard subjects.isSubset(of: authorization.subjects) else { return .outsideGrant }
+            attributed = true
+        }
+        if let thread = summaryThread(node) {
+            guard authorization.threads.contains(thread) else { return .outsideGrant }
+            attributed = true
+        }
+        if let sourceRef = node.sourceRef {
+            let thread = evidence[sourceRef]?.threadID ?? (knownThreads.contains(sourceRef) ? sourceRef : nil)
+            if let thread {
+                guard authorization.threads.contains(thread) else { return .outsideGrant }
+                attributed = true
+            }
+        }
+        return attributed ? .insideGrant : .none
     }
 
     private func summaryThread(_ node: Node) -> String? {

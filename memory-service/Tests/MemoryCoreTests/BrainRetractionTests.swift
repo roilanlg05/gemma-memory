@@ -436,26 +436,55 @@ final class BrainRetractionTests: XCTestCase {
         XCTAssertTrue(try texts(db, table: "brain_claim", column: "id").isEmpty)
     }
 
-    func testUnreadableClaimPayloadStandsDownTheOrphanRule() throws {
-        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+    /// Two subjects share one source, plus a claim whose payload cannot be read. `payload` decides
+    /// whether that unreadable claim names the shared source.
+    func forgetBothSubjectsAroundOpaqueClaim(_ db: MemoryStore, payload: String) throws {
         let auth = authorization(subjects: ["self:user", "self:agent"])
         let brain = BrainStore(store: db, authorization: auth, clock: { 100 })
         XCTAssertEqual(try brain.commit(commitRequest("one", claim(), 0, evidence: [evidence()])).disposition, .committed)
         XCTAssertEqual(try brain.commit(commitRequest("two", claim("c2", subject: "self:agent",
                                                                   predicate: "tone", value: "warm"), 1)).disposition, .committed)
         try db.dbQueue.write { db in
-            try db.execute(sql: "INSERT INTO brain_claim(id, subject, predicate, revision, payload) VALUES ('opaque', 'self:user', 'mood', 1, ?)",
-                           arguments: [#"{"schemaVersion":99,"legacy":"nothing withdrawn here"}"#])
+            // `self:other` is outside both forgets, so the row survives them and can protect.
+            try db.execute(sql: "INSERT INTO brain_claim(id, subject, predicate, revision, payload) VALUES ('opaque', 'self:other', 'mood', 1, ?)",
+                           arguments: [payload])
         }
         let service = BrainRetractionService(brain: brain)
-
         _ = try service.forget(scope: BrainForgetScope(kind: .subject, id: "self:user"),
                                expectedRevision: 2, operationID: "a")
         _ = try service.forget(scope: BrainForgetScope(kind: .subject, id: "self:agent"),
                                expectedRevision: 3, operationID: "b")
-        // With a claim whose support set cannot be read, no source can be proven orphaned, so the
-        // rule stands down rather than erasing evidence that claim may still need.
+    }
+
+    func testUnreadableClaimPayloadSparesOnlyTheSourcesItNames() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        // An unreadable payload still names its sources textually, and support this pass cannot
+        // rule out is spared. The erasure is knowingly narrow for this one row, not store-wide.
+        try forgetBothSubjectsAroundOpaqueClaim(db, payload: #"{"schemaVersion":99,"evidenceIDs":["e1"]}"#)
         XCTAssertEqual(try texts(db, table: "brain_evidence", column: "id"), ["e1"])
+    }
+
+    func testUnreadableClaimPayloadNamingNothingDoesNotBlockOrphanPurge() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        // One corrupt row must not turn every later forget into a silent partial erasure.
+        try forgetBothSubjectsAroundOpaqueClaim(db, payload: #"{"schemaVersion":99,"legacy":"nothing withdrawn here"}"#)
+        XCTAssertTrue(try texts(db, table: "brain_evidence", column: "id").isEmpty)
+        XCTAssertEqual(try texts(db, table: "brain_claim", column: "id"), ["opaque"])
+    }
+
+    func testSubjectScopeSeedsFromTheAuthoritativeSubjectColumn() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let brain = BrainStore(store: db, authorization: authorization(), clock: { 100 })
+        XCTAssertEqual(try brain.commit(commitRequest("one", claim(), 0, evidence: [evidence()])).disposition, .committed)
+        try db.dbQueue.write { db in
+            try db.execute(sql: "INSERT INTO brain_claim(id, subject, predicate, revision, payload) VALUES ('opaque', 'self:user', 'mood', 1, ?)",
+                           arguments: [#"{"schemaVersion":99,"legacy":"opaque but about the user"}"#])
+        }
+
+        _ = try BrainRetractionService(brain: brain).forget(
+            scope: BrainForgetScope(kind: .subject, id: "self:user"), expectedRevision: 1, operationID: "forget")
+        XCTAssertTrue(try texts(db, table: "brain_claim", column: "id").isEmpty,
+                      "a claim whose payload does not decode is still a claim about this subject")
     }
 
     // MARK: Bounds of the cascade
@@ -517,7 +546,49 @@ final class BrainRetractionTests: XCTestCase {
         // Content similarity alone never reaches a row that declares a thread the principal does
         // not hold; only its own thread's retraction may remove it.
         XCTAssertNotNil(try db.node(id: "foreign"))
-        XCTAssertNil(try db.node(id: "legacy-1"), "an unattributed row is still swept")
+        XCTAssertNil(try db.node(id: "legacy-1"), "an unattributed row is still swept for the owner")
+    }
+
+    /// `project` records an evidence id in `sourceRef`, not a thread id, so attribution has to be
+    /// resolved through the source rows before it can be judged against the grant.
+    func testForeignAttributionIsResolvedThroughTheEvidenceID() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let service = try seed(db)
+        let wider = BrainStore(store: db, authorization: authorization(threads: ["thread-1", "thread-2"]), clock: { 100 })
+        _ = try wider.recordEvidence(evidence("e-foreign", text: surviving, thread: "thread-2"),
+                                     idempotencyKey: "foreign")
+        try db.upsert(node("from-foreign", kind: .fact, label: "Home", body: withdrawn, sourceRef: "e-foreign"))
+
+        _ = try service.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                               expectedRevision: 1, operationID: "forget")
+        XCTAssertNotNil(try db.node(id: "from-foreign"),
+                        "an evidence-id sourceRef belonging to an ungranted thread is foreign attribution")
+        XCTAssertNil(try db.node(id: "legacy-1"))
+    }
+
+    /// The unattributed sweep deletes store-wide by construction — most consolidation output
+    /// declares no origin — so only the principal who holds every thread and subject of the memory
+    /// may run it.
+    func testUnattributedBackstopIsOwnerOnly() throws {
+        let delegatedDB = try MemoryStore(inMemory: true, embeddingDim: 4)
+        try seed(delegatedDB)
+        let delegated = BrainRetractionService(brain: BrainStore(
+            store: delegatedDB, authorization: authorization(principal: "delegate"), clock: { 100 }))
+        _ = try delegated.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                                 expectedRevision: 1, operationID: "forget")
+        XCTAssertNotNil(try delegatedDB.node(id: "legacy-1"),
+                        "a delegated grant cannot reach a row it cannot show to be in scope")
+        // Provenance-linked erasure is unaffected by the gate.
+        XCTAssertNil(try delegatedDB.node(id: "brain-claim:c1"))
+        XCTAssertNil(try delegatedDB.node(id: "summary-1"))
+        XCTAssertEqual(try TranscriptStore(dbQueue: delegatedDB.dbQueue)
+            .range(threadId: "thread-1", from: 1, to: 80).map(\.text), ["Noted.", sameThread])
+
+        let ownerDB = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let owner = try seed(ownerDB)
+        _ = try owner.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                             expectedRevision: 1, operationID: "forget")
+        XCTAssertNil(try ownerDB.node(id: "legacy-1"), "the owner keeps the full backstop")
     }
 
     func testApplyExclusionsRejectsReceiptsItDidNotIssue() throws {
