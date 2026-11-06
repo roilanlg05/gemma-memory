@@ -260,7 +260,15 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                                              now: now(), sourceRef: support.evidenceID)
                     }) {
                     case .failure(let problem): tally.note(problem)
-                    case .success: tally.committed += 1; noteCommitted(.nrem, item: itemKey)
+                    case .success:
+                        // The legacy node is the view; the claim is the durable, versioned,
+                        // source-bound record behind it. The node is written first so that a
+                        // refusal of the content stops the claim too.
+                        let row = segment.rows.first { $0.id == support.rowID }
+                        switch commitAssertedIdentity(value: selfLabel, row: row) {
+                        case .failure(let problem): tally.note(problem)
+                        case .success: tally.committed += 1; noteCommitted(.nrem, item: itemKey)
+                        }
                     }
                 }
                 continue
@@ -1159,11 +1167,16 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
     /// Run (or resume) one full cycle and report, phase by phase, what actually happened.
     ///
-    /// Resumption works off two records that the engine can recompute deterministically: the
-    /// persisted `sleep_cycle` phase, and a per-phase receipt keyed on the job's stable operation
-    /// id. A phase whose receipt already says it succeeded is skipped, so an interruption between
-    /// a phase's writes committing and its receipt landing costs at most one convergent re-run —
-    /// never a duplicate and never a loss.
+    /// Resumption works off records the engine can recompute deterministically: the persisted
+    /// `sleep_cycle` phase, a receipt per graph-wide phase, a receipt per *input unit* per phase,
+    /// and a receipt per item inside a unit — all keyed on stable operation ids. Anything whose
+    /// receipt already says it succeeded is skipped, so an interruption between a commit and its
+    /// receipt landing costs at most one convergent re-run, never a duplicate and never a loss.
+    ///
+    /// Failure is isolated to the unit that failed. One unprocessable conversation slice keeps its
+    /// own turns un-consolidated and visibly failed — with its stage and reason in its receipt —
+    /// while every other unit, and every later phase, still runs. The job is then retired either
+    /// way, so a permanently broken slice can never disable all future memory formation.
     @discardableResult
     func runCycleReporting(isCancelled: @escaping () -> Bool,
                            timeZone: TimeZone = .current) async -> ConsolidationCycleReport {
@@ -1203,44 +1216,64 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
         let order = MemoryConsolidationEngine.cycleOrder
         guard let startIdx = order.firstIndex(of: state.phase) else { return report }
+        // Turns whose unit could not be processed. They are the only ones held back.
+        var unresolved = Set<String>()
         for phase in order[startIdx...] {
             if isCancelled() {   // leave persisted phase for resume
                 report.cancelled = true
                 return report
             }
-            let operationID = job.operationID(for: phase)
-            if let receipt = (try? store.consolidationReceipt(jobID: job.id, operationID: operationID)) ?? nil,
-               receipt.succeeded {
+            // A graph-wide phase is one unit of work and carries one receipt for the whole job.
+            // An input phase is split into units and keeps its receipts per unit (see `run`).
+            if !phase.consumesJobInputs {
+                let operationID = job.operationID(for: phase)
+                if let receipt = (try? store.consolidationReceipt(jobID: job.id, operationID: operationID)) ?? nil,
+                   receipt.succeeded {
+                    advance(&state, past: phase, in: order)
+                    continue
+                }
+                let result = await run(phase, rows: rows, state: &state).result
+                report.results.append(result)
+                try? store.recordConsolidationReceipt(jobID: job.id, result, operationID: operationID, at: now())
+                announce(result, phase: phase)
                 advance(&state, past: phase, in: order)
                 continue
             }
-            let result = await run(phase, rows: rows, state: &state)
-            report.results.append(result)
-            try? store.recordConsolidationReceipt(jobID: job.id, result, operationID: operationID, at: now())
-            for refusal in result.refusals { onProgress?("withheld: \(refusal.code)") }
-            if let failure = result.failure {
-                onProgress?("\(phase.rawValue) failed at \(failure.stage.rawValue)"
-                            + (phase.consumesJobInputs ? " — turns kept" : ""))
-                // Only the phases that read the turns can lose content. One of those failing ends
-                // the cycle with the turns still un-consolidated, so a later cycle re-reads them.
-                if phase.consumesJobInputs { return report }
-            }
+            let run = await run(phase, rows: rows, state: &state)
+            report.results.append(run.result)
+            unresolved.formUnion(run.unresolvedInputIDs)
+            announce(run.result, phase: phase)
             advance(&state, past: phase, in: order)
         }
 
         // One transaction: the turns are marked, the resume state is retired and the job is stamped
-        // together, so "consolidated" and "finished" can never be observed apart.
+        // together, so "consolidated" and "finished" can never be observed apart. Only the turns
+        // whose units all succeeded are marked; the rest stay available for a later cycle.
+        //
+        // The job is retired even when units failed, deliberately: a job left parked would be
+        // resumed by every later cycle, and newly arrived turns would never be looked at.
+        let absorbed = state.episodeIds.filter { !unresolved.contains($0) }
         let committed = report.results.reduce(0) { $0 + $1.committed }
         do {
-            try transcriptStore.completeConsolidation(ids: state.episodeIds, jobID: job.id,
+            try transcriptStore.completeConsolidation(ids: absorbed, jobID: job.id,
                                                       operationID: job.completionOperationID,
                                                       phase: .shy, committed: committed, at: now())
-            report.inputsConsolidated = true
-            onProgress?("done")
+            report.unresolvedInputs = unresolved.count
+            report.inputsConsolidated = unresolved.isEmpty
+            onProgress?(unresolved.isEmpty ? "done"
+                                           : "done, \(unresolved.count) turn(s) kept for a later cycle")
         } catch {
+            report.unresolvedInputs = state.episodeIds.count
             onProgress?("completion failed — turns kept")
         }
         return report
+    }
+
+    private func announce(_ result: ConsolidationPhaseResult, phase: SleepPhase) {
+        for refusal in result.refusals { onProgress?("withheld: \(refusal.code)") }
+        guard let failure = result.failure else { return }
+        onProgress?("\(phase.rawValue) failed at \(failure.stage.rawValue)"
+                    + (phase.consumesJobInputs ? " — those turns kept" : ""))
     }
 
     private func advance(_ state: inout SleepCycleState, past phase: SleepPhase, in order: [SleepPhase]) {
@@ -1249,20 +1282,26 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         try? store.saveSleepCycle(state)
     }
 
+    /// A phase's aggregate outcome, plus the input turns it could not process.
+    private struct PhaseRun {
+        let result: ConsolidationPhaseResult
+        let unresolvedInputIDs: Set<String>
+        init(_ result: ConsolidationPhaseResult, unresolvedInputIDs: Set<String> = []) {
+            self.result = result; self.unresolvedInputIDs = unresolvedInputIDs
+        }
+    }
+
     /// One phase of a cycle, over the job's own transcript rows.
     private func run(_ phase: SleepPhase, rows: [TranscriptRow],
-                     state: inout SleepCycleState) async -> ConsolidationPhaseResult {
+                     state: inout SleepCycleState) async -> PhaseRun {
         // Only the phases that read the turns date themselves from those turns. The graph-wide
         // phases reason about the user's memory as it stands now, so they use the clock.
         if !phase.consumesJobInputs { currentAnchor = nil }
         switch phase {
         case .nrem:
-            var tally = PhaseTally(.nrem)
             // Segment-sized generation: one coherent slice of one thread per call, each anchored
-            // on when it was spoken.
-            for segment in ConsolidationSegment.segments(rows) {
-                tally.absorb(await consolidate(segment: segment))
-            }
+            // on when it was spoken, each succeeding or failing on its own.
+            let run = await runOverUnits(.nrem, rows: rows) { await self.consolidate(segment: $0) }
             // Refine focus to the consolidated entities (semantic, reads naturally) now that
             // NREM has minted nodes. The initial positional focus set at cycle start stays the
             // fallback if NREM produced nothing. Persist so an interrupted resume keeps it.
@@ -1277,28 +1316,76 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 state.focus = String(salient.joined(separator: ", ").prefix(100))
                 try? store.saveSleepCycle(state)
             }
-            return tally.result
+            return run
         case .summarize:
-            var tally = PhaseTally(.summarize)
-            for segment in ConsolidationSegment.segments(rows, maxChars: .max) {
-                tally.absorb(await summarize(segment: segment))
+            // One summary unit per thread, so a summary's recorded seq range covers the whole slice.
+            return await runOverUnits(.summarize, rows: rows, maxChars: .max) {
+                await self.summarize(segment: $0)
             }
-            return tally.result
         case .detect:
-            var tally = PhaseTally(.detect)
-            for segment in ConsolidationSegment.segments(rows) {
-                tally.absorb(await detectFollowUps(segment: segment))
+            return await runOverUnits(.detect, rows: rows) { await self.detectFollowUps(segment: $0) }
+        case .embeddings: return PhaseRun(await embedMissingPhase())
+        case .cluster: return PhaseRun(await clusterPhase())
+        case .tag: return PhaseRun(await tagClustersPhase())
+        case .rem: return PhaseRun(await associatePhase())
+        case .reflect: return PhaseRun(await reflectPhase())
+        case .compress: return PhaseRun(await compressPhase())
+        case .clarify: return PhaseRun(await clarifyPhase())
+        case .curate: return PhaseRun(await curateKindsPhase())
+        case .shy: return PhaseRun(await forgetPhase())
+        }
+    }
+
+    /// Run one input phase unit by unit: skip the units this job already absorbed, record a
+    /// receipt per unit with its own stage and reason, and report the turns of the units that
+    /// failed so only those are held back.
+    private func runOverUnits(_ phase: SleepPhase, rows: [TranscriptRow], maxChars: Int = 6_000,
+                              _ body: (ConsolidationSegment) async -> ConsolidationPhaseResult) async -> PhaseRun {
+        var tally = PhaseTally(phase)
+        var unresolved = Set<String>()
+        for segment in ConsolidationSegment.segments(rows, maxChars: maxChars) {
+            guard let job = currentJob else {
+                tally.absorb(await body(segment))
+                continue
             }
-            return tally.result
-        case .embeddings: return await embedMissingPhase()
-        case .cluster: return await clusterPhase()
-        case .tag: return await tagClustersPhase()
-        case .rem: return await associatePhase()
-        case .reflect: return await reflectPhase()
-        case .compress: return await compressPhase()
-        case .clarify: return await clarifyPhase()
-        case .curate: return await curateKindsPhase()
-        case .shy: return await forgetPhase()
+            let operationID = job.operationID(for: phase, unit: segment.unitKey)
+            if let receipt = (try? store.consolidationReceipt(jobID: job.id, operationID: operationID)) ?? nil,
+               receipt.succeeded {
+                continue
+            }
+            let result = await body(segment)
+            tally.absorb(result)
+            try? store.recordConsolidationReceipt(jobID: job.id, result, operationID: operationID, at: now())
+            if result.didFail { unresolved.formUnion(segment.inputIDs) }
+        }
+        return PhaseRun(tally.result, unresolvedInputIDs: unresolved)
+    }
+
+    /// Write the user's asserted identity as a source-bound claim on `self:user`.
+    ///
+    /// The authorization is the engine's own, built server-side: `mayCommitClaims` so the claim can
+    /// be recorded, **`mayProject: false`** so it never enters the legacy projection (which would
+    /// make `self:user` a managed node and permanently lock `upsertSelf` out of it), and no
+    /// `mayForget`. The claim carries its own supporting evidence, which is byte-identical to the
+    /// copy the cycle already stored, so it is recorded once however often this runs.
+    ///
+    /// A `conflict` disposition means another writer moved the revision underneath us. The
+    /// scheduler serializes cycles, so that is transient: it is reported as a retryable failure
+    /// rather than resolved here.
+    private func commitAssertedIdentity(value: String, row: TranscriptRow?) -> Result<Void, PersistProblem> {
+        guard let row, let evidence = ConsolidationEvidenceAdapter.evidence(for: row) else {
+            // Nothing to bind the claim to. The validator should have refused already.
+            return .failure(.refused(.init(code: "identity_claim_unsupported")))
+        }
+        let brain = BrainStore(store: store,
+                               authorization: ConsolidationEvidenceAdapter.authorization(threads: [row.threadId]),
+                               clock: now)
+        return persist("identity_claim") { () -> BrainCommitResult? in
+            try brain.commitAssertedIdentity(value: value, evidence: evidence)
+        }
+        .flatMap { result in
+            guard result?.disposition == .conflict else { return .success(()) }
+            return .failure(.failed(.persist("identity_claim_conflict")))
         }
     }
 
@@ -1319,7 +1406,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         var unrecorded = 0
         for row in rows {
             // A row the transcript cannot attribute is skipped rather than given a speaker.
-            guard let evidence = ConsolidationEvidenceAdapter.evidence(for: row, recordedAt: now()) else { continue }
+            guard let evidence = ConsolidationEvidenceAdapter.evidence(for: row) else { continue }
             // The deterministic id doubles as the idempotency key: the same row always replays onto
             // the same record.
             if (try? brain.recordEvidence(evidence, idempotencyKey: evidence.id)) != nil {

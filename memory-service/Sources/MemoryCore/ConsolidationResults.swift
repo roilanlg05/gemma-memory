@@ -96,13 +96,20 @@ public struct ConsolidationPhaseResult: Equatable, Sendable {
 public struct ConsolidationCycleReport: Equatable, Sendable {
     public var jobID: String
     public var results: [ConsolidationPhaseResult]
+    /// True only when every turn the job owned was absorbed. False while any unit failed, even
+    /// though other units committed — which is why `results` still carries their counts: a cycle
+    /// reports "completed with N turns kept", never a blanket success or a blanket failure.
     public var inputsConsolidated: Bool
+    /// Turns left un-consolidated because the unit covering them failed. They stay available, so a
+    /// later cycle picks them up again together with whatever has arrived since.
+    public var unresolvedInputs: Int
     public var cancelled: Bool
 
     init(jobID: String, results: [ConsolidationPhaseResult] = [],
-         inputsConsolidated: Bool = false, cancelled: Bool = false) {
+         inputsConsolidated: Bool = false, unresolvedInputs: Int = 0, cancelled: Bool = false) {
         self.jobID = jobID; self.results = results
-        self.inputsConsolidated = inputsConsolidated; self.cancelled = cancelled
+        self.inputsConsolidated = inputsConsolidated
+        self.unresolvedInputs = unresolvedInputs; self.cancelled = cancelled
     }
 
     public var refusals: [ConsolidationRefusal] { results.flatMap { $0.refusals } }
@@ -158,6 +165,15 @@ public struct ConsolidationJob: Equatable, Sendable {
         "\(id):\(phase.rawValue):item:" + ConsolidationDigest.hex(key)
     }
 
+    /// Stable operation id for one input unit in one phase.
+    ///
+    /// Units are the grain at which input work succeeds or fails: one unprocessable conversation
+    /// slice must not stop the others from being absorbed, so each carries its own receipt with
+    /// its own stage and reason.
+    public func operationID(for phase: SleepPhase, unit key: String) -> String {
+        "\(id):\(phase.rawValue):unit:" + key
+    }
+
     /// Stable operation id for the job's single completion record.
     public var completionOperationID: String { id + ":complete" }
 }
@@ -210,6 +226,15 @@ public struct ConsolidationSegment: Equatable, Sendable {
     /// The moment this segment was spoken: the newest turn in it. Relative dates in the segment
     /// ("tomorrow") are the user's "tomorrow", not consolidation's.
     public var anchorAt: Double? { rows.map { $0.createdAt }.max() }
+
+    /// The turns this unit covers. These are the turns that stay un-consolidated if it fails.
+    public var inputIDs: Set<String> { Set(rows.map { $0.id }) }
+
+    /// Stable key identifying this unit by the turns it covers, so a receipt written for it in one
+    /// attempt is found again in the next.
+    public var unitKey: String {
+        ConsolidationDigest.hex(rows.map { $0.id }.sorted().joined(separator: "\u{1}"))
+    }
 
     /// Split transcript rows into per-thread, char-budgeted segments, chronological by thread.
     /// A segment never spans two threads and never grows past `maxChars`, so one generation always

@@ -130,18 +130,21 @@ final class ConsolidationEvidenceAdapterTests: XCTestCase {
     }
 
     func test_unattributableOrEmptyRowsYieldNoEvidence() {
-        XCTAssertNil(ConsolidationEvidenceAdapter.evidence(for: row("tool", "results"), recordedAt: 2_000))
-        XCTAssertNil(ConsolidationEvidenceAdapter.evidence(for: row("user", "   "), recordedAt: 2_000))
+        XCTAssertNil(ConsolidationEvidenceAdapter.evidence(for: row("tool", "results")))
+        XCTAssertNil(ConsolidationEvidenceAdapter.evidence(for: row("user", "   ")))
     }
 
-    func test_evidenceCarriesTheRecordedSpeakerAndObservationTime() throws {
-        let evidence = try XCTUnwrap(ConsolidationEvidenceAdapter.evidence(for: row("user", "hola"),
-                                                                           recordedAt: 2_000))
+    func test_evidenceCarriesTheRecordedSpeakerAndIsByteStable() throws {
+        let evidence = try XCTUnwrap(ConsolidationEvidenceAdapter.evidence(for: row("user", "hola")))
         XCTAssertEqual(evidence.speakerID, selfUserID)
-        XCTAssertEqual(evidence.sourceKind, .userMessage)
+        XCTAssertEqual(evidence.sourceKind, BrainSourceKind.userMessage)
         XCTAssertEqual(evidence.observedAt, 1_000, "observed when the turn was spoken")
-        XCTAssertEqual(evidence.recordedAt, 2_000, "recorded when consolidation read it")
+        XCTAssertEqual(evidence.recordedAt, 1_000,
+                       "the transcript row IS the record, so its own createdAt is when it was recorded")
         XCTAssertNil(evidence.parentEvidenceIDs, "a raw turn is a root, not a derived observation")
+        // Byte stability is what lets a claim carry its own evidence without colliding with the
+        // copy an earlier cycle stored.
+        XCTAssertEqual(evidence, ConsolidationEvidenceAdapter.evidence(for: row("user", "hola")))
     }
 
     func test_authorizationIsNarrowAndNeverGrantsErasure() {

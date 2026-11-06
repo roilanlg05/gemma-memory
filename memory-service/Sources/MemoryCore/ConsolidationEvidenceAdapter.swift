@@ -14,9 +14,12 @@ enum ConsolidationDigest {
 ///
 /// Two rules make this safe to run repeatedly:
 ///
-/// 1. **Deterministic ids.** An evidence id is derived from `(threadId, seq, digest(text))`, so
-///    re-adapting the same row produces the very same record. It cannot become a second,
-///    independent root of support for the same sentence, and a retry after a crash converges.
+/// 1. **Deterministic ids and payloads.** An evidence id is derived from
+///    `(threadId, seq, digest(text))`, and every field of the record comes from the row, so
+///    re-adapting the same row produces a byte-identical record. It cannot become a second,
+///    independent root of support for the same sentence, a retry after a crash converges, and a
+///    claim may carry its own supporting evidence without colliding with the copy an earlier
+///    cycle already stored.
 /// 2. **No invented speaker.** The speaker comes from the transcript's own `role` column and from
 ///    nothing else. A row whose role is neither `user` nor `assistant` yields no evidence at all,
 ///    because recording it would mean guessing who said it.
@@ -55,14 +58,19 @@ public enum ConsolidationEvidenceAdapter {
     }
 
     /// The evidence record for one row, or nil when the row cannot be attributed or has no text.
-    public static func evidence(for row: TranscriptRow, recordedAt: Double,
+    ///
+    /// `recordedAt` is the row's own `createdAt`, not the moment consolidation happened to read
+    /// it: the transcript row *is* the record, and it was written when the turn was spoken.
+    /// Taking it from the row is also what keeps the payload deterministic, so the same row always
+    /// adapts to the same bytes however many cycles touch it.
+    public static func evidence(for row: TranscriptRow,
                                 scope: BrainAccessScope = .user) -> BrainEvidence? {
         guard let speaker = speaker(role: row.role) else { return nil }
         let text = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, row.createdAt.isFinite, recordedAt.isFinite else { return nil }
+        guard !text.isEmpty, row.createdAt.isFinite else { return nil }
         return BrainEvidence(id: evidenceID(for: row), sourceKind: speaker.sourceKind,
                              speakerID: speaker.speakerID, threadID: row.threadId,
-                             observedAt: row.createdAt, recordedAt: recordedAt,
+                             observedAt: row.createdAt, recordedAt: row.createdAt,
                              span: nil, accessScope: scope, text: row.text)
     }
 

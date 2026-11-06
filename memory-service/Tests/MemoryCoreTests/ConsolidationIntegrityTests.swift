@@ -47,7 +47,13 @@ final class PromptRecordingRuntime: ModelTextClient, @unchecked Sendable {
 /// makes variable.
 final class SchemaAwareRuntime: ModelTextClient, @unchecked Sendable {
     private let overrides: [String: String]
-    init(_ overrides: [String: String] = [:]) { self.overrides = overrides }
+    /// Extraction replies chosen by a substring of the conversation, so two units of the same
+    /// cycle can be given different content. Applies to the extraction phase only.
+    private let entitiesByPrompt: [String: String]
+
+    init(_ overrides: [String: String] = [:], entitiesByPrompt: [String: String] = [:]) {
+        self.overrides = overrides; self.entitiesByPrompt = entitiesByPrompt
+    }
 
     func generate(prompt: String, options: ModelTextOptions) async throws -> String {
         let marker: String
@@ -60,6 +66,8 @@ final class SchemaAwareRuntime: ModelTextClient, @unchecked Sendable {
         else if prompt.contains("\"questions\"") { marker = "questions" }
         else if prompt.contains("\"map\"") { marker = "map" }
         else { marker = "unknown" }
+        if marker == "entities",
+           let hit = entitiesByPrompt.first(where: { prompt.contains($0.key) }) { return hit.value }
         if let override = overrides[marker] { return override }
         switch marker {
         case "entities": return #"{"entities":[]}"#
@@ -297,6 +305,14 @@ extension ConsolidationIntegrityTests {
 
     private func store(dim: Int = 4) throws -> MemoryStore { try MemoryStore(inMemory: true, embeddingDim: dim) }
 
+    /// The operation id of one input unit's receipt, recomputed the way the engine does.
+    private func unitOperation(jobID: String, phase: SleepPhase, rows: [TranscriptRow]) -> String {
+        ConsolidationJob(id: jobID, phase: phase, transcriptIDs: [], evidenceIDs: [],
+                         timeZoneIdentifier: "UTC", startedAt: 0)
+            .operationID(for: phase,
+                         unit: ConsolidationSegment(threadID: rows[0].threadId, rows: rows).unitKey)
+    }
+
     private func evidenceCount(_ store: MemoryStore) throws -> Int {
         try store.dbQueue.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM brain_evidence") ?? 0 }
     }
@@ -361,13 +377,14 @@ extension ConsolidationIntegrityTests {
         XCTAssertTrue(report.inputsConsolidated)
         let before = try store.allNodes().count
 
-        // Reproduce the crash window: the phase's writes are on disk, its receipt is not, and the
+        // Reproduce the crash window: the unit's writes are on disk, its receipt is not, and the
         // cycle is back at the phase it was running.
+        let rows = try await store.dbQueue.read { db in
+            try TranscriptRow.fetchAll(db)
+        }
         try store.forgetConsolidationReceipt(jobID: report.jobID,
-                                             operationID: ConsolidationJob(id: report.jobID, phase: .nrem,
-                                                                           transcriptIDs: [rowID], evidenceIDs: [],
-                                                                           timeZoneIdentifier: "UTC", startedAt: 0)
-                                                 .operationID(for: .nrem))
+                                             operationID: unitOperation(jobID: report.jobID, phase: .nrem,
+                                                                        rows: rows))
         try await store.dbQueue.write { db in
             try db.execute(sql: "UPDATE transcript SET consolidated = 0 WHERE id = ?", arguments: [rowID])
         }
@@ -384,6 +401,64 @@ extension ConsolidationIntegrityTests {
                        "a replayed phase does not reinforce what it already committed")
         XCTAssertEqual(try evidenceCount(store), 1)
         XCTAssertEqual(try ts.unconsolidated(limit: 10).count, 0)
+    }
+
+    // MARK: Fix 1 — one unprocessable unit must not disable memory formation
+
+    func test_oneFailingUnitDoesNotBlockTheOtherUnits() async throws {
+        let store = try makeStore()
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        let rowA = try ts.append(threadId: "A", turnIndex: 0, role: "user",
+                                 text: "trabajo en Habana", now: 1_000)
+        let rowB = try ts.append(threadId: "B", turnIndex: 0, role: "user",
+                                 text: "me gusta el sushi", now: 1_100)
+        // Only thread A's extraction hits the storage fault.
+        try await store.dbQueue.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER injected_node_failure BEFORE INSERT ON node
+                WHEN NEW.label = 'Habana'
+                BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;
+                """)
+        }
+        let runtime = SchemaAwareRuntime(entitiesByPrompt: [
+            "Habana": #"{"entities":[{"entity":"Habana","kind":"place","detail":"trabaja ahí"}]}"#,
+            "sushi": #"{"entities":[{"entity":"sushi","kind":"preference","detail":"le gusta"}]}"#,
+        ])
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: runtime,
+                                               transcriptStore: ts, now: { 2_000 })
+        let report = await engine.runCycleReporting(isCancelled: { false })
+
+        XCTAssertFalse(report.inputsConsolidated)
+        XCTAssertEqual(report.unresolvedInputs, 1, "only the failing unit's turn is held back")
+        let unconsolidated = try ts.unconsolidated(limit: 10).map { $0.id }
+        XCTAssertEqual(unconsolidated, [rowA], "the healthy unit's turn is absorbed, the broken one is kept")
+        XCTAssertNotNil(try store.allNodes().first { $0.label == "sushi" },
+                        "the healthy unit still commits its content")
+        XCTAssertNil(try store.allNodes().first { $0.label == "Habana" })
+
+        // The failed unit is visibly failed, with its stage and reason.
+        let failedRows = try await store.dbQueue.read { db in
+            try TranscriptRow.filter(Column("id") == rowA).fetchAll(db)
+        }
+        let receipt = try XCTUnwrap(try store.consolidationReceipt(
+            jobID: report.jobID, operationID: unitOperation(jobID: report.jobID, phase: .nrem, rows: failedRows)))
+        XCTAssertEqual(receipt.outcome, .failed)
+        XCTAssertEqual(receipt.stage, .persist)
+
+        // And a later cycle still processes new arrivals alongside the kept turn.
+        try await store.dbQueue.write { db in try db.execute(sql: "DROP TRIGGER injected_node_failure") }
+        let rowC = try ts.append(threadId: "C", turnIndex: 0, role: "user", text: "me gusta el ajedrez", now: 1_200)
+        let later = MemoryConsolidationEngine(store: store, embedder: nil, runtime: SchemaAwareRuntime(entitiesByPrompt: [
+            "Habana": #"{"entities":[{"entity":"Habana","kind":"place","detail":"trabaja ahí"}]}"#,
+            "ajedrez": #"{"entities":[{"entity":"ajedrez","kind":"preference","detail":"le gusta"}]}"#,
+        ]), transcriptStore: ts, now: { 3_000 })
+        let secondReport = await later.runCycleReporting(isCancelled: { false })
+        XCTAssertTrue(secondReport.inputsConsolidated)
+        XCTAssertEqual(try ts.unconsolidated(limit: 10).count, 0,
+                       "the kept turn and the new arrival are both absorbed once the fault clears")
+        XCTAssertNotNil(try store.allNodes().first { $0.label == "Habana" })
+        XCTAssertNotNil(try store.allNodes().first { $0.label == "ajedrez" })
+        XCTAssertNotEqual(rowB, rowC)
     }
 
     // MARK: completion is one transaction
@@ -403,7 +478,7 @@ extension ConsolidationIntegrityTests {
         XCTAssertEqual(completion?.outcome, .committed, "the job carries a completion receipt")
     }
 
-    func test_failedCycleKeepsBothTurnsAndResumeState() async throws {
+    func test_failedCycleKeepsItsTurnsAndRetiresTheJob() async throws {
         let store = try makeStore()
         let ts = TranscriptStore(dbQueue: store.dbQueue)
         try ts.append(threadId: "T", turnIndex: 0, role: "user", text: "hola", now: 1_000)
@@ -411,8 +486,10 @@ extension ConsolidationIntegrityTests {
                                                transcriptStore: ts, now: { 2_000 })
         let report = await engine.runCycleReporting(isCancelled: { false })
         XCTAssertFalse(report.inputsConsolidated)
+        XCTAssertEqual(report.unresolvedInputs, 1, "the cycle reports how many turns it kept")
         XCTAssertEqual(try ts.unconsolidated(limit: 10).count, 1)
-        XCTAssertEqual(try store.loadSleepCycle()?.phase, .nrem, "the cycle stays where it broke")
+        XCTAssertNil(try store.loadSleepCycle(),
+                     "the job is retired even so, or every later cycle would resume it and never look at new turns")
     }
 
     // MARK: receipts carry the stage and the retryability
@@ -424,7 +501,8 @@ extension ConsolidationIntegrityTests {
         let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: FailingRuntime(),
                                                transcriptStore: ts, now: { 2_000 })
         let report = await engine.runCycleReporting(isCancelled: { false })
-        let operation = report.jobID + ":nrem"
+        let rows = try await store.dbQueue.read { db in try TranscriptRow.fetchAll(db) }
+        let operation = unitOperation(jobID: report.jobID, phase: .nrem, rows: rows)
         let first = try XCTUnwrap(try store.consolidationReceipt(jobID: report.jobID, operationID: operation))
         XCTAssertEqual(first.outcome, .failed)
         XCTAssertEqual(first.stage, .generation)
