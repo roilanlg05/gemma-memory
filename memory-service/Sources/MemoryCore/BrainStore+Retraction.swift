@@ -1,14 +1,25 @@
 import Foundation
 import GRDB
 import BrainContract
+import Crypto
 
-/// Identifier classes carried by persistent exclusion markers. Markers hold identifiers only —
-/// never withdrawn content — so a restore from a stale backup can be scrubbed by id without the
-/// store retaining what it erased. Only row identifiers are marked: the scope a retraction named
-/// is recorded in `brain_forget_operations`, and marking a whole thread or subject would also
-/// sweep up turns recorded after that decision.
+/// Identifier classes carried by persistent exclusion markers.
 enum BrainExclusionKind: String, CaseIterable {
     case evidence, claim, node, transcript
+}
+
+/// A persistent exclusion marker: which row id was retracted, and a fingerprint of the content
+/// that was withdrawn from it.
+///
+/// Keying on content as well as id is what separates *reingestion* — a stale backup or sync
+/// pushing back the same body under the same id — from a legitimate later write that reuses a
+/// deterministic id, such as a corrected evidence record or a re-stated identity. An id-only
+/// marker would brick those write paths permanently. A fingerprint is a one-way digest and cannot
+/// be read back as content, so a marker still carries nothing withdrawn.
+struct BrainExclusionMarker: Hashable {
+    let kind: BrainExclusionKind
+    let id: String
+    let fingerprint: String
 }
 
 /// Everything one retraction removes. Identifier sets are persisted as exclusion markers;
@@ -23,26 +34,66 @@ struct BrainRetractionClosure {
     var nodeIDs = Set<String>()
     var transcriptIDs = Set<String>()
     var withdrawnTexts = Set<String>()
-
-    var identifiers: [(BrainExclusionKind, Set<String>)] {
-        [(.evidence, evidenceIDs), (.claim, claimIDs), (.node, nodeIDs), (.transcript, transcriptIDs)]
-    }
 }
 
 extension BrainStore {
-    /// Content matching is a backstop for derived rows that carry no provenance link (most
+    /// Content similarity is a backstop for derived rows that carry no provenance link (most
     /// consolidation output has a nil `sourceRef`). A short fragment is not distinctive enough to
     /// attribute to the withdrawn source, so only normalized texts of at least this length take
     /// part in it. Rows reachable through recorded provenance are purged regardless of length.
     static let minimumDistinctiveTextLength = 12
 
+    /// Deterministic ids the brain reuses by design: the singleton identities and the kind hubs.
+    /// Their rows are erased like any other, but they are never *marked*, because a marker on a
+    /// reusable id would refuse every later write to it and would make a legitimately rebuilt row
+    /// deletable by `applyExclusions`. A rebuilt hub or a re-stated identity is not the withdrawn
+    /// row — it is new content under a fixed name.
+    static let unmarkableNodeIDs: Set<String> = [selfUserID, "self:agent", "relationship:user:agent"]
+
+    static func isMarkable(_ node: Node) -> Bool {
+        !unmarkableNodeIDs.contains(node.id)
+            && node.kind != HubKind.hub.rawValue
+            && !node.id.hasPrefix("hub:")
+    }
+
     static func normalizedContent(_ text: String) -> String {
         text.lowercased().split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
     }
 
-    static func isExcluded(_ db: Database, kind: BrainExclusionKind, id: String) throws -> Bool {
-        try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_exclusion WHERE kind=? AND id=?)",
-                          arguments: [kind.rawValue, id]) ?? false
+    private static let fingerprintSeparator = "\u{1F}"
+
+    static func digest(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+    static func nodeFingerprint(label: String, body: String) -> String {
+        digest(normalizedContent(label) + fingerprintSeparator + normalizedContent(body))
+    }
+    static func nodeFingerprint(_ node: Node) -> String {
+        nodeFingerprint(label: node.label, body: node.body)
+    }
+    static func transcriptFingerprint(_ text: String) -> String {
+        digest(normalizedContent(text))
+    }
+    /// Evidence payloads are canonically encoded, so a byte-identical payload is a replay of the
+    /// same record, while any correction — new text, new observation time — hashes differently.
+    static func evidenceFingerprint(_ payload: String) -> String {
+        digest(payload)
+    }
+    /// A claim's revision is stamped at commit time, so the fingerprint covers what the claim
+    /// asserts rather than when it was recorded. An undecodable payload is fingerprinted raw.
+    static func claimFingerprint(subject: String, predicate: String, value: BrainValue) -> String {
+        let encoded = (try? encode(value)) ?? ""
+        return digest(normalizedContent(subject) + fingerprintSeparator
+                      + normalizedContent(predicate) + fingerprintSeparator + encoded)
+    }
+    static func claimFingerprint(payload: String) -> String {
+        guard let claim = try? decode(BrainClaim.self, payload) else { return digest(payload) }
+        return claimFingerprint(subject: claim.subject, predicate: claim.predicate, value: claim.value)
+    }
+
+    static func isExcluded(_ db: Database, kind: BrainExclusionKind, id: String, fingerprint: String) throws -> Bool {
+        try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_exclusion WHERE kind=? AND id=? AND fingerprint=?)",
+                          arguments: [kind.rawValue, id, fingerprint]) ?? false
     }
 
     // MARK: Forget
@@ -90,39 +141,58 @@ extension BrainStore {
         }
     }
 
-    /// Re-applies exclusion markers so a restored or re-synced store cannot serve withdrawn rows.
-    /// Purges strictly by recorded identifier: every row an earlier retraction removed carries a
-    /// marker, so a thread is never re-swept in bulk and turns recorded after that decision
-    /// survive. No revision is minted: this re-applies an earlier decision, it does not make one.
+    /// Re-applies the exclusion markers of the given retractions, so a store that was restored or
+    /// re-synced from stale inputs cannot serve withdrawn rows. The caller invokes this before
+    /// restored reads; nothing schedules it.
+    ///
+    /// Each receipt must be one this store issued — it is compared against
+    /// `brain_forget_operations` and an unknown or altered receipt is refused. Without that check
+    /// this would be a second deletion path able to erase arbitrary identifiers with no scope, no
+    /// authorization over the target and no revision. The markers of the verified retractions are
+    /// then the authoritative work list, and each is re-applied only while the row still holds the
+    /// fingerprinted content, so a row that legitimately reuses a retracted id survives.
+    ///
+    /// No revision is minted: this re-applies an earlier decision, it does not make a new one.
     func applyExclusions(_ receipts: [BrainForgetReceipt]) throws {
         try requirePrincipal()
         guard authorization.mayForget, authorization.scopes.contains(.user) else { throw BrainStoreError.denied }
         try store.dbQueue.write { db in
             try checkOwner(db, bind: false)
-            var closure = BrainRetractionClosure()
-            for row in try Row.fetchAll(db, sql: "SELECT kind, id FROM brain_exclusion") {
-                let id: String = row["id"]
-                switch BrainExclusionKind(rawValue: row["kind"]) {
-                case .evidence: closure.evidenceIDs.insert(id)
-                case .claim: closure.claimIDs.insert(id)
-                case .node: closure.nodeIDs.insert(id)
-                case .transcript: closure.transcriptIDs.insert(id)
-                case nil: continue
-                }
-            }
-            // A restore can also lose the marker table itself, so trust the caller's receipts for
-            // identifiers, never for content: an affected id is matched against both tables.
+            var authorized = Set<String>()
             for receipt in receipts {
-                closure.evidenceIDs.formUnion(receipt.forgottenEvidenceIDs)
-                closure.evidenceIDs.formUnion(receipt.sourceEvidenceIDs ?? [])
-                closure.claimIDs.formUnion(receipt.forgottenClaimIDs)
-                for id in receipt.affectedIDs ?? [] {
-                    let isTranscript = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM transcript WHERE id=?)", arguments: [id]) ?? false
-                    if isTranscript { closure.transcriptIDs.insert(id) } else { closure.nodeIDs.insert(id) }
+                guard let stored = try String.fetchOne(db, sql: "SELECT receipt FROM brain_forget_operations WHERE principal=? AND operation=?",
+                                                       arguments: [authorization.principal, receipt.clientOperationID]),
+                      try Self.decode(BrainForgetReceipt.self, stored) == receipt else { throw BrainStoreError.denied }
+                authorized.formUnion(receipt.forgottenEvidenceIDs)
+                authorized.formUnion(receipt.forgottenClaimIDs)
+                authorized.formUnion(receipt.sourceEvidenceIDs ?? [])
+                authorized.formUnion(receipt.affectedIDs ?? [])
+            }
+            guard !authorized.isEmpty else { return }
+            var closure = BrainRetractionClosure()
+            for row in try Row.fetchAll(db, sql: "SELECT kind, id, fingerprint FROM brain_exclusion") {
+                let id: String = row["id"], fingerprint: String = row["fingerprint"]
+                guard authorized.contains(id), let kind = BrainExclusionKind(rawValue: row["kind"]) else { continue }
+                switch kind {
+                case .node:
+                    guard let node = try Node.fetchOne(db, key: id),
+                          Self.nodeFingerprint(node) == fingerprint else { continue }
+                    closure.nodeIDs.insert(id)
+                case .transcript:
+                    guard let text = try String.fetchOne(db, sql: "SELECT text FROM transcript WHERE id=?", arguments: [id]),
+                          Self.transcriptFingerprint(text) == fingerprint else { continue }
+                    closure.transcriptIDs.insert(id)
+                case .evidence:
+                    guard let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_evidence WHERE id=?", arguments: [id]),
+                          Self.evidenceFingerprint(payload) == fingerprint else { continue }
+                    closure.evidenceIDs.insert(id)
+                case .claim:
+                    guard let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_claim WHERE id=?", arguments: [id]),
+                          Self.claimFingerprint(payload: payload) == fingerprint else { continue }
+                    closure.claimIDs.insert(id)
                 }
             }
-            let revision = try Self.revision(db)
-            try purge(closure, db: db, revision: revision)
+            try purge(closure, db: db, revision: try Self.revision(db))
         }
     }
 
@@ -148,6 +218,23 @@ extension BrainStore {
         }
     }
 
+    /// Provenance-linked erasure follows a withdrawn source wherever it lives, across threads — but
+    /// only within what the principal holds. If the closure reaches a thread or a subject outside
+    /// the grant the whole operation is refused, rather than erasing part of it: a half-erasure
+    /// that reports success is worse than an observable failure.
+    private func requireGrant(_ closure: BrainRetractionClosure,
+                              evidence: [String: BrainEvidence],
+                              claims: [String: BrainClaim],
+                              transcriptThreads: [String: String]) throws {
+        var threads = Set(closure.threadIDs)
+        threads.formUnion(closure.evidenceIDs.compactMap { evidence[$0]?.threadID })
+        threads.formUnion(closure.transcriptIDs.compactMap { transcriptThreads[$0] })
+        guard threads.isSubset(of: authorization.threads) else { throw BrainStoreError.denied }
+        var subjects = Set(closure.subjectIDs)
+        subjects.formUnion(closure.claimIDs.compactMap { claims[$0]?.subject })
+        guard subjects.isSubset(of: authorization.subjects) else { throw BrainStoreError.denied }
+    }
+
     // MARK: Closure resolution
 
     private func resolveClosure(_ kind: BrainForgetScopeKind, _ target: String, db: Database) throws -> BrainRetractionClosure {
@@ -160,15 +247,20 @@ extension BrainStore {
             else { opaqueEvidence[id] = payload }
         }
         var claims = [String: BrainClaim]()
+        var claimPayloads = [String: String]()
+        var opaqueClaims = Set<String>()
         for row in try Row.fetchAll(db, sql: "SELECT id, payload FROM brain_claim") {
-            if let decoded = try? Self.decode(BrainClaim.self, row["payload"] as String) { claims[row["id"] as String] = decoded }
+            let id: String = row["id"], payload: String = row["payload"]
+            claimPayloads[id] = payload
+            if let decoded = try? Self.decode(BrainClaim.self, payload) { claims[id] = decoded }
+            else { opaqueClaims.insert(id) }
         }
 
         switch kind {
         case .all:
             closure.purgeEverything = true
             closure.evidenceIDs = Set(evidence.keys).union(opaqueEvidence.keys)
-            closure.claimIDs = Set(claims.keys)
+            closure.claimIDs = Set(claimPayloads.keys)
             closure.subjectIDs = Set(claims.values.map(\.subject))
             closure.threadIDs = Set(evidence.values.map(\.threadID))
                 .union(try String.fetchAll(db, sql: "SELECT DISTINCT threadId FROM transcript"))
@@ -184,9 +276,10 @@ extension BrainStore {
             closure.claimIDs = [target]
         }
 
-        // Dependency fixpoint. Derived observations rooted in a withdrawn source go with it, a
-        // claim that loses any of its sources can no longer be verified, and a source kept alive
-        // only by purged claims is orphaned. Each round can feed the next.
+        // Dependency fixpoint over recorded provenance. Derived observations rooted in a withdrawn
+        // source go with it; a claim that loses any of its sources can never be re-verified,
+        // because claim payloads are immutable and its `evidenceIDs` are its complete support set;
+        // a source kept alive only by purged claims is orphaned. Each round can feed the next.
         var changed = true
         while changed {
             changed = false
@@ -200,50 +293,68 @@ extension BrainStore {
                     closure.claimIDs.insert(id); changed = true
                 }
             }
-            let supportingSurvivors = Set(claims.filter { !closure.claimIDs.contains($0.key) }.values.flatMap(\.evidenceIDs))
-            let supportingPurged = Set(claims.filter { closure.claimIDs.contains($0.key) }.values.flatMap(\.evidenceIDs))
-            for id in supportingPurged.subtracting(supportingSurvivors) where !closure.evidenceIDs.contains(id) {
-                closure.evidenceIDs.insert(id); changed = true
+            // An undecodable claim payload still names its sources textually.
+            for id in opaqueClaims where !closure.claimIDs.contains(id) {
+                guard let payload = claimPayloads[id],
+                      closure.evidenceIDs.contains(where: { payload.contains("\"\($0)\"") }) else { continue }
+                closure.claimIDs.insert(id); changed = true
+            }
+            // Orphan detection needs every claim's support set to be readable. While an unresolved
+            // claim payload remains, a source it might depend on cannot be proven orphaned, so the
+            // rule stands down rather than erasing evidence another claim may still need.
+            if opaqueClaims.isSubset(of: closure.claimIDs) {
+                let survivors = Set(claims.filter { !closure.claimIDs.contains($0.key) }.values.flatMap(\.evidenceIDs))
+                let purged = Set(claims.filter { closure.claimIDs.contains($0.key) }.values.flatMap(\.evidenceIDs))
+                for id in purged.subtracting(survivors) where !closure.evidenceIDs.contains(id) {
+                    closure.evidenceIDs.insert(id); changed = true
+                }
             }
             // Content backstop over source rows: an overlapping body is the same withdrawn text.
             let texts = distinctiveTexts(closure.evidenceIDs.compactMap { evidence[$0]?.text })
-            if !texts.isEmpty {
-                for (id, item) in evidence where !closure.evidenceIDs.contains(id) {
-                    guard let text = item.text, contains(Self.normalizedContent(text), texts) else { continue }
-                    closure.evidenceIDs.insert(id); changed = true
-                }
-                for (id, payload) in opaqueEvidence where !closure.evidenceIDs.contains(id) {
-                    guard contains(Self.normalizedContent(payload), texts) else { continue }
-                    closure.evidenceIDs.insert(id); changed = true
-                }
+            guard !texts.isEmpty else { continue }
+            for (id, item) in evidence where !closure.evidenceIDs.contains(id) {
+                guard let text = item.text, contains(Self.normalizedContent(text), texts) else { continue }
+                closure.evidenceIDs.insert(id); changed = true
+            }
+            for (id, payload) in opaqueEvidence where !closure.evidenceIDs.contains(id) {
+                guard contains(Self.normalizedContent(payload), texts) else { continue }
+                closure.evidenceIDs.insert(id); changed = true
+            }
+            // A claim payload holds the asserted value verbatim, decodable or not.
+            for (id, payload) in claimPayloads where !closure.claimIDs.contains(id) {
+                guard contains(Self.normalizedContent(payload), texts) else { continue }
+                closure.claimIDs.insert(id); changed = true
             }
         }
         closure.rootEvidenceIDs = Set(closure.evidenceIDs.filter { evidence[$0]?.sourceKind != .derived })
-        closure.withdrawnTexts = distinctiveTexts(closure.evidenceIDs.compactMap { evidence[$0]?.text })
+        let sourceTexts = distinctiveTexts(closure.evidenceIDs.compactMap { evidence[$0]?.text })
+        closure.withdrawnTexts = sourceTexts
 
-        // Raw turns: the whole thread when the thread is withdrawn, otherwise the turns of the
-        // withdrawn source's own thread that reproduce its text. An evidence body IS the sanitized
-        // source content, so a turn carrying it is the same content in its other home.
+        // Raw turns. A whole thread goes when the thread itself is withdrawn; otherwise a turn is
+        // withdrawn when it carries a withdrawn evidence body, in whichever thread it sits. An
+        // evidence body IS the sanitized source content, so such a turn is that same content in
+        // its other home, and leaving it would let `/v1/transcript/range` serve it verbatim and
+        // let a later consolidation pass mint a fresh node from it.
         var purgedSeqs = [String: Set<Int>]()
-        let sourceThreads = Set(closure.evidenceIDs.compactMap { evidence[$0]?.threadID })
+        var transcriptThreads = [String: String]()
         for row in try TranscriptRow.fetchAll(db) {
+            transcriptThreads[row.id] = row.threadId
             let withdrawnThread = closure.purgeEverything || closure.threadIDs.contains(row.threadId)
-            let reproducesSource = sourceThreads.contains(row.threadId)
-                && contains(Self.normalizedContent(row.text), closure.withdrawnTexts)
-            guard withdrawnThread || reproducesSource else { continue }
+            let carriesSource = contains(Self.normalizedContent(row.text), sourceTexts)
+            guard withdrawnThread || carriesSource else { continue }
             closure.transcriptIDs.insert(row.id)
             purgedSeqs[row.threadId, default: []].insert(row.seq)
-            closure.withdrawnTexts.formUnion(distinctiveTexts([row.text]))
         }
 
         if closure.purgeEverything {
             closure.nodeIDs = Set(try String.fetchAll(db, sql: "SELECT id FROM node"))
             return closure
         }
+        try requireGrant(closure, evidence: evidence, claims: claims, transcriptThreads: transcriptThreads)
 
-        // Legacy graph: managed projections and bindings of withdrawn claims, rows whose recorded
-        // source is withdrawn, summaries over withdrawn turns, nodes a withdrawn subject owns, and
-        // — for the derived rows consolidation writes without provenance — verbatim content.
+        // Legacy graph, by recorded provenance: managed projections and bindings of withdrawn
+        // claims, rows whose recorded source is withdrawn, the node a withdrawn subject *is*,
+        // and summaries over withdrawn turns.
         for claimID in closure.claimIDs {
             closure.nodeIDs.formUnion(try String.fetchAll(db, sql: "SELECT node_id FROM brain_projection WHERE claim_id=?", arguments: [claimID]))
             closure.nodeIDs.formUnion(try String.fetchAll(db, sql: "SELECT node_id FROM brain_legacy_binding WHERE claim_id=?", arguments: [claimID]))
@@ -252,20 +363,32 @@ extension BrainStore {
             closure.nodeIDs.formUnion(try String.fetchAll(db, sql: "SELECT node_id FROM brain_legacy_binding WHERE subject=?", arguments: [subject]))
         }
         let withdrawnSources = closure.evidenceIDs.union(closure.threadIDs)
-        for node in try Node.fetchAll(db) where !closure.nodeIDs.contains(node.id) {
+        let nodes = try Node.fetchAll(db)
+        for node in nodes where !closure.nodeIDs.contains(node.id) {
             if let sourceRef = node.sourceRef, withdrawnSources.contains(sourceRef) {
                 closure.nodeIDs.insert(node.id); continue
             }
+            // The subject grant already bounds this: a scope can only name a held subject.
             if closure.subjectIDs.contains(node.id) || declaresSubject(node, in: closure.subjectIDs) {
                 closure.nodeIDs.insert(node.id); continue
             }
             if node.kind == NodeKind.summary.rawValue, summaryCovers(node, purgedSeqs: purgedSeqs, threads: closure.threadIDs) {
-                closure.nodeIDs.insert(node.id); continue
-            }
-            if contains(Self.normalizedContent(node.label + " " + node.body), closure.withdrawnTexts) {
                 closure.nodeIDs.insert(node.id)
             }
         }
+
+        // Content-similarity backstop, bounded to the grant. Unlike provenance, a verbatim overlap
+        // is only evidence that a row *may* hold the withdrawn text, so it never reaches a row that
+        // declares a thread or a subject the principal does not hold.
+        closure.withdrawnTexts.formUnion(distinctiveTexts(
+            closure.transcriptIDs.compactMap { id in try? String.fetchOne(db, sql: "SELECT text FROM transcript WHERE id=?", arguments: [id]) }.compactMap { $0 }))
+        let knownThreads = Set(transcriptThreads.values)
+        for node in nodes where !closure.nodeIDs.contains(node.id) {
+            guard !attributedOutsideGrant(node, knownThreads: knownThreads),
+                  contains(Self.normalizedContent(node.label + " " + node.body), closure.withdrawnTexts) else { continue }
+            closure.nodeIDs.insert(node.id)
+        }
+
         // A conclusion that loses any of its grounding is no longer supported by what remains.
         let derived = try Edge.filter(Column("relation") == Relation.derivesFrom.rawValue).fetchAll(db)
         changed = true
@@ -287,11 +410,31 @@ extension BrainStore {
     }
 
     private func declaresSubject(_ node: Node, in subjects: Set<String>) -> Bool {
-        guard !subjects.isEmpty, let data = node.extra?.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-        return ["subject", "subjectId", "subjectID"].contains { key in
-            (object[key] as? String).map { subjects.contains($0) } ?? false
-        }
+        guard !subjects.isEmpty else { return false }
+        return subjectsDeclared(by: node).contains { subjects.contains($0) }
+    }
+
+    private func subjectsDeclared(by node: Node) -> Set<String> {
+        guard let data = node.extra?.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        return Set(["subject", "subjectId", "subjectID"].compactMap { object[$0] as? String })
+    }
+
+    /// True when the row names a thread or a subject the principal does not hold. A row with no
+    /// declared attribution is unattributed, not foreign, and stays reachable by the backstop.
+    private func attributedOutsideGrant(_ node: Node, knownThreads: Set<String>) -> Bool {
+        let subjects = subjectsDeclared(by: node)
+        if !subjects.isEmpty, !subjects.isSubset(of: authorization.subjects) { return true }
+        if let sourceRef = node.sourceRef, knownThreads.contains(sourceRef),
+           !authorization.threads.contains(sourceRef) { return true }
+        if let thread = summaryThread(node), !authorization.threads.contains(thread) { return true }
+        return false
+    }
+
+    private func summaryThread(_ node: Node) -> String? {
+        guard node.kind == NodeKind.summary.rawValue, let data = node.extra?.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return object["threadId"] as? String
     }
 
     private func summaryCovers(_ node: Node, purgedSeqs: [String: Set<Int>], threads: Set<String>) -> Bool {
@@ -307,6 +450,25 @@ extension BrainStore {
     // MARK: Purge
 
     private func purge(_ closure: BrainRetractionClosure, db: Database, revision: Int64) throws {
+        // Markers are fingerprinted from the rows as they stand, before anything is deleted.
+        var markers = Set<BrainExclusionMarker>()
+        for id in closure.nodeIDs {
+            guard let node = try Node.fetchOne(db, key: id), Self.isMarkable(node) else { continue }
+            markers.insert(.init(kind: .node, id: id, fingerprint: Self.nodeFingerprint(node)))
+        }
+        for id in closure.transcriptIDs {
+            guard let text = try String.fetchOne(db, sql: "SELECT text FROM transcript WHERE id=?", arguments: [id]) else { continue }
+            markers.insert(.init(kind: .transcript, id: id, fingerprint: Self.transcriptFingerprint(text)))
+        }
+        for id in closure.evidenceIDs {
+            guard let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_evidence WHERE id=?", arguments: [id]) else { continue }
+            markers.insert(.init(kind: .evidence, id: id, fingerprint: Self.evidenceFingerprint(payload)))
+        }
+        for id in closure.claimIDs {
+            guard let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_claim WHERE id=?", arguments: [id]) else { continue }
+            markers.insert(.init(kind: .claim, id: id, fingerprint: Self.claimFingerprint(payload: payload)))
+        }
+
         if closure.purgeEverything {
             // Personal-memory artifacts only. Encrypted connection-service credentials, service
             // and model configuration are not memory and are never erased by a memory scope.
@@ -342,11 +504,9 @@ extension BrainStore {
             try purgeJournals(closure, db: db)
             try scrubSurvivors(closure, db: db)
         }
-        for (kind, ids) in closure.identifiers {
-            for id in ids {
-                try db.execute(sql: "INSERT OR IGNORE INTO brain_exclusion(kind, id, revision, owner) VALUES (?, ?, ?, ?)",
-                               arguments: [kind.rawValue, id, revision, authorization.owner])
-            }
+        for marker in markers {
+            try db.execute(sql: "INSERT OR IGNORE INTO brain_exclusion(kind, id, fingerprint, revision, owner) VALUES (?, ?, ?, ?, ?)",
+                           arguments: [marker.kind.rawValue, marker.id, marker.fingerprint, revision, authorization.owner])
         }
     }
 

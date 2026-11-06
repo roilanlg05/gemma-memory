@@ -198,11 +198,24 @@ public final class MemoryStore: @unchecked Sendable {
         }
         m.registerMigration("v12-brain-retraction") { db in
             // `brain_exclusion` holds identifiers only — never withdrawn content — so a restored
-            // backup can be scrubbed by id without the store retaining what it erased.
+            // backup can be scrubbed without the store retaining what it erased.
             // `brain_forget_operations` is the idempotency journal, same shape as brain_commit.
             try db.execute(sql: """
                 CREATE TABLE brain_exclusion (kind TEXT NOT NULL, id TEXT NOT NULL, revision INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind, id));
                 CREATE TABLE brain_forget_operations (principal TEXT NOT NULL, operation TEXT NOT NULL, scope TEXT NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(principal, operation));
+                """)
+        }
+        m.registerMigration("v13-brain-exclusion-content") { db in
+            // An exclusion keyed on the row id alone refuses every later write to that id, which
+            // permanently bricks the deterministic ones (`self:user`, `hub:*`) and makes an
+            // evidence correction under the original id impossible. Markers are re-keyed on
+            // (kind, id, fingerprint) so only the withdrawn *content* is barred from returning.
+            // A fingerprint is a one-way digest, so the table still holds no content. The old
+            // table is replaced rather than altered because SQLite cannot widen a primary key;
+            // v12 shipped in this same unreleased branch and no deployment ever held a row.
+            try db.execute(sql: """
+                DROP TABLE brain_exclusion;
+                CREATE TABLE brain_exclusion (kind TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL, revision INTEGER NOT NULL, owner TEXT NOT NULL, PRIMARY KEY(kind, id, fingerprint));
                 """)
         }
         return m
@@ -213,8 +226,13 @@ public final class MemoryStore: @unchecked Sendable {
         try dbQueue.write { db in
             let managed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_projection WHERE node_id=? UNION ALL SELECT 1 FROM brain_legacy_binding WHERE node_id=?)", arguments: [node.id, node.id]) ?? false
             guard !managed else { throw BrainStoreError.denied }
-            // A retracted node stays retracted: a stale client or backup cannot write it back.
-            guard !(try BrainStore.isExcluded(db, kind: .node, id: node.id)) else { throw BrainStoreError.denied }
+            // Retracted content stays retracted: a stale client or backup cannot write the same
+            // body back under the same id. A different body under that id is a new record, so the
+            // deterministic ids (self:user, hub:*) stay writable after a retraction.
+            guard !(try BrainStore.isExcluded(db, kind: .node, id: node.id,
+                                              fingerprint: BrainStore.nodeFingerprint(node))) else {
+                throw BrainStoreError.denied
+            }
             try node.save(db)
             try db.execute(sql: "DELETE FROM node_fts WHERE node_id = ?", arguments: [node.id])
             if node.deleted {

@@ -64,8 +64,8 @@ final class BrainRetractionTests: XCTestCase {
     /// that reproduces the withdrawn sentence verbatim, a surviving node whose merge conflict
     /// holds the withdrawn sentence, and a wholly unrelated preference.
     @discardableResult
-    func seed(_ db: MemoryStore) throws -> BrainRetractionService {
-        let brain = BrainStore(store: db, authorization: authorization(), clock: { 100 })
+    func seed(_ db: MemoryStore, threads: Set<String> = ["thread-1"]) throws -> BrainRetractionService {
+        let brain = BrainStore(store: db, authorization: authorization(threads: threads), clock: { 100 })
         XCTAssertEqual(
             try brain.commit(commitRequest("seed", claim(), 0, evidence: [evidence()])).disposition,
             .committed)
@@ -300,6 +300,10 @@ final class BrainRetractionTests: XCTestCase {
     func testApplyExclusionsScrubsRestoredRowsBeforeReads() throws {
         let db = try MemoryStore(inMemory: true, embeddingDim: 4)
         let service = try seed(db)
+        // Captured before the purge so the restore replays the row byte for byte, as a backup would.
+        let evidencePayload = try XCTUnwrap(db.dbQueue.read {
+            try String.fetchOne($0, sql: "SELECT payload FROM brain_evidence WHERE id='e1'")
+        })
         let receipt = try service.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
                                          expectedRevision: 1, operationID: "forget")
 
@@ -315,7 +319,7 @@ final class BrainRetractionTests: XCTestCase {
             try db.execute(sql: "INSERT INTO node_fts(node_id, label, body) VALUES ('legacy-1', 'Home', ?)",
                            arguments: [withdrawn])
             try db.execute(sql: "INSERT INTO brain_evidence(id, payload) VALUES ('e1', ?)",
-                           arguments: [#"{"accessScope":"user","id":"e1","observedAt":10,"recordedAt":11,"sourceKind":"userMessage","speakerID":"self:user","text":"\#(withdrawn)","threadID":"thread-1"}"#])
+                           arguments: [evidencePayload])
         }
         XCTAssertFalse(try db.searchFTS(query: "Miami", limit: 20).isEmpty, "precondition: the restore re-exposed it")
 
@@ -376,6 +380,170 @@ final class BrainRetractionTests: XCTestCase {
         // Credentials and configuration are not personal-memory artifacts.
         XCTAssertEqual(try connections.load(id: "amazon-atoz")?.payloadJSON, #"{"cookie":"session-123"}"#)
         XCTAssertEqual(try models.load()?.model, "gemma")
+    }
+
+    // MARK: The store stays usable after a retraction
+
+    func testStoreStaysWritableAfterForgetAll() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let service = try seed(db)
+        try db.upsertSelf(name: "Roilan", detail: "the user", now: 50)
+        try db.ensureKindHubs(now: 50)
+
+        _ = try service.forget(scope: BrainForgetScope(kind: .all),
+                               expectedRevision: 1, operationID: "forget-all")
+        XCTAssertNil(try db.selfNode())
+
+        // The singleton identity and the kind hubs use deterministic ids the brain reuses by
+        // design, so "forget everything" must not brick their write paths.
+        XCTAssertNoThrow(try db.upsertSelf(name: "Roilan", detail: "the user", now: 60))
+        XCTAssertNotNil(try db.selfNode())
+        XCTAssertGreaterThan(try db.ensureKindHubs(now: 60), 0)
+        XCTAssertNoThrow(try db.upsert(node("fresh", kind: .fact, label: "Fresh", body: "A new fact")))
+    }
+
+    func testCorrectedEvidenceMayReuseTheWithdrawnIdentifier() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let service = try seed(db)
+        _ = try service.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                               expectedRevision: 1, operationID: "forget")
+        let brain = BrainStore(store: db, authorization: authorization(), clock: { 100 })
+
+        // Replaying the withdrawn record byte for byte is reingestion.
+        XCTAssertThrowsError(try brain.recordEvidence(evidence(), idempotencyKey: "replay")) {
+            XCTAssertEqual($0 as? BrainStoreError, .denied)
+        }
+        // Correcting it under the same id is a different record, which the brief names explicitly.
+        let corrected = evidence("e1", text: "Correction: I now live in Havana with Ana")
+        XCTAssertEqual(try brain.recordEvidence(corrected, idempotencyKey: "corrected"), corrected)
+    }
+
+    // MARK: Unreadable source rows
+
+    func testUndecodableClaimPayloadIsSweptByContent() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let service = try seed(db)
+        try db.dbQueue.write { db in
+            try db.execute(sql: "INSERT INTO brain_claim(id, subject, predicate, revision, payload) VALUES ('opaque', 'self:user', 'home', 1, ?)",
+                           arguments: [#"{"schemaVersion":99,"legacy":"\#(withdrawn)"}"#])
+        }
+
+        _ = try service.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                               expectedRevision: 1, operationID: "forget")
+        for payload in try texts(db, table: "brain_claim", column: "payload") {
+            XCTAssertFalse(payload.contains("Miami"), "an unreadable claim payload still holds the value verbatim")
+        }
+        XCTAssertTrue(try texts(db, table: "brain_claim", column: "id").isEmpty)
+    }
+
+    func testUnreadableClaimPayloadStandsDownTheOrphanRule() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let auth = authorization(subjects: ["self:user", "self:agent"])
+        let brain = BrainStore(store: db, authorization: auth, clock: { 100 })
+        XCTAssertEqual(try brain.commit(commitRequest("one", claim(), 0, evidence: [evidence()])).disposition, .committed)
+        XCTAssertEqual(try brain.commit(commitRequest("two", claim("c2", subject: "self:agent",
+                                                                  predicate: "tone", value: "warm"), 1)).disposition, .committed)
+        try db.dbQueue.write { db in
+            try db.execute(sql: "INSERT INTO brain_claim(id, subject, predicate, revision, payload) VALUES ('opaque', 'self:user', 'mood', 1, ?)",
+                           arguments: [#"{"schemaVersion":99,"legacy":"nothing withdrawn here"}"#])
+        }
+        let service = BrainRetractionService(brain: brain)
+
+        _ = try service.forget(scope: BrainForgetScope(kind: .subject, id: "self:user"),
+                               expectedRevision: 2, operationID: "a")
+        _ = try service.forget(scope: BrainForgetScope(kind: .subject, id: "self:agent"),
+                               expectedRevision: 3, operationID: "b")
+        // With a claim whose support set cannot be read, no source can be proven orphaned, so the
+        // rule stands down rather than erasing evidence that claim may still need.
+        XCTAssertEqual(try texts(db, table: "brain_evidence", column: "id"), ["e1"])
+    }
+
+    // MARK: Bounds of the cascade
+
+    /// A withdrawn source body repeated verbatim in another thread is the same content, and
+    /// leaving it would let `/v1/transcript/range` serve it and a later consolidation pass mint a
+    /// fresh node from it.
+    func testProvenanceLinkedTurnsFollowTheSourceAcrossThreads() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let service = try seed(db, threads: ["thread-1", "thread-2"])
+        let transcript = TranscriptStore(dbQueue: db.dbQueue)
+        try transcript.append(threadId: "thread-2", turnIndex: 1, role: "user", text: withdrawn, now: 14)
+
+        _ = try service.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                               expectedRevision: 1, operationID: "forget")
+        XCTAssertFalse(try transcript.allRecent(limit: 50).contains { $0.text.contains("Miami") })
+        XCTAssertEqual(try transcript.range(threadId: "thread-2", from: 1, to: 80).map(\.text), [surviving])
+        XCTAssertNotNil(try db.node(id: "unrelated-1"))
+    }
+
+    func testCascadeBeyondTheGrantIsDeniedRatherThanPartial() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let service = try seed(db)
+        let transcript = TranscriptStore(dbQueue: db.dbQueue)
+        try transcript.append(threadId: "thread-2", turnIndex: 1, role: "user", text: withdrawn, now: 14)
+
+        XCTAssertThrowsError(try service.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                                                expectedRevision: 1, operationID: "forget")) {
+            XCTAssertEqual($0 as? BrainStoreError, .denied)
+        }
+        // Refused, not half-done: the granted thread's turn is still there too.
+        XCTAssertEqual(try transcript.allRecent(limit: 50).filter { $0.text.contains("Miami") }.count, 2)
+        XCTAssertEqual(try BrainStore(store: db, authorization: authorization()).revision(), 1)
+        XCTAssertNotNil(try db.node(id: "legacy-1"))
+    }
+
+    func testSubjectScopeWithoutThreadGrantIsDenied() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        try seed(db)
+        let threadless = BrainRetractionService(brain: BrainStore(
+            store: db, authorization: authorization(threads: []), clock: { 100 }))
+
+        XCTAssertThrowsError(try threadless.forget(scope: BrainForgetScope(kind: .subject, id: "self:user"),
+                                                   expectedRevision: 1, operationID: "forget")) {
+            XCTAssertEqual($0 as? BrainStoreError, .denied)
+        }
+        XCTAssertEqual(try TranscriptStore(dbQueue: db.dbQueue)
+            .range(threadId: "thread-1", from: 1, to: 80).count, 3)
+        XCTAssertFalse(try texts(db, table: "brain_evidence", column: "id").isEmpty)
+    }
+
+    func testContentBackstopSkipsRowsAttributedOutsideTheGrant() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let service = try seed(db)
+        try db.upsert(node("foreign", kind: .fact, label: "Home", body: withdrawn, sourceRef: "thread-2"))
+
+        _ = try service.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                               expectedRevision: 1, operationID: "forget")
+        // Content similarity alone never reaches a row that declares a thread the principal does
+        // not hold; only its own thread's retraction may remove it.
+        XCTAssertNotNil(try db.node(id: "foreign"))
+        XCTAssertNil(try db.node(id: "legacy-1"), "an unattributed row is still swept")
+    }
+
+    func testApplyExclusionsRejectsReceiptsItDidNotIssue() throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let service = try seed(db)
+        let receipt = try service.forget(scope: BrainForgetScope(kind: .evidence, id: "e1"),
+                                         expectedRevision: 1, operationID: "forget")
+        func assertDenied(_ forged: BrainForgetReceipt) {
+            XCTAssertThrowsError(try service.applyExclusions([forged])) {
+                XCTAssertEqual($0 as? BrainStoreError, .denied)
+            }
+        }
+        func rewrite(operation: String, affected: [String]?) -> BrainForgetReceipt {
+            BrainForgetReceipt(clientOperationID: operation, scope: receipt.scope, state: receipt.state,
+                               revision: receipt.revision, forgottenEvidenceIDs: receipt.forgottenEvidenceIDs,
+                               forgottenClaimIDs: receipt.forgottenClaimIDs, affectedIDs: affected,
+                               sourceEvidenceIDs: receipt.sourceEvidenceIDs)
+        }
+        assertDenied(rewrite(operation: "never-issued", affected: receipt.affectedIDs))
+        assertDenied(rewrite(operation: "forget", affected: ["unrelated-1"]))
+        XCTAssertNotNil(try db.node(id: "unrelated-1"))
+
+        // A row that legitimately reuses a retracted id with new content is not the withdrawn row.
+        try db.upsert(node("legacy-1", kind: .fact, label: "Home", body: "Somewhere else entirely"))
+        try service.applyExclusions([receipt])
+        XCTAssertEqual(try db.node(id: "legacy-1")?.body, "Somewhere else entirely")
     }
 
     func testSalienceDecayIsNotRetraction() throws {
