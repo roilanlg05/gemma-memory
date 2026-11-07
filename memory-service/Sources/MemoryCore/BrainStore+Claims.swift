@@ -99,6 +99,7 @@ extension BrainStore {
             let mayPublish = authorization.mayProject && authorization.scopes.contains(.user)
             try reconcile(db: db, now: clock(), claimIDs: affected, mayPublish: mayPublish)
             try db.execute(sql: "UPDATE brain_meta SET revision=? WHERE id=1", arguments: [next])
+            try invalidateConversationCorrections(request.updates, db: db)
             let result = BrainCommitResult(clientOperationID: request.clientOperationID, state: .committed, revision: next, claimIDs: ids, disposition: .committed)
             try db.execute(sql: "INSERT INTO brain_commit VALUES (?, ?, ?, ?)", arguments: [authorization.principal, request.clientOperationID, payload, try Self.encode(result)])
             try didCommit(db, result)

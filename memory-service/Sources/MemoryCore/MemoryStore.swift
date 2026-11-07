@@ -298,6 +298,20 @@ public final class MemoryStore: @unchecked Sendable {
                 );
                 """)
         }
+        m.registerMigration("v18-conversation-state") { db in
+            try db.execute(sql: """
+                CREATE TABLE brain_conversation_segment (
+                    id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL, payload TEXT NOT NULL
+                );
+                CREATE INDEX brain_conversation_thread ON brain_conversation_segment(thread_id);
+                CREATE TABLE brain_conversation_source (
+                    segment_id TEXT NOT NULL REFERENCES brain_conversation_segment(id) ON DELETE CASCADE,
+                    evidence_id TEXT NOT NULL, transcript_id TEXT, fingerprint TEXT NOT NULL,
+                    PRIMARY KEY(segment_id, evidence_id)
+                );
+                """)
+        }
         return m
     }
 

@@ -48,18 +48,56 @@ public struct BrainContextBundle: Codable, Equatable, Sendable {
     public let sourceReferences: [BrainEvidence]
     public let revision: Int64
     public let policyRevision: Int64
+    public let accounting: BrainContextAccounting?
+    public let truncations: [BrainContextTruncation]?
 
     public init(
         renderedContext: String,
         recentMessageUnits: [BrainMessageUnit],
         sourceReferences: [BrainEvidence],
         revision: Int64,
-        policyRevision: Int64
+        policyRevision: Int64,
+        accounting: BrainContextAccounting? = nil,
+        truncations: [BrainContextTruncation]? = nil
     ) {
         self.renderedContext = renderedContext
         self.recentMessageUnits = recentMessageUnits
         self.sourceReferences = sourceReferences
         self.revision = revision
         self.policyRevision = policyRevision
+        self.accounting = accounting
+        self.truncations = truncations
+    }
+}
+
+/// Conservative input estimate includes the serialized bundle, query and framing. Provider
+/// integrations must reserve their actual system/tool capacity and output separately.
+public struct BrainContextAccounting: Codable, Equatable, Sendable {
+    public let estimatedInputTokens: Int
+    public let reservedOutputTokens: Int
+    public let reservedSystemTokens: Int
+    public let reservedToolTokens: Int
+    public let totalWindowTokens: Int
+    public init(estimatedInputTokens: Int, reservedOutputTokens: Int, reservedSystemTokens: Int,
+                reservedToolTokens: Int, totalWindowTokens: Int) {
+        self.estimatedInputTokens = estimatedInputTokens
+        self.reservedOutputTokens = reservedOutputTokens
+        self.reservedSystemTokens = reservedSystemTokens
+        self.reservedToolTokens = reservedToolTokens
+        self.totalWindowTokens = totalWindowTokens
+    }
+}
+
+/// Byte counts refer to an original source. A partial recent unit is never a full exact quote.
+public struct BrainContextTruncation: Codable, Equatable, Sendable {
+    public let evidenceID: String
+    public let originalUTF8Bytes: Int
+    public let includedUTF8Bytes: Int
+    public let reason: String
+    public init(evidenceID: String, originalUTF8Bytes: Int, includedUTF8Bytes: Int, reason: String) {
+        self.evidenceID = evidenceID
+        self.originalUTF8Bytes = originalUTF8Bytes
+        self.includedUTF8Bytes = includedUTF8Bytes
+        self.reason = reason
     }
 }

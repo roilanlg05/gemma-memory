@@ -208,7 +208,13 @@ extension BrainStore {
         case .subject:
             guard authorization.subjects.contains(target) else { throw BrainStoreError.denied }
         case .evidence:
-            let evidence = try loadEvidence(target, db: db)
+            let evidence: BrainEvidence
+            if let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_evidence WHERE id=?", arguments: [target]) {
+                // Neither a corrupt record nor a denied persisted scope may use the fallback.
+                evidence = try Self.decode(BrainEvidence.self, payload)
+            } else if let original = try conversationOriginal(target, db: db) {
+                evidence = original
+            } else { throw BrainStoreError.invalid }
             guard canRead(evidence), authorization.threads.contains(evidence.threadID) else { throw BrainStoreError.denied }
         case .claim:
             guard let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_claim WHERE id=?", arguments: [target]) else {
@@ -246,6 +252,10 @@ extension BrainStore {
             let id: String = row["id"], payload: String = row["payload"]
             if let decoded = try? Self.decode(BrainEvidence.self, payload) { evidence[id] = decoded }
             else { opaqueEvidence[id] = payload }
+        }
+        if kind == .evidence, evidence[target] == nil, opaqueEvidence[target] == nil,
+           let original = try conversationOriginal(target, db: db) {
+            evidence[target] = original
         }
         let sourceIDs = Set(evidence.keys).union(opaqueEvidence.keys)
         var claims = [String: BrainClaim]()
@@ -352,7 +362,8 @@ extension BrainStore {
             transcriptThreads[row.id] = row.threadId
             let withdrawnThread = closure.purgeEverything || closure.threadIDs.contains(row.threadId)
             let carriesSource = contains(Self.normalizedContent(row.text), sourceTexts)
-            guard withdrawnThread || carriesSource || closure.transcriptIDs.contains(row.id) else { continue }
+            let exactOriginal = closure.evidenceIDs.contains(ConsolidationEvidenceAdapter.evidenceID(for: row))
+            guard withdrawnThread || carriesSource || exactOriginal || closure.transcriptIDs.contains(row.id) else { continue }
             closure.transcriptIDs.insert(row.id)
             purgedSeqs[row.threadId, default: []].insert(row.seq)
         }
@@ -495,6 +506,9 @@ extension BrainStore {
         var closure = closure
         _ = try expandTurnClosure(&closure, db: db)
         try purgeTurnJournals(closure, db: db)
+        try Self.invalidateConversationState(evidenceIDs: closure.evidenceIDs, transcriptIDs: closure.transcriptIDs,
+                                             threadIDs: closure.threadIDs,
+                                             all: closure.purgeEverything || closure.subjectIDs.contains("self:user"), db: db)
         // Markers are fingerprinted from the rows as they stand, before anything is deleted.
         var markers = Set<BrainExclusionMarker>()
         for id in closure.nodeIDs {

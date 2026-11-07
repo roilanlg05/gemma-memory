@@ -8,19 +8,22 @@ public struct BrainMessageUnit: Codable, Equatable, Sendable {
     public let text: String
     public let observedAt: Double
     public let evidenceIDs: [String]
+    public let groupID: String?
 
     public init(
         id: String,
         speakerID: String,
         text: String,
         observedAt: Double,
-        evidenceIDs: [String]
+        evidenceIDs: [String],
+        groupID: String? = nil
     ) {
         self.id = id
         self.speakerID = speakerID
         self.text = text
         self.observedAt = observedAt
         self.evidenceIDs = evidenceIDs
+        self.groupID = groupID
     }
 }
 
