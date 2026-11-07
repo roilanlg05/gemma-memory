@@ -140,6 +140,22 @@ public final class BrainContextAssembler {
         guard try fits(draft, request: request, revision: snapshot.revision) else {
             throw BrainContextAssemblyError.insufficientBudget
         }
+        // The agent's identity gets its own section and its own slice of the input capacity. It
+        // goes in before any conversation content, so sheer conversation volume cannot evict who
+        // the assistant is, and after the mandatory omission notices, so the identity cannot take
+        // the space an original's disclosure is owed. Its own slice is a quarter of what is left,
+        // which keeps it from evicting the conversation either. It is never folded in with user
+        // memories: a `[memory]` block is something the user told the brain, an `[agent ...]`
+        // block is not, and a reader must be able to tell which is which.
+        if let identity = snapshot.identity {
+            for evidence in snapshot.identityEvidence { available[evidence.id] = evidence }
+            let identityIDs = snapshot.identityEvidence.map(\.id)
+            let base = try estimatedInput(draft, request: request, revision: snapshot.revision)
+            let identityLimit = base + max(0, (capacity(request.budget) - base) / 4)
+            for block in Self.identityBlocks(identity, sourceIDs: identityIDs) {
+                try add(block: block, ids: identityIDs, maximumInput: identityLimit)
+            }
+        }
         for id in selected {
             guard let text = originals[id]?.text else { throw BrainStoreError.invalid }
             let label = quotes.contains(id) ? "original quote" : "original detail"
@@ -212,6 +228,31 @@ public final class BrainContextAssembler {
         let estimate = try estimatedInput(draft, request: request, revision: snapshot.revision)
         guard estimate <= capacity(request.budget) else { throw BrainContextAssemblyError.insufficientBudget }
         return bundle(draft, request: request, revision: snapshot.revision, estimate: estimate)
+    }
+    /// The agent identity as its own ordered blocks, most load-bearing first: who it is, what it
+    /// works by, what it must not claim about itself, how it was configured to come across, what
+    /// this installation can actually do, and then the few most recent things that actually
+    /// happened. Each block is added only if it fits whole — an experience is never rendered as a
+    /// prefix, because a half-quoted utterance of its own is exactly the kind of thing an assistant
+    /// should not be left to complete from memory.
+    private static func identityBlocks(_ identity: BrainIdentity, sourceIDs: [String]) -> [String] {
+        guard let profile = identity.agentProfile else { return [] }
+        let sources = sourceIDs.isEmpty ? "" : "\nsources=" + sourceIDs.joined(separator: ",")
+        var blocks = ["[agent identity]\nname=\(identity.displayName)\nnature=\(profile.core.nature)\(sources)"]
+        blocks.append("[agent values]\n" + profile.core.values.joined(separator: "\n"))
+        blocks.append("[agent boundaries]\n" + profile.core.boundaries.joined(separator: "\n"))
+        let character = profile.character
+        blocks.append("[agent character]\nhumor=\(character.humor.rawValue)\npace=\(character.pace.rawValue)\nformality=\(character.formality.rawValue)\nverbosity=\(character.verbosity.rawValue)")
+        if !profile.capabilityAddenda.isEmpty {
+            blocks.append("[agent capabilities]\n" + profile.capabilityAddenda.joined(separator: "\n"))
+        }
+        for entry in profile.autobiography.suffix(3) {
+            let header = "[agent experience \(entry.qualification.rawValue)"
+                + (entry.status.map { " status=\($0.rawValue)" } ?? "")
+                + " sources=\(entry.evidenceIDs.joined(separator: ","))]"
+            blocks.append(header + "\n" + (entry.redacted ? "(text withheld)" : entry.text))
+        }
+        return blocks
     }
     private static func prefix(_ text: String, maximumUTF8Bytes: Int) -> String {
         var result = "", count = 0

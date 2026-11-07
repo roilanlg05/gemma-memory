@@ -312,6 +312,44 @@ public final class MemoryStore: @unchecked Sendable {
                 );
                 """)
         }
+        m.registerMigration("v19-agent-identity") { db in
+            // The agent's identity core is an operation store of its own, separate from claims.
+            //
+            // `brain_identity_revision` holds the personal part — a custom display name, a typed
+            // character — as an append-only series of deltas stamped with the brain revision that
+            // minted them, the revision they descend from and the identity generation they belong
+            // to. `brain_identity_source` is the complete support set of each revision, so a
+            // withdrawn source takes its revision and that revision's descendants with it.
+            //
+            // `brain_identity_operation` is the idempotency journal, same shape as the turn
+            // journal: a hashed operation key, the request fingerprint and the stored result. On
+            // erasure the fingerprint and the result are nulled and `withdrawn` is set, leaving a
+            // row that holds no payload but still refuses a replay of the withdrawn operation ID.
+            //
+            // `brain_identity_meta.generation` is bumped whenever a retraction clears custom
+            // history, so a revision row restored from a stale backup belongs to a dead generation
+            // and can neither be read as current nor be the target of a revert.
+            try db.execute(sql: """
+                CREATE TABLE brain_identity_meta (id INTEGER PRIMARY KEY CHECK (id=1), generation INTEGER NOT NULL);
+                INSERT INTO brain_identity_meta VALUES (1, 0);
+                CREATE TABLE brain_identity_revision (
+                    agent_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                    generation INTEGER NOT NULL, parent_revision INTEGER,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY(agent_id, revision)
+                );
+                CREATE TABLE brain_identity_source (
+                    agent_id TEXT NOT NULL, revision INTEGER NOT NULL, evidence_id TEXT NOT NULL,
+                    PRIMARY KEY(agent_id, revision, evidence_id)
+                );
+                CREATE TABLE brain_identity_operation (
+                    principal TEXT NOT NULL, operation_hash TEXT NOT NULL,
+                    request_hash TEXT, result TEXT, withdrawn BOOLEAN NOT NULL DEFAULT 0,
+                    agent_id TEXT, revision INTEGER,
+                    PRIMARY KEY(principal, operation_hash)
+                );
+                """)
+        }
         return m
     }
 

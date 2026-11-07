@@ -117,18 +117,27 @@ extension BrainStore {
         guard asOf.isFinite, knownAtRevision.map({ $0 >= 0 }) ?? true else { throw BrainStoreError.invalid }
         return try store.dbQueue.read { db in
             try checkOwner(db, bind: false)
-            let known: Int64
-            if let knownAtRevision { known = knownAtRevision } else { known = try Self.revision(db) }
-            let payloads = try String.fetchAll(db, sql: "SELECT payload FROM brain_claim WHERE subject=? AND revision<=? ORDER BY revision, id", arguments: [subject, known])
-            var visible = [BrainClaim]()
-            for payload in payloads {
-                let claim = try Self.decode(BrainClaim.self, payload)
-                let sources = try claim.evidenceIDs.map { try loadEvidence($0, db: db) }
-                guard sources.allSatisfy({ $0.accessScope == scope && canRead($0) }), claim.validFrom <= asOf else { continue }
-                visible.append(claim)
-            }
-            let superseded = Set(visible.compactMap(\.supersedesID))
-            return visible.filter { $0.status == .active && !superseded.contains($0.id) && ($0.validTo.map { asOf < $0 } ?? true) }
+            return try claims(subject: subject, asOf: asOf, scope: scope, knownAtRevision: knownAtRevision, db: db)
         }
+    }
+    /// The same query inside a transaction a caller already opened, for readers that must see the
+    /// claim store and their own derived rows in one consistent snapshot. The caller has already
+    /// verified the owner binding; access to the subject and scope is still checked here.
+    func claims(subject: String, asOf: Double, scope: BrainAccessScope, knownAtRevision: Int64? = nil,
+                db: Database) throws -> [BrainClaim] {
+        try requireAccess(subject: subject, scope: scope)
+        guard asOf.isFinite, knownAtRevision.map({ $0 >= 0 }) ?? true else { throw BrainStoreError.invalid }
+        let known: Int64
+        if let knownAtRevision { known = knownAtRevision } else { known = try Self.revision(db) }
+        let payloads = try String.fetchAll(db, sql: "SELECT payload FROM brain_claim WHERE subject=? AND revision<=? ORDER BY revision, id", arguments: [subject, known])
+        var visible = [BrainClaim]()
+        for payload in payloads {
+            let claim = try Self.decode(BrainClaim.self, payload)
+            let sources = try claim.evidenceIDs.map { try loadEvidence($0, db: db) }
+            guard sources.allSatisfy({ $0.accessScope == scope && canRead($0) }), claim.validFrom <= asOf else { continue }
+            visible.append(claim)
+        }
+        let superseded = Set(visible.compactMap(\.supersedesID))
+        return visible.filter { $0.status == .active && !superseded.contains($0.id) && ($0.validTo.map { asOf < $0 } ?? true) }
     }
 }

@@ -506,6 +506,7 @@ extension BrainStore {
         var closure = closure
         _ = try expandTurnClosure(&closure, db: db)
         try purgeTurnJournals(closure, db: db)
+        try purgeIdentityJournals(closure, db: db)
         try Self.invalidateConversationState(evidenceIDs: closure.evidenceIDs, transcriptIDs: closure.transcriptIDs,
                                              threadIDs: closure.threadIDs,
                                              all: closure.purgeEverything || closure.subjectIDs.contains("self:user"), db: db)

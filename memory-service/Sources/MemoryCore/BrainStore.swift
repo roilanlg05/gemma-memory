@@ -19,14 +19,20 @@ public struct BrainAuthorization: Sendable {
     /// Erasure is its own capability. A read grant, a projection grant or `mayCommitClaims`
     /// never escalates into forgetting, so this defaults to false (default-deny).
     public let mayForget: Bool
+    /// Revising the agent's identity core is its own capability too, and for the same reason:
+    /// `mayCommitClaims` lets extracted and recalled claims be written, and if that grant also
+    /// reached the identity then any quoted page or model proposal routed through a commit could
+    /// rewrite who the assistant is. Default-deny, so only a caller explicitly configuring the
+    /// character holds it.
+    public let mayReviseIdentity: Bool
     public let subjects: Set<String>
     public let scopes: Set<BrainAccessScope>
     public let threads: Set<String>
     public let sourceSpeakers: [BrainSourceKind: Set<String>]
     public let mayProject: Bool
     public let legacyBindings: [BrainLegacyBinding]
-    public init(principal: String, owner: String, subjects: Set<String>, scopes: Set<BrainAccessScope>, threads: Set<String>, sourceSpeakers: [BrainSourceKind: Set<String>], mayProject: Bool = false, legacyBindings: [BrainLegacyBinding] = [], allowDelegated: Bool = false, mayCommitClaims: Bool = false, mayForget: Bool = false) {
-        self.principal = principal; self.owner = owner; self.allowDelegated = allowDelegated; self.mayCommitClaims = mayCommitClaims; self.mayForget = mayForget; self.subjects = subjects
+    public init(principal: String, owner: String, subjects: Set<String>, scopes: Set<BrainAccessScope>, threads: Set<String>, sourceSpeakers: [BrainSourceKind: Set<String>], mayProject: Bool = false, legacyBindings: [BrainLegacyBinding] = [], allowDelegated: Bool = false, mayCommitClaims: Bool = false, mayForget: Bool = false, mayReviseIdentity: Bool = false) {
+        self.principal = principal; self.owner = owner; self.allowDelegated = allowDelegated; self.mayCommitClaims = mayCommitClaims; self.mayForget = mayForget; self.mayReviseIdentity = mayReviseIdentity; self.subjects = subjects
         self.scopes = scopes; self.threads = threads; self.sourceSpeakers = sourceSpeakers
         self.mayProject = mayProject; self.legacyBindings = legacyBindings
     }
