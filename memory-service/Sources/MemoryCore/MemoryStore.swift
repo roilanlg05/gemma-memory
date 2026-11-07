@@ -350,6 +350,26 @@ public final class MemoryStore: @unchecked Sendable {
                 );
                 """)
         }
+        m.registerMigration("v20-agent-identity-generation") { db in
+            // The generation counter became per-agent. One global counter meant a forget that
+            // touched one agent's identity chain had to re-stamp every agent's surviving rows to
+            // keep them readable — and re-stamping rows a forget never named is indistinguishable,
+            // from the outside, from moving them. Keying the counter by agent lets a forget raise
+            // the floor for exactly the chain it reached and leave every other chain where it is.
+            //
+            // `brain_identity_meta.generation` stays, as the floor for an agent that has no row of
+            // its own yet, so an identity minted after a whole-store erasure cannot land in a dead
+            // generation. Existing agents are seeded from that same floor, which is the value their
+            // rows were already stamped with, so this migration changes no reachable state.
+            try db.execute(sql: """
+                CREATE TABLE brain_identity_generation (
+                    agent_id TEXT PRIMARY KEY, generation INTEGER NOT NULL
+                );
+                INSERT INTO brain_identity_generation(agent_id, generation)
+                    SELECT DISTINCT r.agent_id, (SELECT generation FROM brain_identity_meta WHERE id=1)
+                    FROM brain_identity_revision r;
+                """)
+        }
         return m
     }
 

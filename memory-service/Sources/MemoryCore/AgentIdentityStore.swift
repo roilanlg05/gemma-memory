@@ -77,14 +77,22 @@ final class AgentIdentityStore {
 
     // MARK: Reads
 
-    func generation(_ db: Database) throws -> Int64 {
-        try Int64.fetchOne(db, sql: "SELECT generation FROM brain_identity_meta WHERE id=1") ?? 0
+    /// The live generation for one agent. Its own row wins; the store-wide row in
+    /// `brain_identity_meta` is the floor for an agent that has never been purged, and for one
+    /// minted after a whole-store erasure. Reading it per agent is what keeps one agent's forget
+    /// from moving another agent's floor.
+    func generation(_ agentID: String, db: Database) throws -> Int64 {
+        if let own = try Int64.fetchOne(db, sql: "SELECT generation FROM brain_identity_generation WHERE agent_id=?",
+                                        arguments: [agentID]) {
+            return own
+        }
+        return try BrainStore.identityGenerationFloor(db)
     }
 
     /// The surviving revisions of the current generation, oldest first. The row's own `revision`
     /// column is authoritative; a payload that disagrees with it is not trusted.
     func history(_ agentID: String, db: Database) throws -> [BrainIdentityRevision] {
-        let generation = try self.generation(db)
+        let generation = try self.generation(agentID, db: db)
         var entries = [BrainIdentityRevision]()
         for row in try Row.fetchAll(db, sql: "SELECT revision, payload FROM brain_identity_revision WHERE agent_id=? AND generation=? ORDER BY revision",
                                     arguments: [agentID, generation]) {
@@ -158,7 +166,7 @@ final class AgentIdentityStore {
     func dependencies(agentID: String, db: Database) throws -> AgentIdentityDependencies {
         let history = try self.history(agentID, db: db)
         let state = Self.state(history)
-        return .init(generation: try generation(db),
+        return .init(generation: try generation(agentID, db: db),
                      revisions: history.map(\.revision),
                      evidenceIDs: Set(history.flatMap(\.evidenceIDs)).sorted(),
                      displayName: state.displayName ?? BrainAgentCore.gemma.name,
@@ -343,7 +351,7 @@ final class AgentIdentityStore {
             guard expectedRevision == current, current < Int64.max else { throw BrainStoreError.conflict }
             let next = current + 1
             let history = try self.history(agentID, db: db)
-            let generation = try self.generation(db)
+            let generation = try self.generation(agentID, db: db)
             _ = try authorizingSources(change.evidenceIDs, db: db)
             var evidenceIDs = [String]()
             var displayName: String?
@@ -434,25 +442,37 @@ extension BrainStore {
             rows.append(.init(agentID: agentID, revision: revision, parent: row["parent_revision"],
                               revertedTo: entry?.revertedToRevision, sources: sources))
         }
-        var removed = Set<Int64>()
+        // A revision number is only unique inside one agent's chain, so the closure is keyed by
+        // (agent, revision) throughout. Keying it by the number alone made a parent link in one
+        // chain withdraw the same-numbered revision in another, and deleted rows a forget had no
+        // business touching.
+        var removed = Set<String>()
+        func key(_ row: AgentIdentityRevisionRow) -> String {
+            agentIdentityRevisionKey(row.agentID, row.revision)
+        }
         if clearAll {
-            removed = Set(rows.map(\.revision))
+            removed = Set(rows.map(key))
         } else {
             var changed = true
             while changed {
                 changed = false
-                for row in rows where !removed.contains(row.revision) {
+                for row in rows where !removed.contains(key(row)) {
+                    let parentRemoved = row.parent.map {
+                        removed.contains(agentIdentityRevisionKey(row.agentID, $0))
+                    } == true
+                    let targetRemoved = row.revertedTo.map {
+                        removed.contains(agentIdentityRevisionKey(row.agentID, $0))
+                    } == true
                     guard !row.sources.isDisjoint(with: closure.evidenceIDs)
-                            || row.parent.map({ removed.contains($0) }) == true
-                            || row.revertedTo.map({ removed.contains($0) }) == true else { continue }
-                    removed.insert(row.revision); changed = true
+                            || parentRemoved || targetRemoved else { continue }
+                    removed.insert(key(row)); changed = true
                 }
             }
         }
         guard clearAll || !removed.isEmpty else { return }
-        var withdrawnRevisions = Set<String>()
-        for row in rows where removed.contains(row.revision) {
-            withdrawnRevisions.insert(agentIdentityRevisionKey(row.agentID, row.revision))
+        var touchedAgents = Set<String>()
+        for row in rows where removed.contains(key(row)) {
+            touchedAgents.insert(row.agentID)
             try db.execute(sql: "DELETE FROM brain_identity_source WHERE agent_id=? AND revision=?",
                            arguments: [row.agentID, row.revision])
             try db.execute(sql: "DELETE FROM brain_identity_revision WHERE agent_id=? AND revision=?",
@@ -462,7 +482,7 @@ extension BrainStore {
             let agentID: String? = row["agent_id"], revision: Int64? = row["revision"]
             var producedWithdrawnRevision = false
             if let agentID, let revision {
-                producedWithdrawnRevision = withdrawnRevisions.contains(agentIdentityRevisionKey(agentID, revision))
+                producedWithdrawnRevision = removed.contains(agentIdentityRevisionKey(agentID, revision))
             }
             guard clearAll || producedWithdrawnRevision else { continue }
             try db.execute(sql: "UPDATE brain_identity_operation SET withdrawn=1, request_hash=NULL, result=NULL, revision=NULL WHERE principal=? AND operation_hash=?",
@@ -474,12 +494,40 @@ extension BrainStore {
         // still live unreadable, which is a silent erasure far wider than the user asked for: a
         // forget of the one message that authorised a revert also took the name and the character
         // set from two other messages that were still there.
-        let generation = try Int64.fetchOne(db, sql: "SELECT generation FROM brain_identity_meta WHERE id=1") ?? 0
-        guard generation < Int64.max else { throw BrainStoreError.invalid }
-        if !clearAll {
-            try db.execute(sql: "UPDATE brain_identity_revision SET generation=? WHERE generation=?",
-                           arguments: [generation + 1, generation])
+        //
+        // Both halves are keyed by agent. A partial forget advances the floor for the chains it
+        // actually reached and re-stamps their survivors; a chain it never named keeps its own
+        // floor and its own stamps, and is readable afterwards without having been rewritten.
+        if clearAll {
+            // Whole-store erasure, or an erasure naming a reserved subject, raises one floor above
+            // every per-agent floor and drops the per-agent rows, so every agent — including one
+            // whose rows only exist in a stale backup — falls back to a generation nothing was
+            // ever stamped with.
+            let agentFloor = try Int64.fetchOne(db, sql: "SELECT MAX(generation) FROM brain_identity_generation") ?? 0
+            let floor = max(try BrainStore.identityGenerationFloor(db), agentFloor)
+            guard floor < Int64.max else { throw BrainStoreError.invalid }
+            try db.execute(sql: "DELETE FROM brain_identity_generation")
+            try db.execute(sql: "UPDATE brain_identity_meta SET generation=? WHERE id=1", arguments: [floor + 1])
+            return
         }
-        try db.execute(sql: "UPDATE brain_identity_meta SET generation=? WHERE id=1", arguments: [generation + 1])
+        let floor = try BrainStore.identityGenerationFloor(db)
+        for agentID in touchedAgents.sorted() {
+            let current = try Int64.fetchOne(db, sql: "SELECT generation FROM brain_identity_generation WHERE agent_id=?",
+                                             arguments: [agentID]) ?? floor
+            guard current < Int64.max else { throw BrainStoreError.invalid }
+            try db.execute(sql: """
+                INSERT INTO brain_identity_generation(agent_id, generation) VALUES (?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET generation=excluded.generation
+                """, arguments: [agentID, current + 1])
+            try db.execute(sql: "UPDATE brain_identity_revision SET generation=? WHERE agent_id=? AND generation=?",
+                           arguments: [current + 1, agentID, current])
+        }
+    }
+
+    /// The store-wide generation floor. An agent with no row of its own reads this, so a new
+    /// identity minted after a whole-store erasure can never land in a generation that erasure
+    /// already declared dead.
+    static func identityGenerationFloor(_ db: Database) throws -> Int64 {
+        try Int64.fetchOne(db, sql: "SELECT generation FROM brain_identity_meta WHERE id=1") ?? 0
     }
 }

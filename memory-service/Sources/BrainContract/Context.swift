@@ -89,15 +89,36 @@ public struct BrainContextAccounting: Codable, Equatable, Sendable {
 }
 
 /// Byte counts refer to an original source. A partial recent unit is never a full exact quote.
+///
+/// `evidenceID` is absent when the entry does not describe one original: a rendered section that
+/// did not fit, or an aggregate notice standing for several omissions at a budget too small to
+/// carry one entry each. The byte counts then describe that section or that aggregate. A present
+/// `evidenceID` is always an original that resolves in `BrainContextBundle.sourceReferences`, so a
+/// caller can follow it; a subject, a predicate or any other kind of identifier is never put here,
+/// because an id that does not resolve is worse than no id at all.
 public struct BrainContextTruncation: Codable, Equatable, Sendable {
-    public let evidenceID: String
+    public let evidenceID: String?
     public let originalUTF8Bytes: Int
     public let includedUTF8Bytes: Int
     public let reason: String
-    public init(evidenceID: String, originalUTF8Bytes: Int, includedUTF8Bytes: Int, reason: String) {
+    public init(evidenceID: String?, originalUTF8Bytes: Int, includedUTF8Bytes: Int, reason: String) {
         self.evidenceID = evidenceID
         self.originalUTF8Bytes = originalUTF8Bytes
         self.includedUTF8Bytes = includedUTF8Bytes
         self.reason = reason
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case evidenceID, originalUTF8Bytes, includedUTF8Bytes, reason
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            evidenceID: try c.decodeIfPresent(String.self, forKey: .evidenceID),
+            originalUTF8Bytes: try c.decode(Int.self, forKey: .originalUTF8Bytes),
+            includedUTF8Bytes: try c.decode(Int.self, forKey: .includedUTF8Bytes),
+            reason: try c.decode(String.self, forKey: .reason)
+        )
     }
 }

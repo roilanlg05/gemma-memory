@@ -33,7 +33,10 @@ public final class BrainContextAssembler {
     }
     public func context(_ request: BrainContextRequest) async throws -> BrainContextBundle {
         let snapshot = try store.snapshot(threadID: request.threadID)
-        let empty = Draft()
+        // The envelope and the disclosure floor are checked before the selector runs, so a window
+        // that cannot honestly report what it dropped fails before a model is called.
+        var empty = Draft()
+        empty.truncations = Self.disclosureFloor
         guard try fits(empty, request: request, revision: snapshot.revision) else { throw BrainContextAssemblyError.insufficientBudget }
         var selection = ConversationSelection()
         if let selector {
@@ -51,6 +54,33 @@ public final class BrainContextAssembler {
         var units = [BrainMessageUnit]()
         var references = [String: BrainEvidence]()
         var truncations = [BrainContextTruncation]()
+    }
+    /// The disclosure classes whose omissions can only be discovered after content has already
+    /// been offered space: the agent identity section, and a recent raw group that would not fit
+    /// even as a prefix. Every other omission in this file is known before the thing it describes
+    /// is offered, and is reserved at that point.
+    ///
+    /// One entry per class is reserved before any content is spent. A bundle must never render
+    /// with admitted content excluded and no `truncations` to say so, and a disclosure that is
+    /// merely attempted after the content has eaten the window is not a disclosure. Reserving
+    /// first means the space is already there when the omission is discovered; if the window
+    /// cannot hold even this floor, the request is unsatisfiable and fails with
+    /// `BrainContextAssemblyError.insufficientBudget` instead of rendering a silent bundle.
+    ///
+    /// `Int.max` is what makes the reservation sound: a placeholder encodes to at least as many
+    /// bytes as the single aggregate notice that may replace it, because that notice carries the
+    /// same `reason`, no `evidenceID`, and a byte count that cannot have more decimal digits than
+    /// `Int.max` has. Unused placeholders are stripped before the bundle is returned, so a caller
+    /// never sees one.
+    private static let disclosureReasons = ["agentIdentityOmittedBudget", "groupOmittedBudget"]
+    private static var disclosureFloor: [BrainContextTruncation] {
+        disclosureReasons.map {
+            .init(evidenceID: nil, originalUTF8Bytes: Int.max, includedUTF8Bytes: 0, reason: $0)
+        }
+    }
+    private static func isDisclosurePlaceholder(_ truncation: BrainContextTruncation) -> Bool {
+        truncation.evidenceID == nil && truncation.originalUTF8Bytes == Int.max
+            && disclosureReasons.contains(truncation.reason)
     }
     private func capacity(_ budget: BrainContextBudget) -> Int {
         budget.contextTokens - budget.outputTokens - budget.systemTokens - budget.toolTokens
@@ -137,8 +167,56 @@ public final class BrainContextAssembler {
                          reason: quotes.contains(id) ? "quoteOmittedBudget" : "detailOmittedBudget")
         }
         draft = adding(to: draft, truncations: disclosures)
+        // Then the floor for the omissions nobody can predict yet. This comes after the selected
+        // originals' notices, which are owed to content a model already asked for, and before any
+        // block of content at all.
+        draft = adding(to: draft, truncations: Self.disclosureFloor)
         guard try fits(draft, request: request, revision: snapshot.revision) else {
             throw BrainContextAssemblyError.insufficientBudget
+        }
+        // Late-discovered omissions are recorded here and rendered once, in `finalizeDisclosures`.
+        // Recording rather than rendering is what keeps the reservation intact while later
+        // sections are still being offered content, and it is the single place a disclosure is
+        // produced: a future section that omits something calls `disclose` and cannot reintroduce
+        // the shape where a failed add silently drops the notice.
+        var pending = [String: [BrainContextTruncation]]()
+        func disclose(_ reason: String, _ entries: [BrainContextTruncation]) {
+            guard !entries.isEmpty else { return }
+            pending[reason, default: []] += entries
+        }
+        func finalizeDisclosures() throws {
+            for reason in Self.disclosureReasons {
+                var released = draft
+                released.truncations.removeAll { Self.isDisclosurePlaceholder($0) && $0.reason == reason }
+                guard let entries = pending[reason], !entries.isEmpty else {
+                    draft = released
+                    continue
+                }
+                // Prefer naming every omission. The per-original batch is the useful form, so it
+                // gets the first chance against whatever capacity is left.
+                let itemized = adding(to: released, truncations: entries)
+                if try fits(itemized, request: request, revision: snapshot.revision) {
+                    draft = itemized
+                    continue
+                }
+                // Otherwise one aggregate notice stands for the whole class. It carries no
+                // `evidenceID` because it describes several originals, and the summed byte count
+                // saturates rather than overflowing. This is the form the placeholder reserved
+                // room for, so it fits; the guard is here because a disclosure that cannot be
+                // rendered must fail loudly, never be dropped.
+                var total = 0
+                for entry in entries {
+                    let (sum, overflow) = total.addingReportingOverflow(entry.originalUTF8Bytes)
+                    total = overflow ? Int.max : sum
+                }
+                let aggregate = BrainContextTruncation(evidenceID: nil, originalUTF8Bytes: total,
+                                                       includedUTF8Bytes: 0, reason: reason)
+                let collapsed = adding(to: released, truncations: [aggregate])
+                guard try fits(collapsed, request: request, revision: snapshot.revision) else {
+                    throw BrainContextAssemblyError.insufficientBudget
+                }
+                draft = collapsed
+            }
         }
         // The agent's identity gets its own section. It goes in before any conversation content,
         // so sheer conversation volume cannot evict who the assistant is, and after the mandatory
@@ -167,10 +245,12 @@ public final class BrainContextAssembler {
                 }
             } else {
                 // Nothing goes missing silently: the caller is told the section did not fit,
-                // through the same disclosure mechanism an omitted original uses.
-                try add(truncations: [.init(evidenceID: BrainIdentity.agentID,
-                                            originalUTF8Bytes: core.utf8.count, includedUTF8Bytes: 0,
-                                            reason: "agentIdentityOmittedBudget")])
+                // through the same disclosure mechanism an omitted original uses. The entry
+                // carries no `evidenceID` — it describes a rendered section, and `self:agent` is
+                // a subject, not a source a caller could look up in `sourceReferences`.
+                disclose("agentIdentityOmittedBudget",
+                         [.init(evidenceID: nil, originalUTF8Bytes: core.utf8.count,
+                                includedUTF8Bytes: 0, reason: "agentIdentityOmittedBudget")])
             }
         }
         for id in selected {
@@ -238,10 +318,11 @@ public final class BrainContextAssembler {
             }
             if let best { draft = best }
             else {
-                try add(truncations: group.map { .init(evidenceID: $0.evidence.id,
+                disclose("groupOmittedBudget", group.map { .init(evidenceID: $0.evidence.id,
                     originalUTF8Bytes: $0.evidence.text?.utf8.count ?? 0, includedUTF8Bytes: 0, reason: "groupOmittedBudget") })
             }
         }
+        try finalizeDisclosures()
         let estimate = try estimatedInput(draft, request: request, revision: snapshot.revision)
         guard estimate <= capacity(request.budget) else { throw BrainContextAssemblyError.insufficientBudget }
         return bundle(draft, request: request, revision: snapshot.revision, estimate: estimate)
@@ -249,6 +330,14 @@ public final class BrainContextAssembler {
     /// Who the agent is, what it works by, and what it must not claim about itself — one block,
     /// because the parts are not separable. An empty string when there is no agent profile, which
     /// `add` treats as nothing to add.
+    ///
+    /// `name=` is configuration, not a quotation. It is the current value of a setting the owner
+    /// chose, the same in every thread, so it renders in every thread and advertises no source id
+    /// of its own; the thread that happened to carry the configuring turn has no claim on it. The
+    /// `sources=` header therefore covers only the evidence this block cites — the admitted
+    /// identity evidence, passed in by a caller that has already thread-scoped it — and is absent
+    /// when there is none. Nothing here is ever rendered as a prefix: a half-written boundary is
+    /// worse than no boundary.
     private static func identityCoreBlock(_ identity: BrainIdentity, sourceIDs: [String]) -> String {
         guard let profile = identity.agentProfile else { return "" }
         let sources = sourceIDs.isEmpty ? "" : "\nsources=" + sourceIDs.joined(separator: ",")

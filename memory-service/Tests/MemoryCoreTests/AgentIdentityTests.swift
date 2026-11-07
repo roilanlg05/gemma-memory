@@ -352,6 +352,114 @@ final class AgentIdentityTests: XCTestCase {
             XCTAssertTrue(whole || disclosed, "recent turn lost without disclosure at \(tokens)")
         }
     }
+    // MARK: Fix round 2
+
+    /// The invariant as a property, not as points: a bundle never renders with admitted content
+    /// excluded and nothing saying so. Swept across every budget in a contiguous range, because
+    /// the silent band's width is roughly the size of one notice and its position moves with the
+    /// content — so any hand-picked grid will eventually straddle it, which is how this survived a
+    /// round. An unsatisfiable budget may throw; it may not return a bundle that quietly lies.
+    func testNoBundleOmitsAdmittedContentWithoutADisclosureAtAnyBudget() async throws {
+        let (_, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        _ = try brain.recordEvidence(.init(id: "ask", sourceKind: .userMessage, speakerID: "self:user",
+            threadID: "t", observedAt: 5, recordedAt: 5, accessScope: .user,
+            text: "Should I take the 9am flight or the 2pm one?"), idempotencyKey: "ask")
+        let state = ConversationStateStore(brain: brain)
+        var satisfied = 0, refused = 0
+        for tokens in 400...1400 {
+            let request = try BrainContextRequest(clientOperationID: "b\(tokens)", threadID: "t", query: "hi",
+                                                  budget: .init(contextTokens: tokens, outputTokens: 100))
+            do {
+                let bundle = try await BrainContextAssembler(store: state).context(request)
+                satisfied += 1
+                let truncations = bundle.truncations ?? []
+                // At the tightest honest budgets there is room for one notice but not for one per
+                // original, so the class collapses to a single aggregate entry that carries no
+                // id. That entry still accounts for the omission, which is the invariant; it is
+                // accepted here only when it is present and non-empty.
+                let aggregate = truncations.first {
+                    $0.evidenceID == nil && $0.reason == "groupOmittedBudget"
+                }
+                if let aggregate {
+                    XCTAssertGreaterThan(aggregate.originalUTF8Bytes, 0,
+                                         "aggregate group disclosure reported nothing at \(tokens)")
+                }
+                for id in ["choice", "ask"] {
+                    let delivered = bundle.recentMessageUnits.contains { $0.evidenceIDs.contains(id) && !$0.text.isEmpty }
+                    let disclosed = truncations.contains { $0.evidenceID == id } || aggregate != nil
+                    XCTAssertTrue(delivered || disclosed, "\(id) omitted with no disclosure at \(tokens)")
+                    // Nothing is ever both delivered whole and reported as dropped.
+                    XCTAssertFalse(delivered && truncations.contains {
+                        $0.evidenceID == id && $0.reason == "groupOmittedBudget"
+                    }, "\(id) delivered and disclosed as omitted at \(tokens)")
+                }
+                let core = bundle.renderedContext.contains("[agent identity]")
+                let coreDisclosed = truncations.contains { $0.reason == "agentIdentityOmittedBudget" }
+                XCTAssertTrue(core || coreDisclosed, "identity omitted with no disclosure at \(tokens)")
+            } catch BrainContextAssemblyError.insufficientBudget {
+                refused += 1
+            }
+        }
+        XCTAssertGreaterThan(satisfied, 0, "every budget in the range was refused")
+        XCTAssertGreaterThan(refused, 0, "no budget in the range was too small to be honest about")
+    }
+    /// A disclosure names an evidence id or names nothing. The identity section is not an
+    /// original, so advertising the subject id as its source hands a caller a dangling identifier
+    /// — the class of defect the `sources=` rule just closed.
+    func testIdentityOmissionDisclosureAdvertisesNoSourceID() async throws {
+        let (_, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        let state = ConversationStateStore(brain: brain)
+        var seen = 0
+        for tokens in 500...900 {
+            let request = try BrainContextRequest(clientOperationID: "d\(tokens)", threadID: "t", query: "hi",
+                                                  budget: .init(contextTokens: tokens, outputTokens: 100))
+            guard let bundle = try? await BrainContextAssembler(store: state).context(request) else { continue }
+            for entry in (bundle.truncations ?? []) where entry.reason == "agentIdentityOmittedBudget" {
+                seen += 1
+                XCTAssertNil(entry.evidenceID, "identity omission advertised a source at \(tokens)")
+            }
+            XCTAssertFalse(bundle.truncations?.contains { $0.evidenceID == "self:agent" } ?? false, "\(tokens)")
+        }
+        XCTAssertGreaterThan(seen, 0, "no budget in the range omitted the identity, so nothing was checked")
+    }
+    /// The generation counter is what makes a restored backup row invisible, so re-stamping the
+    /// survivors has to stay inside the chain that was purged. A second agent's rows must not be
+    /// touched by the first agent's forget.
+    ///
+    /// The second chain is written directly: `requireAgentRead` admits only `self:agent`, so the
+    /// schema's `agent_id` keying has no public write path yet, and this is the only way to hold it
+    /// to the isolation the column promises.
+    func testAForgetForOneAgentLeavesAnotherAgentsIdentityRowsAlone() throws {
+        let (db, brain, service) = try setup()
+        try source(brain, "e1", text: "The first explicit naming choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "o1",
+                                       change: .configure(displayName: "Ada", evidenceIDs: ["e1"]))
+        try source(brain, "e2", text: "A separate instruction about humor")
+        _ = try service.reviseIdentity(expectedRevision: 1, operationID: "o2",
+                                       change: .configure(character: .init(humor: .playful), evidenceIDs: ["e2"]))
+        try db.dbQueue.write { db in
+            try db.execute(sql: """
+                INSERT INTO brain_identity_revision(agent_id, revision, generation, parent_revision, payload)
+                SELECT 'self:agent:second', revision, generation, parent_revision, payload
+                FROM brain_identity_revision WHERE agent_id='self:agent'
+                """)
+        }
+        let other = { try db.dbQueue.read { try Row.fetchAll($0, sql: "SELECT revision, generation FROM brain_identity_revision WHERE agent_id='self:agent:second' ORDER BY revision").map { "\($0["revision"] as Int64)/\($0["generation"] as Int64)" } } }
+        let before = try other()
+        XCTAssertEqual(before.count, 2)
+        _ = try BrainRetractionService(brain: brain).forget(scope: .init(kind: .evidence, id: "e2"),
+                                                            expectedRevision: 2, operationID: "erase")
+        XCTAssertEqual(try other(), before, "another agent's rows moved with this agent's forget")
+        // And this agent's own partial forget still behaves exactly as before.
+        XCTAssertEqual(try service.identity().displayName, "Ada")
+        XCTAssertEqual(try service.identity().agentProfile?.history.map(\.revision), [1])
+    }
     func testJournalReplayAgreesWithTheLiveIdentityAfterAPartialForget() throws {
         let (_, brain, service, ada) = try branchingIdentity()
         _ = try BrainRetractionService(brain: brain).forget(scope: .init(kind: .evidence, id: "e3"),
