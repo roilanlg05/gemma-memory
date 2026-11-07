@@ -50,7 +50,6 @@ public struct BrainContextRequest: Codable, Equatable, Sendable {
 /// means it was withheld, and a value in between means a prefix was rendered. A consumer building
 /// citations from this list without consulting `truncations` will cite a source the model never
 /// saw.
-
 public struct BrainContextBundle: Codable, Equatable, Sendable {
     public let renderedContext: String
     public let recentMessageUnits: [BrainMessageUnit]
