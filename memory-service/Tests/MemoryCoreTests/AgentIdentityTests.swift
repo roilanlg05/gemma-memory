@@ -348,8 +348,20 @@ final class AgentIdentityTests: XCTestCase {
             let bundle = try await BrainContextAssembler(store: state).context(request)
             let delivered = bundle.recentMessageUnits.first { $0.id == "recent" }
             let whole = delivered?.text.utf8.count == 900
-            let disclosed = bundle.truncations?.contains { $0.evidenceID == "recent" } ?? false
+            let truncations = bundle.truncations ?? []
+            // Named by its own id, or covered by the recent-group class aggregate. The aggregate is
+            // the form the floor reserves room for, so at the budgets where naming the id (and
+            // carrying the metadata that makes the id resolve) does not fit, it is what accounts
+            // for the loss.
+            let disclosed = truncations.contains { $0.evidenceID == "recent" }
+                || truncations.contains { $0.evidenceID == nil && $0.reason == "groupOmittedBudget" }
             XCTAssertTrue(whole || disclosed, "recent turn lost without disclosure at \(tokens)")
+            // And an id this bundle does print is always one its caller can follow.
+            let resolvable = Set(bundle.sourceReferences.map(\.id))
+            for entry in truncations {
+                guard let id = entry.evidenceID else { continue }
+                XCTAssertTrue(resolvable.contains(id), "\(id) advertised but unresolvable at \(tokens)")
+            }
         }
     }
     // MARK: Fix round 2
@@ -428,6 +440,85 @@ final class AgentIdentityTests: XCTestCase {
         }
         XCTAssertGreaterThan(seen, 0, "no budget in the range omitted the identity, so nothing was checked")
     }
+    // MARK: Fix round 3
+
+    /// The wire contract says a present `evidenceID` resolves in `sourceReferences`. An entry that
+    /// reports an omission is exactly the entry whose id was never registered, because ids are
+    /// registered on a successful add and an omitted original did not add. A caller that follows
+    /// the documented invariant into a force-unwrap crashes, so the invariant has to be true.
+    func testEveryAdvertisedSourceIDResolvesInSourceReferencesAtEveryBudget() async throws {
+        let (_, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        _ = try brain.recordEvidence(.init(id: "ask", sourceKind: .userMessage, speakerID: "self:user",
+            threadID: "t", observedAt: 5, recordedAt: 5, accessScope: .user,
+            text: "Should I take the 9am flight or the 2pm one?"), idempotencyKey: "ask")
+        let state = ConversationStateStore(brain: brain)
+        var advertised = 0, violations = 0, firstViolation = -1
+        for tokens in 400...2000 {
+            let request = try BrainContextRequest(clientOperationID: "r\(tokens)", threadID: "t", query: "hi",
+                                                  budget: .init(contextTokens: tokens, outputTokens: 100))
+            guard let bundle = try? await BrainContextAssembler(store: state).context(request) else { continue }
+            let resolvable = Set(bundle.sourceReferences.map(\.id))
+            for entry in (bundle.truncations ?? []) {
+                guard let id = entry.evidenceID else { continue }
+                advertised += 1
+                if !resolvable.contains(id) {
+                    violations += 1
+                    if firstViolation < 0 { firstViolation = tokens }
+                }
+            }
+        }
+        XCTAssertGreaterThan(advertised, 0, "no budget advertised an id, so nothing was checked")
+        XCTAssertEqual(violations, 0,
+                       "\(violations) advertised ids did not resolve, first at \(firstViolation)")
+    }
+    /// A reservation is charged for a disclosure class that can actually fire. A grant without the
+    /// agent subject can never produce an identity disclosure, so paying for one costs the newest
+    /// user turn across a band where a complete bundle used to render. The price of a class that
+    /// cannot fire must be zero.
+    func testTheDisclosureFloorChargesNothingForAClassThatCannotFire() async throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let brain = BrainStore(store: db, authorization: auth(subjects: ["self:user"], scopes: [.user]),
+                               clock: { 100 })
+        _ = try brain.recordEvidence(.init(id: "hi", sourceKind: .userMessage, speakerID: "self:user",
+            threadID: "t", observedAt: 5, recordedAt: 5, accessScope: .user, text: "Hi"),
+            idempotencyKey: "hi")
+        let state = ConversationStateStore(brain: brain)
+        func bundle(_ tokens: Int) async throws -> BrainContextBundle? {
+            let request = try BrainContextRequest(clientOperationID: "f\(tokens)", threadID: "t", query: "hi",
+                                                  budget: .init(contextTokens: tokens, outputTokens: 100))
+            return try? await BrainContextAssembler(store: state).context(request)
+        }
+        let generous = try await bundle(4000)
+        let complete = try XCTUnwrap(generous)
+        XCTAssertEqual(complete.recentMessageUnits.first?.text, "Hi")
+        XCTAssertEqual(complete.truncations ?? [], [])
+        let estimate = try XCTUnwrap(complete.accounting?.estimatedInputTokens)
+        var firstComplete = -1, silent = 0
+        for tokens in 300...1200 {
+            guard let bundle = try await bundle(tokens) else { continue }
+            let truncations = bundle.truncations ?? []
+            XCTAssertFalse(truncations.contains { $0.reason == "agentIdentityOmittedBudget" },
+                           "a class that cannot fire produced an entry at \(tokens)")
+            XCTAssertFalse(truncations.contains { $0.originalUTF8Bytes == Int.max },
+                           "a reservation placeholder reached the caller at \(tokens)")
+            let delivered = bundle.recentMessageUnits.first { $0.id == "hi" }?.text == "Hi"
+            if !delivered, !truncations.contains(where: { $0.reason == "groupOmittedBudget" }) { silent += 1 }
+            if delivered, truncations.isEmpty, firstComplete < 0 { firstComplete = tokens }
+        }
+        XCTAssertEqual(silent, 0, "\(silent) budgets lost the turn with nothing saying so")
+        XCTAssertGreaterThan(firstComplete, 0, "no budget in the range returned a complete bundle")
+        // The complete bundle needs `estimate` bytes. The gap between that and the smallest window
+        // that delivers it is exactly what the floor reserved. Only the recent-group class can fire
+        // here, so at most one notice may be charged — never two.
+        let gap = firstComplete - 100 - estimate
+        XCTAssertGreaterThanOrEqual(gap, 0, "the complete bundle rendered below its own estimate")
+        XCTAssertLessThanOrEqual(gap, 110,
+            "the floor charged \(gap) bytes at \(firstComplete) for \(estimate) bytes of bundle; "
+            + "a class that cannot fire was charged for")
+    }
     /// The generation counter is what makes a restored backup row invisible, so re-stamping the
     /// survivors has to stay inside the chain that was purged. A second agent's rows must not be
     /// touched by the first agent's forget.
@@ -443,19 +534,31 @@ final class AgentIdentityTests: XCTestCase {
         try source(brain, "e2", text: "A separate instruction about humor")
         _ = try service.reviseIdentity(expectedRevision: 1, operationID: "o2",
                                        change: .configure(character: .init(humor: .playful), evidenceIDs: ["e2"]))
+        // The second chain cites a source of its own. Without it the chain would be unreachable by
+        // any closure for any reason, and the test would prove only that a chain nothing points at
+        // survives — which is true of an empty table too.
+        try source(brain, "x1", text: "An unrelated private note about bicycles")
         try db.dbQueue.write { db in
             try db.execute(sql: """
                 INSERT INTO brain_identity_revision(agent_id, revision, generation, parent_revision, payload)
                 SELECT 'self:agent:second', revision, generation, parent_revision, payload
                 FROM brain_identity_revision WHERE agent_id='self:agent'
                 """)
+            try db.execute(sql: """
+                INSERT INTO brain_identity_source(agent_id, revision, evidence_id)
+                SELECT 'self:agent:second', revision, 'x1'
+                FROM brain_identity_revision WHERE agent_id='self:agent:second'
+                """)
         }
+        let otherSources = { try db.dbQueue.read { try String.fetchAll($0, sql: "SELECT evidence_id FROM brain_identity_source WHERE agent_id='self:agent:second' ORDER BY revision") } }
+        XCTAssertEqual(try otherSources(), ["x1", "x1"])
         let other = { try db.dbQueue.read { try Row.fetchAll($0, sql: "SELECT revision, generation FROM brain_identity_revision WHERE agent_id='self:agent:second' ORDER BY revision").map { "\($0["revision"] as Int64)/\($0["generation"] as Int64)" } } }
         let before = try other()
         XCTAssertEqual(before.count, 2)
         _ = try BrainRetractionService(brain: brain).forget(scope: .init(kind: .evidence, id: "e2"),
                                                             expectedRevision: 2, operationID: "erase")
         XCTAssertEqual(try other(), before, "another agent's rows moved with this agent's forget")
+        XCTAssertEqual(try otherSources(), ["x1", "x1"], "another agent's sources went with this agent's forget")
         // And this agent's own partial forget still behaves exactly as before.
         XCTAssertEqual(try service.identity().displayName, "Ada")
         XCTAssertEqual(try service.identity().agentProfile?.history.map(\.revision), [1])

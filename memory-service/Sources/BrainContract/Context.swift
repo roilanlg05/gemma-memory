@@ -92,10 +92,20 @@ public struct BrainContextAccounting: Codable, Equatable, Sendable {
 ///
 /// `evidenceID` is absent when the entry does not describe one original: a rendered section that
 /// did not fit, or an aggregate notice standing for several omissions at a budget too small to
-/// carry one entry each. The byte counts then describe that section or that aggregate. A present
-/// `evidenceID` is always an original that resolves in `BrainContextBundle.sourceReferences`, so a
-/// caller can follow it; a subject, a predicate or any other kind of identifier is never put here,
-/// because an id that does not resolve is worse than no id at all.
+/// carry one entry each. The byte counts then describe that section or that aggregate.
+///
+/// A present `evidenceID` always resolves in `BrainContextBundle.sourceReferences`. The assembler
+/// reserves an original's metadata entry together with the notice that may name it, so an
+/// advertised id is followable and is a valid forget target whether or not the original itself was
+/// delivered. A subject, a predicate or any other kind of identifier is never put here, because an
+/// id that does not resolve is worse than no id at all.
+///
+/// Resolving is therefore not evidence of delivery, and the two are told apart from this type, not
+/// from `sourceReferences`: `includedUTF8Bytes == 0` means the original was wholly omitted, a value
+/// between zero and `originalUTF8Bytes` means a marked prefix of it was rendered, and an original
+/// with no entry at all was delivered whole. A `sourceReferences` entry is metadata about an
+/// original this bundle accounted for; it never carries text, for a delivered original or an
+/// omitted one.
 public struct BrainContextTruncation: Codable, Equatable, Sendable {
     public let evidenceID: String?
     public let originalUTF8Bytes: Int
