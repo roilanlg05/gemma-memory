@@ -28,8 +28,10 @@ public protocol ConversationDetailSelector {
 public final class BrainContextAssembler {
     private let store: ConversationStateStore
     private let selector: (any ConversationDetailSelector)?
-    public init(store: ConversationStateStore, selector: (any ConversationDetailSelector)? = nil) {
-        self.store = store; self.selector = selector
+    private let affect: AffectiveContextService?
+    public init(store: ConversationStateStore, selector: (any ConversationDetailSelector)? = nil,
+                affect: AffectiveContextService? = nil) {
+        self.store = store; self.selector = selector; self.affect = affect
     }
     public func context(_ request: BrainContextRequest) async throws -> BrainContextBundle {
         let snapshot = try store.snapshot(threadID: request.threadID)
@@ -45,10 +47,13 @@ public final class BrainContextAssembler {
             do { selection = try await selector.select(input) }
             catch {
                 // A failing optional model still must not return data withdrawn during its await.
-                return try store.validated(snapshot) { try assemble($0, request: request, selection: .init()) }
+                selection = .init()
             }
         }
-        return try store.validated(snapshot) { try assemble($0, request: request, selection: selection) }
+        return try store.validatedInTransaction(snapshot) { current, db in
+            let interaction = try affect?.interaction(threadID: request.threadID, authorizedBy: store.brain, db: db)
+            return try assemble(current, request: request, selection: selection, interaction: interaction)
+        }
     }
     private struct Draft {
         var blocks = [String]()
@@ -158,7 +163,7 @@ public final class BrainContextAssembler {
             segments.append(segment)
             if try JSONEncoder().encode(input()).count > limit { segments.removeLast() }
         }
-        for claim in snapshot.claims.reversed() {
+        for claim in snapshot.claims.reversed() where !BrainStore.requiresTurnSource(claim.predicate) {
             claims.append(claim)
             if try JSONEncoder().encode(input()).count > limit { claims.removeLast() }
         }
@@ -168,9 +173,11 @@ public final class BrainContextAssembler {
         }
         return input()
     }
-    private func assemble(_ snapshot: ConversationSnapshot, request: BrainContextRequest, selection: ConversationSelection) throws -> BrainContextBundle {
+    private func assemble(_ snapshot: ConversationSnapshot, request: BrainContextRequest, selection: ConversationSelection,
+                          interaction: BrainInteractionState?) throws -> BrainContextBundle {
         let originals = Dictionary(uniqueKeysWithValues: snapshot.sources.map { ($0.evidence.id, $0.evidence) })
-        let claims = Dictionary(uniqueKeysWithValues: snapshot.claims.map { ($0.id, $0) })
+        let claims = Dictionary(uniqueKeysWithValues: snapshot.claims
+            .filter { !BrainStore.requiresTurnSource($0.predicate) }.map { ($0.id, $0) })
         guard selection.detailEvidenceIDs.allSatisfy({ originals[$0] != nil }),
               selection.quoteEvidenceIDs.allSatisfy({ originals[$0] != nil }),
               selection.claimIDs.allSatisfy({ claims[$0] != nil }) else { throw BrainStoreError.denied }
@@ -384,6 +391,27 @@ public final class BrainContextAssembler {
             }
         }
         try finalizeDisclosures(DisclosureReason.snapshotOmissions)
+        // Guidance uses whatever capacity remains after original evidence and required notices.
+        // Render only bounded cues, never the model's affect label or the source text again.
+        if let advice = AffectiveContextService.advice(claims: snapshot.claims, threadID: request.threadID,
+                                                       evidence: { $0.compactMap { available[$0] } }) {
+            let guidance = advice.mode == .listen ? "Listen without offering unsolicited advice."
+                : "Offer advice when it is useful and relevant to the request."
+            try add(block: "[expressed conversation preference]\n" + guidance, ids: advice.evidenceIDs,
+                    renderedUse: .derivedSupport)
+        }
+        if let interaction, interaction.evidenceIDs.allSatisfy({ originals[$0] != nil }) {
+            let cues = interaction.cues
+            var guidance = [String]()
+            if cues.focus == .stayWithTopic { guidance.append("Stay with the current topic.") }
+            if cues.focus == .clarifyGoal { guidance.append("Clarify the goal briefly if needed.") }
+            if cues.interest == .exploreTopic { guidance.append("Leave room to explore the topic.") }
+            if cues.interest == .acknowledgeProgress { guidance.append("Acknowledge progress when it is grounded.") }
+            if cues.tension == .slowDown { guidance.append("Use a patient pace and keep the response easy to follow.") }
+            if cues.tension == .respondCalmly { guidance.append("Respond calmly and directly.") }
+            try add(block: "[optional conversation guidance]\n" + guidance.joined(separator: " "),
+                    ids: interaction.evidenceIDs, renderedUse: .derivedSupport)
+        }
         let estimate = try estimatedInput(draft, request: request, revision: snapshot.revision)
         guard estimate <= capacity(request.budget) else { throw BrainContextAssemblyError.insufficientBudget }
         return bundle(draft, request: request, revision: snapshot.revision, estimate: estimate)

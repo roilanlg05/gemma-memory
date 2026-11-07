@@ -54,8 +54,11 @@ public final class BrainTurnService {
 
     /// Read-your-writes hook for context assembly, independent of embedding availability.
     public func currentClaims(turnID: String, asOf: Double) throws -> [BrainClaim] {
-        _ = try journal.read(turnID)
-        return try brain.claims(subject: "self:user", asOf: asOf, scope: .user)
+        try brain.store.dbQueue.read { db in
+            let turn = try journal.load(turnID, db: db)
+            return try brain.claims(subject: "self:user", asOf: asOf, scope: .user,
+                                    threadID: turn.source.threadID, db: db)
+        }
     }
 
     @discardableResult

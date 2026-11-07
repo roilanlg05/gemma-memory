@@ -2,6 +2,9 @@ import Foundation
 
 public enum BrainTasteKind: String, Codable, Equatable, Sendable {
     case liking, disliking, comparativePreference
+    case selection, variety
+
+    public var isCurrentIntent: Bool { self == .selection || self == .variety }
 }
 
 public enum BrainTasteProvenance: String, Codable, Equatable, Sendable {
@@ -40,6 +43,8 @@ public struct BrainTasteRecord: Codable, Equatable, Sendable {
     public let intensity: BrainTasteIntensity?
     public let modality: BrainClaimModality?
     public let attribution: BrainTasteAttribution?
+    public let validFrom: Double?
+    public let validTo: Double?
 
     public init(
         id: String,
@@ -56,7 +61,9 @@ public struct BrainTasteRecord: Codable, Equatable, Sendable {
         evidenceIDs: [String],
         intensity: BrainTasteIntensity? = nil,
         modality: BrainClaimModality? = nil,
-        attribution: BrainTasteAttribution? = nil
+        attribution: BrainTasteAttribution? = nil,
+        validFrom: Double? = nil,
+        validTo: Double? = nil
     ) {
         self.id = id
         self.subjectID = subjectID
@@ -73,10 +80,13 @@ public struct BrainTasteRecord: Codable, Equatable, Sendable {
         self.intensity = intensity
         self.modality = modality
         self.attribution = attribution
+        self.validFrom = validFrom
+        self.validTo = validTo
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, subjectID, kind, target, alternatives, criterion, domain, context, provenance, durability, recordedAt, evidenceIDs, intensity, modality, attribution
+        case validFrom, validTo
     }
 
     public init(from decoder: Decoder) throws {
@@ -96,31 +106,54 @@ public struct BrainTasteRecord: Codable, Equatable, Sendable {
             evidenceIDs: try c.decode([String].self, forKey: .evidenceIDs),
             intensity: try c.decodeIfPresent(BrainTasteIntensity.self, forKey: .intensity),
             modality: try c.decodeIfPresent(BrainClaimModality.self, forKey: .modality),
-            attribution: try c.decodeIfPresent(BrainTasteAttribution.self, forKey: .attribution)
+            attribution: try c.decodeIfPresent(BrainTasteAttribution.self, forKey: .attribution),
+            validFrom: try c.decodeIfPresent(Double.self, forKey: .validFrom),
+            validTo: try c.decodeIfPresent(Double.self, forKey: .validTo)
         )
     }
 
     /// A known non-assertion or quotation cannot establish an enduring taste.
     /// Third-party records retain their actual subjectID; they are never user tastes by label.
     public var isEnduringTaste: Bool {
-        durability == .enduring
+        durability == .enduring && provenance == .explicit && !kind.isCurrentIntent
             && (modality == nil || modality == .asserted)
             && attribution != .quoted
+            && !(subjectID == BrainIdentity.userID && attribution == .thirdParty)
     }
+}
+
+public struct BrainTasteContext: Codable, Equatable, Sendable {
+    public let threadID: String?
+    public let situation: String?
+
+    public init(threadID: String? = nil, situation: String? = nil) {
+        self.threadID = threadID
+        self.situation = situation
+    }
+}
+
+public enum BrainTasteInformationGap: String, Codable, Equatable, Sendable {
+    case taste, comparativePreference
 }
 
 public struct BrainTasteProfile: Codable, Equatable, Sendable {
     public let subjectID: String
     public let revision: Int64
     public let records: [BrainTasteRecord]
+    public let currentIntent: [BrainTasteRecord]?
+    public let missingInformation: [BrainTasteInformationGap]?
 
     public init(
         subjectID: String,
         revision: Int64,
-        records: [BrainTasteRecord]
+        records: [BrainTasteRecord],
+        currentIntent: [BrainTasteRecord]? = nil,
+        missingInformation: [BrainTasteInformationGap]? = nil
     ) {
         self.subjectID = subjectID
         self.revision = revision
         self.records = records
+        self.currentIntent = currentIntent
+        self.missingInformation = missingInformation
     }
 }

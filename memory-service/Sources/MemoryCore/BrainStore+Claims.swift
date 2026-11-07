@@ -15,12 +15,26 @@ extension BrainStore {
     public func commit(_ request: BrainCommitRequest) throws -> BrainCommitResult {
         try commit(request, transactionGuard: { _ in }, didCommit: { _, _ in })
     }
+    static func requiresTurnSource(_ predicate: String) -> Bool {
+        predicate == TastePreferenceStore.predicate || predicate == AffectiveContextService.advicePreferencePredicate
+    }
+
+    static func admitsPreference(_ claim: BrainClaim, sources: [BrainEvidence], threadID: String?) -> Bool {
+        guard requiresTurnSource(claim.predicate), claim.validTo != nil else { return true }
+        guard let threadID else { return false }
+        return sources.allSatisfy { $0.threadID == threadID }
+    }
+
     /// Internal turn lifecycle checks run under the same lock/rollback boundary as claim writes.
-    func commit(_ request: BrainCommitRequest, transactionGuard: (Database) throws -> Void,
+    func commit(_ request: BrainCommitRequest, validatedTurnSource: BrainEvidence? = nil,
+                transactionGuard: (Database) throws -> Void,
                 didCommit: (Database, BrainCommitResult) throws -> Void) throws -> BrainCommitResult {
         try requirePrincipal()
         guard authorization.mayCommitClaims else { throw BrainStoreError.denied }
+        // The legacy wire tastes field has no attributed span. The staged turn is the write path.
         guard let expected = request.expectedRevision, expected >= 0, request.tastes?.isEmpty != false else { throw BrainStoreError.invalid }
+        guard validatedTurnSource != nil || !request.updates.contains(where: { Self.requiresTurnSource($0.claim.predicate) })
+        else { throw BrainStoreError.denied }
         let payload = try Self.encode(request)
         do {
             return try store.dbQueue.write { db in
@@ -63,6 +77,14 @@ extension BrainStore {
                 guard let scope = sources.first?.accessScope, let thread = sources.first?.threadID,
                       sources.allSatisfy({ $0.accessScope == scope && (scope != .thread || $0.threadID == thread) }) else { throw BrainStoreError.invalid }
                 try requireAccess(subject: claim.subject, scope: scope)
+                if Self.requiresTurnSource(claim.predicate) {
+                    guard let source = validatedTurnSource, sources == [source] else { throw BrainStoreError.denied }
+                    if claim.predicate == TastePreferenceStore.predicate {
+                        try TastePreferenceStore.validate(claim, source: source)
+                    } else {
+                        try AffectiveContextService.validateAdvice(claim, source: source)
+                    }
+                }
                 guard Set(claim.contradictsIDs).count == claim.contradictsIDs.count,
                       !claim.contradictsIDs.contains(claim.id) else { throw BrainStoreError.invalid }
                 for targetID in claim.contradictsIDs {
@@ -85,6 +107,12 @@ extension BrainStore {
                           update.expectedRevision.map({ $0 == previous.revision }) ?? true else { throw BrainStoreError.conflict }
                     let oldSources = try availableEvidence(previous.evidenceIDs, db: db)
                     guard oldSources.allSatisfy({ $0.accessScope == scope && (scope != .thread || $0.threadID == thread) }) else { throw BrainStoreError.denied }
+                    if Self.requiresTurnSource(claim.predicate), claim.validTo != nil {
+                        guard previous.validTo != nil, oldSources.allSatisfy({ $0.threadID == thread }) else { throw BrainStoreError.invalid }
+                    }
+                    if claim.predicate == TastePreferenceStore.predicate {
+                        try TastePreferenceStore.validateCorrection(claim, previous: previous)
+                    }
                 } else if let expectedClaim = update.expectedRevision, expectedClaim != 0 { throw BrainStoreError.conflict }
                 let saved = BrainClaim(id: claim.id, revision: next, subject: claim.subject, predicate: claim.predicate, value: claim.value,
                     modality: claim.modality, status: claim.status, validFrom: claim.validFrom, validTo: claim.validTo,
@@ -124,8 +152,9 @@ extension BrainStore {
     /// claim store and their own derived rows in one consistent snapshot. The caller has already
     /// verified the owner binding; access to the subject and scope is still checked here.
     func claims(subject: String, asOf: Double, scope: BrainAccessScope, knownAtRevision: Int64? = nil,
-                db: Database) throws -> [BrainClaim] {
+                threadID: String? = nil, includingExpiredPredicate: String? = nil, db: Database) throws -> [BrainClaim] {
         try requireAccess(subject: subject, scope: scope)
+        if let threadID, !authorization.threads.contains(threadID) { throw BrainStoreError.denied }
         guard asOf.isFinite, knownAtRevision.map({ $0 >= 0 }) ?? true else { throw BrainStoreError.invalid }
         let known: Int64
         if let knownAtRevision { known = knownAtRevision } else { known = try Self.revision(db) }
@@ -134,10 +163,14 @@ extension BrainStore {
         for payload in payloads {
             let claim = try Self.decode(BrainClaim.self, payload)
             let sources = try claim.evidenceIDs.map { try loadEvidence($0, db: db) }
-            guard sources.allSatisfy({ $0.accessScope == scope && canRead($0) }), claim.validFrom <= asOf else { continue }
+            guard sources.allSatisfy({ $0.accessScope == scope && canRead($0) }), claim.validFrom <= asOf,
+                  Self.admitsPreference(claim, sources: sources, threadID: threadID) else { continue }
             visible.append(claim)
         }
         let superseded = Set(visible.compactMap(\.supersedesID))
-        return visible.filter { $0.status == .active && !superseded.contains($0.id) && ($0.validTo.map { asOf < $0 } ?? true) }
+        return visible.filter { claim in
+            claim.status == .active && !superseded.contains(claim.id)
+                && (claim.predicate == includingExpiredPredicate || (claim.validTo.map { asOf < $0 } ?? true))
+        }
     }
 }

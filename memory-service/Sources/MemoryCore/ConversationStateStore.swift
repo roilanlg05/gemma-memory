@@ -168,7 +168,8 @@ public final class ConversationStateStore {
             guard brain.authorization.subjects.contains(claim.subject), claim.validFrom <= brain.clock(),
                   !claim.evidenceIDs.isEmpty else { continue }
             let evidence = claim.evidenceIDs.compactMap { evidenceByID[$0] }
-            guard evidence.count == claim.evidenceIDs.count, evidence.allSatisfy({ brain.canRead($0) }) else { continue }
+            guard evidence.count == claim.evidenceIDs.count, evidence.allSatisfy({ brain.canRead($0) }),
+                  BrainStore.admitsPreference(claim, sources: evidence, threadID: threadID) else { continue }
             visible.append(claim)
         }
         let superseded = Set(visible.compactMap(\.supersedesID))
@@ -208,10 +209,14 @@ public final class ConversationStateStore {
     /// Revalidate after EVERY model await, including model failures before fallback. The result
     /// is built inside the same transaction that checks revision and original source bytes.
     func validated<T>(_ original: ConversationSnapshot, _ body: (ConversationSnapshot) throws -> T) throws -> T {
+        try validatedInTransaction(original) { current, _ in try body(current) }
+    }
+    func validatedInTransaction<T>(_ original: ConversationSnapshot,
+                                   _ body: (ConversationSnapshot, Database) throws -> T) throws -> T {
         try brain.store.dbQueue.write { db in
             let current = try snapshot(threadID: original.threadID, db: db)
             try Self.requireSameSources(original, current)
-            return try body(current)
+            return try body(current, db)
         }
     }
     private static func requireSameSources(_ old: ConversationSnapshot, _ current: ConversationSnapshot) throws {

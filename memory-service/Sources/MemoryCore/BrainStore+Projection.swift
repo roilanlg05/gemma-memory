@@ -17,6 +17,12 @@ extension BrainStore {
         for binding in bindings {
             guard authorization.mayProject, binding.subject == claim.subject, binding.predicate == claim.predicate else { throw BrainStoreError.denied }
         }
+        // These preferences have dedicated scoped readers. A legacy fact cannot preserve
+        // their different modality, context, or short-lived intent semantics.
+        if Self.requiresTurnSource(claim.predicate) {
+            guard bindings.isEmpty else { throw BrainStoreError.denied }
+            return
+        }
         // Global legacy APIs cannot enforce narrower scopes.
         guard authorization.mayProject, evidence.first?.accessScope == .user,
               claim.modality == .asserted, claim.status == .active else {

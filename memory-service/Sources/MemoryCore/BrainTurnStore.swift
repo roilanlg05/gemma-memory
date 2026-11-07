@@ -6,6 +6,7 @@ struct BrainTurnRecord {
     let id: String
     let source: BrainEvidence
     let transcriptID: String
+    let sequence: Int
     let state: String
     let updates: [BrainClaimUpdate]?
     let hasPending: Bool
@@ -43,12 +44,13 @@ final class BrainTurnStore {
         try requireUser(thread: thread)
         let sourceID: String = row["source_id"], transcriptID: String = row["transcript_id"]
         guard let sourcePayload = try String.fetchOne(db, sql: "SELECT payload FROM brain_evidence WHERE id=?", arguments: [sourceID]),
-              try TranscriptRow.fetchOne(db, key: transcriptID) != nil else { throw BrainStoreError.denied }
+              let transcript = try TranscriptRow.fetchOne(db, key: transcriptID) else { throw BrainStoreError.denied }
         let source = try BrainStore.decode(BrainEvidence.self, sourcePayload)
         try brain.validateEvidence(source, db: db)
-        guard source.threadID == thread, source.sourceKind == .userMessage, source.speakerID == "self:user" else { throw BrainStoreError.denied }
+        guard source.threadID == thread, source.sourceKind == .userMessage, source.speakerID == "self:user",
+              ConsolidationEvidenceAdapter.evidence(for: transcript) == source else { throw BrainStoreError.denied }
         let updatesPayload: String? = row["updates"], receiptPayload: String? = row["receipt"]
-        return BrainTurnRecord(id: id, source: source, transcriptID: transcriptID, state: row["state"],
+        return BrainTurnRecord(id: id, source: source, transcriptID: transcriptID, sequence: transcript.seq, state: row["state"],
             updates: try updatesPayload.map { try BrainStore.decode([BrainClaimUpdate].self, $0) },
             hasPending: row["has_pending"], receipt: try receiptPayload.map { try BrainStore.decode(BrainCommitResult.self, $0) })
     }
@@ -111,9 +113,9 @@ final class BrainTurnStore {
             guard turn.updates == updates else { throw BrainStoreError.denied }
             if let receipt = turn.receipt { return receipt }
             let request = try BrainCommitRequest(clientOperationID: "turn:" + turnID, evidence: [], updates: updates, expectedRevision: brain.revision())
-            let result = try brain.commit(request, transactionGuard: { db in
+            let result = try brain.commit(request, validatedTurnSource: turn.source, transactionGuard: { db in
                 let current = try self.load(turnID, db: db)
-                guard current.updates == updates else { throw BrainStoreError.denied }
+                guard current.updates == updates, current.source == turn.source else { throw BrainStoreError.denied }
                 guard current.receipt == nil else { throw BrainStoreError.conflict }
             }, didCommit: { db, result in
                 // Guard and receipt are in the exact transaction that changes claims/revision.
