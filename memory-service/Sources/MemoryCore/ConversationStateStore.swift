@@ -34,10 +34,13 @@ public struct ConversationSnapshot: Sendable {
     public let claims: [BrainClaim]
     let memoryEvidence: [BrainEvidence]
     let claimEvidenceIDs: [String: [String]]
-    /// The agent's own identity, read in the same transaction as the conversation so it is part of
-    /// what revalidation compares. Absent when the grant does not hold the agent subject or scope.
+    /// The agent's own identity, read in the same transaction as the conversation and confined to
+    /// this thread. Absent when the grant does not hold the agent subject or scope.
     let identity: BrainIdentity?
     let identityEvidence: [BrainEvidence]
+    /// What a retraction could take from that identity. Revalidation compares this rather than the
+    /// whole identity, which would also compare a growing experience projection.
+    let identityDependencies: AgentIdentityDependencies?
 }
 
 /// Source snapshots and derived segments share the brain's owner, revision and erasure boundary.
@@ -184,17 +187,23 @@ public final class ConversationStateStore {
         // the post-await revalidation below: an identity source withdrawn while a model was running
         // must make assembly conflict rather than letting withdrawn personalisation reach a prompt.
         // A grant that does not hold the agent subject and scope simply gets no identity.
+        // Both the experience projection and the citable identity sources are confined to this
+        // thread: everything the identity section renders verbatim is raw content, and raw content
+        // here is exact-thread like every other raw path in this store.
         var identity: BrainIdentity?
         var identityEvidence = [BrainEvidence]()
+        var identityDependencies: AgentIdentityDependencies?
         if brain.authorization.subjects.contains(BrainIdentity.agentID),
            brain.authorization.scopes.contains(.agent) {
             let identityStore = AgentIdentityStore(brain: brain, capabilityAddenda: capabilityAddenda)
-            identity = try identityStore.identity(agentID: BrainIdentity.agentID, db: db)
-            identityEvidence = try identityStore.identityEvidence(agentID: BrainIdentity.agentID, db: db)
+            identity = try identityStore.identity(agentID: BrainIdentity.agentID, db: db, thread: threadID)
+            identityEvidence = try identityStore.identityEvidence(agentID: BrainIdentity.agentID, db: db, thread: threadID)
+            identityDependencies = try identityStore.dependencies(agentID: BrainIdentity.agentID, db: db)
         }
         return .init(threadID: threadID, revision: revision, sources: sources, segments: segments,
                      claims: claims, memoryEvidence: memoryEvidence, claimEvidenceIDs: claimEvidenceIDs,
-                     identity: identity, identityEvidence: identityEvidence)
+                     identity: identity, identityEvidence: identityEvidence,
+                     identityDependencies: identityDependencies)
     }
     /// Revalidate after EVERY model await, including model failures before fallback. The result
     /// is built inside the same transaction that checks revision and original source bytes.
@@ -208,7 +217,7 @@ public final class ConversationStateStore {
     private static func requireSameSources(_ old: ConversationSnapshot, _ current: ConversationSnapshot) throws {
         guard old.revision == current.revision, old.sources == current.sources,
               old.claims == current.claims, old.memoryEvidence == current.memoryEvidence,
-              old.identity == current.identity, old.identityEvidence == current.identityEvidence else { throw BrainStoreError.conflict }
+              old.identityDependencies == current.identityDependencies else { throw BrainStoreError.conflict }
     }
     func save(_ candidate: ConversationStateCandidate, sources: [ConversationSource], snapshot original: ConversationSnapshot) throws {
         try brain.store.dbQueue.write { db in

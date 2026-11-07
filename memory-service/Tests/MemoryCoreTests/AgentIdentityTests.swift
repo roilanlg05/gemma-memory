@@ -285,4 +285,251 @@ final class AgentIdentityTests: XCTestCase {
         XCTAssertTrue(rendered.contains("Nova"))
         XCTAssertTrue(rendered.contains("playful"))
     }
+
+    // MARK: Fix round 1
+
+    /// Three revisions on three distinct sources. The texts differ so the retraction's
+    /// content-similarity backstop cannot pull one source in on account of another.
+    private func branchingIdentity() throws -> (MemoryStore, BrainStore, AgentIdentityService, BrainIdentityChange) {
+        let (db, brain, service) = try setup()
+        try source(brain, "e1", text: "The first explicit naming choice")
+        try source(brain, "e2", text: "A separate instruction about humor")
+        try source(brain, "e3", text: "Yet another unrelated request to go back")
+        let ada = BrainIdentityChange.configure(displayName: "Ada", evidenceIDs: ["e1"])
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "o1", change: ada)
+        _ = try service.reviseIdentity(expectedRevision: 1, operationID: "o2",
+                                       change: .configure(character: .init(humor: .playful), evidenceIDs: ["e2"]))
+        _ = try service.reviseIdentity(expectedRevision: 2, operationID: "o3",
+                                       change: .revert(revision: 1, evidenceIDs: ["e3"]))
+        return (db, brain, service, ada)
+    }
+    func testPartialForgetKeepsRevisionsWhoseSourcesAreStillLive() throws {
+        let (db, brain, service, _) = try branchingIdentity()
+        // A forget that never reaches the identity chain changes nothing about it.
+        try source(brain, "e4", text: "Something else entirely, unrelated to the character")
+        _ = try BrainRetractionService(brain: brain).forget(scope: .init(kind: .evidence, id: "e4"),
+                                                            expectedRevision: 3, operationID: "unrelated")
+        XCTAssertEqual(try service.identity().displayName, "Ada")
+        XCTAssertEqual(try service.identity().agentProfile?.history.map(\.revision), [1, 2, 3])
+        _ = try BrainRetractionService(brain: brain).forget(scope: .init(kind: .evidence, id: "e3"),
+                                                            expectedRevision: 4, operationID: "erase")
+        let live = try service.identity()
+        XCTAssertEqual(live.displayName, "Ada")
+        XCTAssertEqual(live.agentProfile?.character.humor, .playful)
+        XCTAssertEqual(live.agentProfile?.history.map(\.revision), [1, 2])
+        let payloads = try db.dbQueue.read { try String.fetchAll($0, sql: "SELECT payload FROM brain_identity_revision") }
+        XCTAssertEqual(payloads.count, 2)
+        // A later revision still lands on, and reads back from, the surviving chain.
+        _ = try service.reviseIdentity(expectedRevision: try brain.revision(), operationID: "o4",
+                                       change: .configure(displayName: "Bea", evidenceIDs: ["e1"]))
+        XCTAssertEqual(try service.identity().displayName, "Bea")
+        XCTAssertEqual(try service.identity().agentProfile?.history.count, 3)
+        // And a revert still resolves across the re-stamped generation.
+        _ = try service.reviseIdentity(expectedRevision: try brain.revision(), operationID: "o5",
+                                       change: .revert(revision: 1, evidenceIDs: ["e1"]))
+        XCTAssertEqual(try service.identity().displayName, "Ada")
+        XCTAssertEqual(try service.identity().agentProfile?.character.humor, .balanced)
+    }
+    /// The core became a mandatory reservation, which means it now competes with recent raw turns
+    /// at tight budgets where a partial identity did not. Competing is allowed; losing a turn
+    /// without saying so is not — that was Task 8's own repaired regression.
+    func testATightBudgetNeverDropsARecentTurnSilentlyBesideTheIdentity() async throws {
+        let (_, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        _ = try brain.recordEvidence(.init(id: "recent", sourceKind: .userMessage, speakerID: "self:user",
+            threadID: "t", observedAt: 5, recordedAt: 5, accessScope: .user,
+            text: String(repeating: "r", count: 900)), idempotencyKey: "recent")
+        let state = ConversationStateStore(brain: brain)
+        for tokens in [1200, 1400, 1600, 2000, 2400, 3000, 9000] {
+            let request = try BrainContextRequest(clientOperationID: "c\(tokens)", threadID: "t", query: "hi",
+                                                  budget: .init(contextTokens: tokens, outputTokens: 100))
+            let bundle = try await BrainContextAssembler(store: state).context(request)
+            let delivered = bundle.recentMessageUnits.first { $0.id == "recent" }
+            let whole = delivered?.text.utf8.count == 900
+            let disclosed = bundle.truncations?.contains { $0.evidenceID == "recent" } ?? false
+            XCTAssertTrue(whole || disclosed, "recent turn lost without disclosure at \(tokens)")
+        }
+    }
+    func testJournalReplayAgreesWithTheLiveIdentityAfterAPartialForget() throws {
+        let (_, brain, service, ada) = try branchingIdentity()
+        _ = try BrainRetractionService(brain: brain).forget(scope: .init(kind: .evidence, id: "e3"),
+                                                            expectedRevision: 3, operationID: "erase")
+        let replay = try service.reviseIdentity(expectedRevision: 0, operationID: "o1", change: ada)
+        let live = try service.identity()
+        XCTAssertEqual(replay.displayName, live.displayName)
+        // A replay may hand back an earlier configuration, never one the record no longer holds:
+        // what it returns must be a prefix of the history that exists now.
+        let replayed = replay.agentProfile!.history
+        XCTAssertEqual(replayed, Array(live.agentProfile!.history.prefix(replayed.count)))
+        XCTAssertFalse(replayed.isEmpty)
+        // The withdrawn revision's own operation stays refused.
+        XCTAssertThrowsError(try service.reviseIdentity(expectedRevision: 0, operationID: "o3",
+            change: .revert(revision: 1, evidenceIDs: ["e3"]))) { XCTAssertEqual($0 as? BrainStoreError, .denied) }
+    }
+    func testIdentityCoreNeverRendersWithoutItsValuesAndBoundaries() async throws {
+        let (_, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+            change: .configure(displayName: "Nova", character: .init(humor: .playful), evidenceIDs: ["choice"]))
+        let state = ConversationStateStore(brain: brain)
+        var omittedSomewhere = false
+        for tokens in [800, 1000, 1400, 1500, 1600, 1800, 2000, 2400, 9000] {
+            let request = try BrainContextRequest(clientOperationID: "c\(tokens)", threadID: "t", query: "hi",
+                                                  budget: .init(contextTokens: tokens, outputTokens: 100))
+            let bundle = try await BrainContextAssembler(store: state).context(request)
+            let rendered = bundle.renderedContext
+            let core = rendered.contains("[agent identity]")
+            XCTAssertEqual(core, rendered.contains("[agent values]"), "values at \(tokens)")
+            XCTAssertEqual(core, rendered.contains("[agent boundaries]"), "boundaries at \(tokens)")
+            if rendered.contains("[agent character]") { XCTAssertTrue(core, "character without core at \(tokens)") }
+            if !core {
+                omittedSomewhere = true
+                XCTAssertTrue(bundle.truncations?.contains { $0.reason == "agentIdentityOmittedBudget" } ?? false,
+                              "undisclosed omission at \(tokens)")
+            }
+        }
+        XCTAssertTrue(omittedSomewhere, "no probed budget exercised the omission disclosure")
+    }
+    /// The brief asks for the identity to be *separately* budgeted, and nothing asserted the
+    /// slice: a change to the tail's limit would have failed no test. At 6000 the whole tail would
+    /// fit inside the overall capacity and is still refused, because it does not fit inside the
+    /// section's own quarter of what remains; with room to spare it renders.
+    func testTheIdentityTailIsBoundedByItsOwnShareOfCapacity() async throws {
+        let (_, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        let bulky = (0..<40).map { "capability line \($0) describing something this installation can do" }
+        let state = ConversationStateStore(brain: brain, capabilityAddenda: bulky)
+        let tight = try BrainContextRequest(clientOperationID: "tight", threadID: "t", query: "hi",
+                                            budget: .init(contextTokens: 6000, outputTokens: 100))
+        let tightened = try await BrainContextAssembler(store: state).context(tight).renderedContext
+        XCTAssertTrue(tightened.contains("[agent identity]"))
+        XCTAssertTrue(tightened.contains("[agent boundaries]"))
+        XCTAssertTrue(tightened.contains("[agent character]"))
+        XCTAssertFalse(tightened.contains("[agent capabilities]"))
+        let roomy = try BrainContextRequest(clientOperationID: "roomy", threadID: "t", query: "hi",
+                                            budget: .init(contextTokens: 20000, outputTokens: 100))
+        let roomier = try await BrainContextAssembler(store: state).context(roomy).renderedContext
+        XCTAssertTrue(roomier.contains("[agent capabilities]"))
+    }
+    /// The one-point disclosure guard swept across budgets: a selected quote is either delivered
+    /// whole or disclosed as omitted, never both and never neither, with the identity in the way.
+    func testASelectedQuoteIsEitherDeliveredOrDisclosedAtEveryBudget() async throws {
+        let (_, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        _ = try brain.recordEvidence(.init(id: "long", sourceKind: .userMessage, speakerID: "self:user",
+            threadID: "t", observedAt: 3, recordedAt: 3, accessScope: .user,
+            text: String(repeating: "q", count: 3000)), idempotencyKey: "long")
+        let state = ConversationStateStore(brain: brain)
+        for tokens in [2000, 3000, 5000, 9000, 20000] {
+            let request = try BrainContextRequest(clientOperationID: "q\(tokens)", threadID: "t", query: "hi",
+                                                  budget: .init(contextTokens: tokens, outputTokens: 100))
+            let bundle = try await BrainContextAssembler(store: state, selector: IdentityQuoteSelector(quoted: ["long"])).context(request)
+            let delivered = bundle.renderedContext.contains("[original quote source=long]")
+            let disclosed = bundle.truncations?.contains {
+                $0.evidenceID == "long" && $0.reason == "quoteOmittedBudget"
+            } ?? false
+            XCTAssertNotEqual(delivered, disclosed, "quote neither delivered nor disclosed at \(tokens)")
+        }
+    }
+    func testAutobiographyNeverRendersAnotherThreadsUtterance() async throws {
+        let db = try MemoryStore(inMemory: true, embeddingDim: 4)
+        let grant = BrainAuthorization(principal: "user", owner: "user",
+            subjects: ["self:user", "self:agent", "relationship:user:agent"],
+            scopes: [.user, .agent, .shared, .thread], threads: ["t", "u"],
+            sourceSpeakers: [.userMessage: ["self:user"], .assistantMessage: ["self:agent"]],
+            mayProject: true, mayCommitClaims: true, mayForget: true, mayReviseIdentity: true)
+        let brain = BrainStore(store: db, authorization: grant, clock: { 100 })
+        let service = AgentIdentityService(brain: brain)
+        _ = try brain.recordEvidence(.init(id: "choice", sourceKind: .userMessage, speakerID: "self:user",
+            threadID: "t", observedAt: 1, recordedAt: 1, accessScope: .user,
+            text: "Choose this character explicitly"), idempotencyKey: "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        let turns = BrainTurnService(store: db, authorization: grant, extractor: IdentityExtractor(), clock: { 100 })
+        let other = try await turns.begin(.init(clientOperationID: "turn-u", threadID: "u",
+            message: .init(id: "mu", speakerID: "self:user", text: "Ask in the other chat", observedAt: 2, evidenceIDs: []),
+            budget: .init(contextTokens: 5000, outputTokens: 100)))
+        let secret = try turns.recordAssistant(turnID: other.turnID, operationID: "said-u",
+                                               text: "SECRET-FROM-OTHER-THREAD about the medical result")
+        // The service's own read stays bounded by the grant's threads, so it still holds it.
+        XCTAssertTrue(try service.identity().agentProfile!.autobiography.contains { $0.evidenceIDs == [secret.id] })
+        // The rendered section for thread t must not carry another chat's words or cite them.
+        let state = ConversationStateStore(brain: brain)
+        let request = try BrainContextRequest(clientOperationID: "context", threadID: "t", query: "hello",
+                                              budget: .init(contextTokens: 9000, outputTokens: 500))
+        let bundle = try await BrainContextAssembler(store: state).context(request)
+        XCTAssertTrue(bundle.renderedContext.contains("[agent identity]"))
+        XCTAssertFalse(bundle.renderedContext.contains("SECRET-FROM-OTHER-THREAD"))
+        XCTAssertFalse(bundle.renderedContext.contains(secret.id))
+        XCTAssertFalse(bundle.sourceReferences.contains { $0.id == secret.id })
+    }
+    func testEveryPrintedSourceIDResolvesInSourceReferences() async throws {
+        let (db, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        let turns = BrainTurnService(store: db, authorization: auth(), extractor: IdentityExtractor(), clock: { 100 })
+        let turn = try await turns.begin(.init(clientOperationID: "turn", threadID: "t",
+            message: .init(id: "m", speakerID: "self:user", text: "Plan a search", observedAt: 2, evidenceIDs: []),
+            budget: .init(contextTokens: 5000, outputTokens: 100)))
+        let spoken = try turns.recordAssistant(turnID: turn.turnID, operationID: "said", text: "I will look that up for you")
+        // A transcript row can be purged while the assistant's own evidence record survives. The
+        // conversation path then stops treating it as a raw turn, so its id is no longer something
+        // a caller can resolve — and must therefore not be printed as a source.
+        try await db.dbQueue.write { db in
+            try db.execute(sql: "DELETE FROM transcript WHERE id IN (SELECT transcript_id FROM brain_turn_ref WHERE evidence_id=?)",
+                           arguments: [spoken.id])
+        }
+        let state = ConversationStateStore(brain: brain)
+        let request = try BrainContextRequest(clientOperationID: "context", threadID: "t", query: "hello",
+                                              budget: .init(contextTokens: 9000, outputTokens: 500))
+        let bundle = try await BrainContextAssembler(store: state).context(request)
+        var printed = Set<String>()
+        for part in bundle.renderedContext.components(separatedBy: "sources=").dropFirst() {
+            let head = String(part.prefix { $0 != "]" && $0 != "\n" })
+            printed.formUnion(head.components(separatedBy: ",").filter { !$0.isEmpty })
+        }
+        XCTAssertFalse(printed.isEmpty)
+        let referenced = Set(bundle.sourceReferences.map(\.id))
+        XCTAssertTrue(printed.isSubset(of: referenced), "unresolvable: \(printed.subtracting(referenced))")
+        XCTAssertFalse(bundle.renderedContext.contains(spoken.id))
+    }
+    func testConcurrentOutcomeReceiptDoesNotConflictWhileWithdrawnIdentityStillDoes() async throws {
+        let (db, brain, service) = try setup()
+        try source(brain, "choice")
+        _ = try service.reviseIdentity(expectedRevision: 0, operationID: "name",
+                                       change: .configure(displayName: "Nova", evidenceIDs: ["choice"]))
+        let turns = BrainTurnService(store: db, authorization: auth(), extractor: IdentityExtractor(), clock: { 100 })
+        let turn = try await turns.begin(.init(clientOperationID: "turn", threadID: "t",
+            message: .init(id: "m", speakerID: "self:user", text: "Plan a search", observedAt: 2, evidenceIDs: []),
+            budget: .init(contextTokens: 5000, outputTokens: 100)))
+        let spoken = try turns.recordAssistant(turnID: turn.turnID, operationID: "said", text: "I will look that up")
+        let state = ConversationStateStore(brain: brain)
+        let request = try BrainContextRequest(clientOperationID: "context", threadID: "t", query: "hello",
+                                              budget: .init(contextTokens: 9000, outputTokens: 500))
+        // The agent recording a receipt for something it already said withdraws nothing, and does
+        // not bump the brain revision, so it must not fail an assembly in flight.
+        let receipt = IdentitySelector {
+            try turns.recordOutcome(.init(id: "o", description: "secret", status: .succeeded,
+                                          recordedAt: 3, evidenceIDs: [spoken.id]))
+        }
+        let bundle = try await BrainContextAssembler(store: state, selector: receipt).context(request)
+        XCTAssertTrue(bundle.renderedContext.contains("[agent identity]"))
+        XCTAssertTrue(bundle.renderedContext.contains("Nova"))
+        // Withdrawing the identity's own source during the await still conflicts.
+        let withdraw = IdentitySelector {
+            _ = try BrainRetractionService(brain: brain).forget(scope: .init(kind: .evidence, id: "choice"),
+                expectedRevision: brain.revision(), operationID: "forget-await")
+        }
+        do {
+            _ = try await BrainContextAssembler(store: state, selector: withdraw).context(request)
+            XCTFail("withdrawn identity escaped")
+        } catch { XCTAssertEqual(error as? BrainStoreError, .conflict) }
+    }
 }

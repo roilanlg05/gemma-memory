@@ -8,6 +8,26 @@ struct AgentIdentityState {
     var character: BrainAgentCharacter?
 }
 
+/// The withdrawable part of an identity — what a retraction can take away — for revalidating a
+/// snapshot after a model await.
+///
+/// The autobiography is deliberately absent. It is a projection that grows as the agent speaks and
+/// as outcome receipts are recorded, and neither of those withdraws anything, so comparing it
+/// turned an ordinary concurrent turn into a typed `conflict` that callers are told to read as
+/// "data was withdrawn". The withdrawal classes stay covered without it: an in-thread utterance
+/// that really is withdrawn also changes `ConversationSnapshot.sources`, and every forget mints a
+/// revision. This set is a conservative superset of the identity's own dependencies — the
+/// generation, the surviving revision numbers, every source those revisions declare, and the
+/// configuration they resolve to — because a missed withdrawal is expensive and a spurious
+/// conflict only costs a recomputation.
+struct AgentIdentityDependencies: Equatable, Sendable {
+    let generation: Int64
+    let revisions: [Int64]
+    let evidenceIDs: [String]
+    let displayName: String
+    let character: BrainAgentCharacter
+}
+
 /// Transactional store for the agent's own identity.
 ///
 /// Three things are deliberately kept apart here:
@@ -107,26 +127,42 @@ final class AgentIdentityStore {
             .map(\.id)
     }
 
-    func identity(agentID: String, db: Database) throws -> BrainIdentity {
+    /// `thread`, when given, confines the experience projection to that one conversation. A caller
+    /// that renders verbatim autobiography text into a prompt passes the thread it is assembling,
+    /// because the agent's own speech routinely restates what the user said and is therefore no
+    /// weaker a class of content than a transcript turn. `nil` is the service's own read, which
+    /// stays bounded by the grant's threads.
+    func identity(agentID: String, db: Database, thread: String? = nil) throws -> BrainIdentity {
         try requireAgentRead(agentID)
         try brain.checkOwner(db, bind: false)
-        return try resolvedIdentity(agentID: agentID, db: db)
+        return try resolvedIdentity(agentID: agentID, db: db, thread: thread)
     }
 
     /// Owner and access are already checked by the caller.
-    private func resolvedIdentity(agentID: String, db: Database) throws -> BrainIdentity {
+    private func resolvedIdentity(agentID: String, db: Database, thread: String? = nil) throws -> BrainIdentity {
         let history = try self.history(agentID, db: db)
         let state = Self.state(history)
         let profile = BrainAgentProfile(
             core: .gemma,
             character: state.character ?? .init(),
             history: history,
-            autobiography: try autobiography(db: db),
+            autobiography: try autobiography(db: db, thread: thread),
             capabilityAddenda: capabilityAddenda)
         return BrainIdentity(id: agentID, kind: .agent,
                              displayName: state.displayName ?? BrainAgentCore.gemma.name,
                              claimIDs: try claimIDs(subject: agentID, scope: .agent, db: db),
                              agentProfile: profile)
+    }
+
+    /// What a retraction could take away from this identity, for post-await revalidation.
+    func dependencies(agentID: String, db: Database) throws -> AgentIdentityDependencies {
+        let history = try self.history(agentID, db: db)
+        let state = Self.state(history)
+        return .init(generation: try generation(db),
+                     revisions: history.map(\.revision),
+                     evidenceIDs: Set(history.flatMap(\.evidenceIDs)).sorted(),
+                     displayName: state.displayName ?? BrainAgentCore.gemma.name,
+                     character: state.character ?? .init())
     }
 
     /// The shared subject. It carries no agent profile and is never merged with either self: the
@@ -140,18 +176,32 @@ final class AgentIdentityStore {
                              agentProfile: nil)
     }
 
-    /// The readable sources the current history rests on, so a caller can cite them.
-    func identityEvidence(agentID: String, db: Database) throws -> [BrainEvidence] {
+    /// The readable sources the current history rests on, so a caller can cite them. `thread`
+    /// confines them to one conversation, for the same reason the experience projection is
+    /// confined: a caller assembling a thread must be able to resolve every id it cites, and
+    /// `BrainContextBundle.sourceReferences` is a same-thread surface.
+    func identityEvidence(agentID: String, db: Database, thread: String? = nil) throws -> [BrainEvidence] {
         var sources = [String: BrainEvidence]()
         for entry in try history(agentID, db: db) {
             for id in entry.evidenceIDs where sources[id] == nil {
                 guard let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_evidence WHERE id=?", arguments: [id]) else { continue }
                 let evidence = try BrainStore.decode(BrainEvidence.self, payload)
-                guard brain.canRead(evidence) else { continue }
+                guard admits(evidence, thread: thread) else { continue }
                 sources[id] = evidence
             }
         }
         return sources.values.sorted { $0.id < $1.id }
+    }
+
+    /// Readable, inside the grant's threads, and — when a thread is named — inside that one.
+    ///
+    /// `BrainStore.canRead` admits `.user`-scoped evidence from any thread, which is right for a
+    /// durable claim and wrong for raw text: every other raw-content path in the conversation
+    /// store is exact-thread by construction, and the identity section must not become the one
+    /// cross-chat channel for verbatim content.
+    private func admits(_ evidence: BrainEvidence, thread: String?) -> Bool {
+        guard brain.canRead(evidence), brain.authorization.threads.contains(evidence.threadID) else { return false }
+        return thread.map { $0 == evidence.threadID } ?? true
     }
 
     /// What the agent actually did, in the order it happened.
@@ -161,13 +211,17 @@ final class AgentIdentityStore {
     /// those utterances. A receipt whose supporting sources are no longer readable is not history
     /// and is dropped. Nothing is copied into a second store, so there is no autobiography to
     /// diverge from the record.
-    func autobiography(db: Database) throws -> [BrainAutobiographyEntry] {
+    ///
+    /// Entries are always bounded by the grant's threads, and by `thread` when one is named — see
+    /// `admits`. A receipt is admitted only when *every* source it names is, so a receipt that
+    /// spans conversations does not carry another one's identifiers into this one.
+    func autobiography(db: Database, thread: String? = nil) throws -> [BrainAutobiographyEntry] {
         var entries = [BrainAutobiographyEntry]()
         var spoken = Set<String>()
         for payload in try String.fetchAll(db, sql: "SELECT payload FROM brain_evidence ORDER BY id") {
             guard let evidence = try? BrainStore.decode(BrainEvidence.self, payload) else { continue }
             guard evidence.sourceKind == .assistantMessage, evidence.speakerID == BrainIdentity.agentID,
-                  brain.canRead(evidence), let text = evidence.text, !text.isEmpty else { continue }
+                  admits(evidence, thread: thread), let text = evidence.text, !text.isEmpty else { continue }
             spoken.insert(evidence.id)
             entries.append(.init(id: evidence.id, kind: .utterance, qualification: .utteranceOnly,
                                  text: text, status: nil, redacted: false,
@@ -179,12 +233,12 @@ final class AgentIdentityStore {
             let refs = try String.fetchAll(db, sql: "SELECT evidence_id FROM brain_turn_outcome_ref WHERE principal=? AND operation_hash=? ORDER BY evidence_id",
                                            arguments: [principal, key])
             guard !refs.isEmpty, refs.contains(where: { spoken.contains($0) }) else { continue }
-            let readable = try refs.allSatisfy { id in
+            let admitted = try refs.allSatisfy { id in
                 guard let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_evidence WHERE id=?", arguments: [id]),
                       let evidence = try? BrainStore.decode(BrainEvidence.self, payload) else { return false }
-                return brain.canRead(evidence)
+                return admits(evidence, thread: thread)
             }
-            guard readable, let outcome = try? BrainStore.decode(BrainOutcome.self, row["payload"] as String) else { continue }
+            guard admitted, let outcome = try? BrainStore.decode(BrainOutcome.self, row["payload"] as String) else { continue }
             // Redaction is a durable property of the stored receipt, not a rendering choice: until
             // Tasks 12/14 inject an audited sanitiser the description is empty and stays empty.
             let redacted: Bool = row["redacted"]
@@ -263,12 +317,27 @@ final class AgentIdentityStore {
         let requestHash = BrainStore.digest(try BrainStore.encode(change))
         return try brain.store.dbQueue.write { db in
             try brain.checkOwner(db, bind: true)
-            if let row = try Row.fetchOne(db, sql: "SELECT request_hash, result, withdrawn FROM brain_identity_operation WHERE principal=? AND operation_hash=?",
+            if let row = try Row.fetchOne(db, sql: "SELECT request_hash, result, withdrawn, revision FROM brain_identity_operation WHERE principal=? AND operation_hash=?",
                                           arguments: [brain.authorization.principal, key]) {
                 guard !(row["withdrawn"] as Bool) else { throw BrainStoreError.denied }
                 guard (row["request_hash"] as String?) == requestHash,
                       let result = row["result"] as String? else { throw BrainStoreError.conflict }
-                return try projecting(BrainStore.decode(BrainIdentity.self, result), db: db)
+                // A replay may hand back an earlier configuration — a retry of an operation that
+                // later revisions have since built on is not a conflict, and the caller asked for
+                // what *that* operation did. It may never hand back a configuration the surviving
+                // record no longer holds: the operation's own revision must still be live, and
+                // what it returned must be a prefix of the history that exists now. Otherwise an
+                // idempotent retry would be told something the very next read contradicts, which
+                // is how withdrawn personalisation comes back.
+                let stored = try BrainStore.decode(BrainIdentity.self, result)
+                let live = try self.history(agentID, db: db)
+                guard let storedRevision = row["revision"] as Int64?,
+                      live.contains(where: { $0.revision == storedRevision }),
+                      let storedProfile = stored.agentProfile,
+                      Array(live.prefix(storedProfile.history.count)) == storedProfile.history else {
+                    throw BrainStoreError.conflict
+                }
+                return try projecting(stored, db: db)
             }
             let current = try BrainStore.revision(db)
             guard expectedRevision == current, current < Int64.max else { throw BrainStoreError.conflict }
@@ -399,6 +468,18 @@ extension BrainStore {
             try db.execute(sql: "UPDATE brain_identity_operation SET withdrawn=1, request_hash=NULL, result=NULL, revision=NULL WHERE principal=? AND operation_hash=?",
                            arguments: [row["principal"] as String, row["operation_hash"] as String])
         }
-        try db.execute(sql: "UPDATE brain_identity_meta SET generation=generation+1 WHERE id=1")
+        // The generation counter is a stale-backup defence, so it still advances after a partial
+        // purge — but the survivors are re-stamped into the new generation in the same
+        // transaction. Advancing it without re-stamping made every revision whose sources are
+        // still live unreadable, which is a silent erasure far wider than the user asked for: a
+        // forget of the one message that authorised a revert also took the name and the character
+        // set from two other messages that were still there.
+        let generation = try Int64.fetchOne(db, sql: "SELECT generation FROM brain_identity_meta WHERE id=1") ?? 0
+        guard generation < Int64.max else { throw BrainStoreError.invalid }
+        if !clearAll {
+            try db.execute(sql: "UPDATE brain_identity_revision SET generation=? WHERE generation=?",
+                           arguments: [generation + 1, generation])
+        }
+        try db.execute(sql: "UPDATE brain_identity_meta SET generation=? WHERE id=1", arguments: [generation + 1])
     }
 }

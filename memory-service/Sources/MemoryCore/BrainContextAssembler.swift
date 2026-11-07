@@ -140,20 +140,37 @@ public final class BrainContextAssembler {
         guard try fits(draft, request: request, revision: snapshot.revision) else {
             throw BrainContextAssemblyError.insufficientBudget
         }
-        // The agent's identity gets its own section and its own slice of the input capacity. It
-        // goes in before any conversation content, so sheer conversation volume cannot evict who
-        // the assistant is, and after the mandatory omission notices, so the identity cannot take
-        // the space an original's disclosure is owed. Its own slice is a quarter of what is left,
-        // which keeps it from evicting the conversation either. It is never folded in with user
-        // memories: a `[memory]` block is something the user told the brain, an `[agent ...]`
-        // block is not, and a reader must be able to tell which is which.
-        if let identity = snapshot.identity {
+        // The agent's identity gets its own section. It goes in before any conversation content,
+        // so sheer conversation volume cannot evict who the assistant is, and after the mandatory
+        // omission notices, so it cannot take the space an original's disclosure is owed. It is
+        // never folded in with user memories: a `[memory]` block is something the user told the
+        // brain, an `[agent ...]` block is not, and a reader must be able to tell which is which.
+        if let identity = snapshot.identity, identity.agentProfile != nil {
             for evidence in snapshot.identityEvidence { available[evidence.id] = evidence }
             let identityIDs = snapshot.identityEvidence.map(\.id)
-            let base = try estimatedInput(draft, request: request, revision: snapshot.revision)
-            let identityLimit = base + max(0, (capacity(request.budget) - base) / 4)
-            for block in Self.identityBlocks(identity, sourceIDs: identityIDs) {
-                try add(block: block, ids: identityIDs, maximumInput: identityLimit)
+            let core = Self.identityCoreBlock(identity, sourceIDs: identityIDs)
+            // The core is one indivisible unit, offered against the capacity that remains rather
+            // than against the section's own slice. An identity assertion that keeps `name=` and
+            // drops the values and the boundaries — the only statement in the system that the
+            // agent has no childhood, body or suffering — is strictly worse than no identity
+            // section at all, so this is a mandatory reservation and not a best effort.
+            if try add(block: core, ids: identityIDs) {
+                let base = try estimatedInput(draft, request: request, revision: snapshot.revision)
+                let limit = base + max(0, (capacity(request.budget) - base) / 4)
+                // The optional tail lives in its own quarter of what is left, so the identity
+                // cannot evict the conversation. Priority descends — character, then what this
+                // installation can do, then experience — and the first block that does not fit
+                // stops the rest, so two budgets differ by a prefix of the section rather than by
+                // an arbitrary subset of it.
+                for (block, ids) in Self.identityOptionalBlocks(identity, resolvable: { available[$0] != nil }) {
+                    if try !add(block: block, ids: ids, maximumInput: limit) { break }
+                }
+            } else {
+                // Nothing goes missing silently: the caller is told the section did not fit,
+                // through the same disclosure mechanism an omitted original uses.
+                try add(truncations: [.init(evidenceID: BrainIdentity.agentID,
+                                            originalUTF8Bytes: core.utf8.count, includedUTF8Bytes: 0,
+                                            reason: "agentIdentityOmittedBudget")])
             }
         }
         for id in selected {
@@ -229,28 +246,40 @@ public final class BrainContextAssembler {
         guard estimate <= capacity(request.budget) else { throw BrainContextAssemblyError.insufficientBudget }
         return bundle(draft, request: request, revision: snapshot.revision, estimate: estimate)
     }
-    /// The agent identity as its own ordered blocks, most load-bearing first: who it is, what it
-    /// works by, what it must not claim about itself, how it was configured to come across, what
-    /// this installation can actually do, and then the few most recent things that actually
-    /// happened. Each block is added only if it fits whole — an experience is never rendered as a
-    /// prefix, because a half-quoted utterance of its own is exactly the kind of thing an assistant
-    /// should not be left to complete from memory.
-    private static func identityBlocks(_ identity: BrainIdentity, sourceIDs: [String]) -> [String] {
-        guard let profile = identity.agentProfile else { return [] }
+    /// Who the agent is, what it works by, and what it must not claim about itself — one block,
+    /// because the parts are not separable. An empty string when there is no agent profile, which
+    /// `add` treats as nothing to add.
+    private static func identityCoreBlock(_ identity: BrainIdentity, sourceIDs: [String]) -> String {
+        guard let profile = identity.agentProfile else { return "" }
         let sources = sourceIDs.isEmpty ? "" : "\nsources=" + sourceIDs.joined(separator: ",")
-        var blocks = ["[agent identity]\nname=\(identity.displayName)\nnature=\(profile.core.nature)\(sources)"]
-        blocks.append("[agent values]\n" + profile.core.values.joined(separator: "\n"))
-        blocks.append("[agent boundaries]\n" + profile.core.boundaries.joined(separator: "\n"))
+        return "[agent identity]\nname=\(identity.displayName)\nnature=\(profile.core.nature)\(sources)\n"
+            + "[agent values]\n" + profile.core.values.joined(separator: "\n") + "\n"
+            + "[agent boundaries]\n" + profile.core.boundaries.joined(separator: "\n")
+    }
+
+    /// Everything after the core, in descending priority: how it was configured to come across,
+    /// what this installation can actually do, then the few most recent things that actually
+    /// happened. Each carries the ids it cites so they land in `sourceReferences`.
+    ///
+    /// An experience is only offered when every source it names resolves. An id printed in a
+    /// `sources=` header that a caller cannot look up is worse than silence: it invites a later
+    /// task to trust an identifier that does not resolve and cannot be forgotten. An experience is
+    /// also never rendered as a prefix — a half-quoted utterance of its own is exactly the kind of
+    /// thing an assistant should not be left to complete from memory.
+    private static func identityOptionalBlocks(_ identity: BrainIdentity,
+                                               resolvable: (String) -> Bool) -> [(String, [String])] {
+        guard let profile = identity.agentProfile else { return [] }
         let character = profile.character
-        blocks.append("[agent character]\nhumor=\(character.humor.rawValue)\npace=\(character.pace.rawValue)\nformality=\(character.formality.rawValue)\nverbosity=\(character.verbosity.rawValue)")
+        var blocks = [("[agent character]\nhumor=\(character.humor.rawValue)\npace=\(character.pace.rawValue)\nformality=\(character.formality.rawValue)\nverbosity=\(character.verbosity.rawValue)", [String]())]
         if !profile.capabilityAddenda.isEmpty {
-            blocks.append("[agent capabilities]\n" + profile.capabilityAddenda.joined(separator: "\n"))
+            blocks.append(("[agent capabilities]\n" + profile.capabilityAddenda.joined(separator: "\n"), []))
         }
-        for entry in profile.autobiography.suffix(3) {
+        let citable = profile.autobiography.filter { !$0.evidenceIDs.isEmpty && $0.evidenceIDs.allSatisfy(resolvable) }
+        for entry in citable.suffix(3) {
             let header = "[agent experience \(entry.qualification.rawValue)"
                 + (entry.status.map { " status=\($0.rawValue)" } ?? "")
                 + " sources=\(entry.evidenceIDs.joined(separator: ","))]"
-            blocks.append(header + "\n" + (entry.redacted ? "(text withheld)" : entry.text))
+            blocks.append((header + "\n" + (entry.redacted ? "(text withheld)" : entry.text), entry.evidenceIDs))
         }
         return blocks
     }
