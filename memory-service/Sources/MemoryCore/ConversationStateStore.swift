@@ -95,6 +95,24 @@ public final class ConversationStateStore {
             let turn = try String.fetchOne(db, sql: "SELECT turn_id FROM brain_turn_ref WHERE evidence_id=? ORDER BY turn_id LIMIT 1", arguments: [evidence.id])
             sources.append(.init(evidence: evidence, transcriptID: nil, groupID: turn.map { "turn:" + $0 } ?? "source:" + evidence.id))
         }
+        // Both storage populations share a timeline. Timestamps govern across differing
+        // times; actual transcript sequence wins tied timestamps before kind/ID tie-breaks.
+        let transcriptSequences = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0.seq) })
+        sources.sort { lhs, rhs in
+            if lhs.evidence.observedAt != rhs.evidence.observedAt { return lhs.evidence.observedAt < rhs.evidence.observedAt }
+            if lhs.evidence.recordedAt != rhs.evidence.recordedAt { return lhs.evidence.recordedAt < rhs.evidence.recordedAt }
+            let leftSequence = lhs.transcriptID.flatMap { transcriptSequences[$0] }
+            let rightSequence = rhs.transcriptID.flatMap { transcriptSequences[$0] }
+            switch (leftSequence, rightSequence) {
+            case let (.some(left), .some(right)):
+                if left != right { return left < right }
+            case (.some, .none): return true
+            case (.none, .some): return false
+            case (.none, .none): break
+            }
+            if lhs.evidence.sourceKind != rhs.evidence.sourceKind { return lhs.evidence.sourceKind.rawValue < rhs.evidence.sourceKind.rawValue }
+            return lhs.evidence.id < rhs.evidence.id
+        }
         var assigned = Set<String>(), groupNames = Set<String>()
         for group in unitGroups {
             guard !group.id.isEmpty, groupNames.insert(group.id).inserted,

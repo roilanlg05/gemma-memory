@@ -385,4 +385,78 @@ final class AdaptiveConversationTests: XCTestCase {
         XCTAssertThrowsError(try journal.capture(changed)) { XCTAssertEqual($0 as? BrainStoreError, .conflict) }
     }
 
+    func testSelectedOriginalOmissionMustThrowWhenMandatoryDisclosureCannotFit() async throws {
+        let (_, brain, state) = try setup()
+        let probe = try await BrainContextAssembler(store: state).context(request("q", tokens: 4096))
+        let envelope = try XCTUnwrap(probe.accounting).estimatedInputTokens
+        // Leave only 32 bytes beyond a fitting mandatory query/envelope, less than a disclosure.
+        let query = String(repeating: "q", count: 3200 - envelope + 1 - 32)
+        try source(brain, "large", String(repeating: "Original ", count: 1000))
+        for quote in [true, false] {
+            let selector = ContextSelector { _ in
+                quote ? .init(quoteEvidenceIDs: ["large"]) : .init(detailEvidenceIDs: ["large"])
+            }
+            do {
+                _ = try await BrainContextAssembler(store: state, selector: selector).context(request(query, tokens: 4096))
+                XCTFail("Returned success without space for required original-omission disclosure")
+            } catch { XCTAssertEqual(error as? BrainContextAssemblyError, .insufficientBudget) }
+        }
+    }
+    func testEveryRequestedQuoteRemainsExactOrExplicitlyOmittedWhenEarlierQuotesConsumeBudget() async throws {
+        for length in stride(from: 2000, through: 3000, by: 50) {
+            let (_, brain, state) = try setup()
+            let first = String(repeating: "a", count: length), second = String(repeating: "b", count: 10000)
+            try source(brain, "first", first, 1)
+            try source(brain, "second", second, 2)
+            let selector = ContextSelector { _ in .init(quoteEvidenceIDs: ["first", "second"]) }
+            let bundle = try await BrainContextAssembler(store: state, selector: selector).context(request(tokens: 4096))
+            for (id, original) in [("first", first), ("second", second)] {
+                let full = bundle.renderedContext.contains("[original quote source=\(id)]\n\(original)")
+                let omitted = bundle.truncations?.contains {
+                    $0.evidenceID == id && $0.reason == "quoteOmittedBudget"
+                        && $0.originalUTF8Bytes == original.utf8.count && $0.includedUTF8Bytes == 0
+                } == true
+                XCTAssertTrue(full || omitted, "Missing quote or disclosure for \(id), first length \(length)")
+                XCTAssertFalse(full && omitted, "A delivered full quote must not also be marked omitted")
+            }
+            XCTAssertLessThanOrEqual(try XCTUnwrap(bundle.accounting).estimatedInputTokens + 896, 4096)
+        }
+    }
+    func testMixedOriginalsShareChronologyForRecentContextAndCompactionPrefix() async throws {
+        let (db, brain, state) = try setup()
+        try source(brain, "earlier", "Earlier persisted original", 1)
+        try TranscriptStore(dbQueue: db.dbQueue).append(threadId: "t", turnIndex: 1, role: "user", text: "Later transcript turn", now: 2)
+        let snapshot = try state.snapshot(threadID: "t")
+        XCTAssertEqual(snapshot.sources.map { $0.evidence.text }, ["Earlier persisted original", "Later transcript turn"])
+        let latest = try XCTUnwrap(snapshot.sources.first { $0.evidence.text == "Later transcript turn" }?.evidence.id)
+        let bundle = try await BrainContextAssembler(store: state).context(request())
+        XCTAssertEqual(bundle.recentMessageUnits.map(\.text), ["Earlier persisted original", "Later transcript turn"])
+        let model = ContextModel { originals in
+            XCTAssertEqual(originals.map(\.text), ["Earlier persisted original", "Later transcript turn"])
+            return .init(gist: [.init(text: "Ordered conversation", evidenceIDs: originals.map(\.id), modality: .asserted)])
+        }
+        try await ConversationCompactor(store: state, model: model).update(threadID: "t", throughEvidenceID: latest)
+        XCTAssertEqual(try state.snapshot(threadID: "t").segments.first?.sources.count, 2)
+    }
+    func testOlderLargePersistedOriginalCannotDisplaceActualNewestTranscriptTurn() async throws {
+        let (db, brain, state) = try setup()
+        try source(brain, "earlier", String(repeating: "Old original ", count: 1000), 1)
+        try TranscriptStore(dbQueue: db.dbQueue).append(threadId: "t", turnIndex: 1, role: "user", text: "Newest user turn", now: 2)
+        let bundle = try await BrainContextAssembler(store: state).context(request(tokens: 4096))
+        XCTAssertEqual(bundle.recentMessageUnits.last?.text, "Newest user turn")
+        XCTAssertEqual(bundle.recentMessageUnits.last?.observedAt, 2)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(bundle.accounting).estimatedInputTokens + 896, 4096)
+    }
+    func testEqualTimestampTimelineRetainsTranscriptSequenceBeforeStableUnsequencedTie() async throws {
+        let (db, brain, state) = try setup()
+        let transcript = TranscriptStore(dbQueue: db.dbQueue)
+        for (turn, role, text) in [(1, "user", "user one"), (1, "assistant", "assistant one"),
+                                   (2, "user", "user two"), (2, "assistant", "assistant two")] {
+            try transcript.append(threadId: "t", turnIndex: turn, role: role, text: text, now: 5)
+        }
+        try source(brain, "unsequenced", "unsequenced", 5)
+        XCTAssertEqual(try state.snapshot(threadID: "t").sources.map { $0.evidence.text },
+                       ["user one", "assistant one", "user two", "assistant two", "unsequenced"])
+    }
+
 }

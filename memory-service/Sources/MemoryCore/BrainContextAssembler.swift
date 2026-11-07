@@ -128,14 +128,25 @@ public final class BrainContextAssembler {
         }
         let quotes = Set(selection.quoteEvidenceIDs)
         var detailed = Set<String>()
-        for id in selection.quoteEvidenceIDs + selection.detailEvidenceIDs where detailed.insert(id).inserted {
-            guard let evidence = originals[id], let text = evidence.text else { continue }
+        let selected = (selection.quoteEvidenceIDs + selection.detailEvidenceIDs).filter { detailed.insert($0).inserted }
+        // Every selected original must be delivered fully or explicitly accounted for. Reserve
+        // all omission notices first, so an earlier quote cannot consume a later disclosure.
+        let disclosures = try selected.map { id -> BrainContextTruncation in
+            guard let text = originals[id]?.text else { throw BrainStoreError.invalid }
+            return .init(evidenceID: id, originalUTF8Bytes: text.utf8.count, includedUTF8Bytes: 0,
+                         reason: quotes.contains(id) ? "quoteOmittedBudget" : "detailOmittedBudget")
+        }
+        draft = adding(to: draft, truncations: disclosures)
+        guard try fits(draft, request: request, revision: snapshot.revision) else {
+            throw BrainContextAssemblyError.insufficientBudget
+        }
+        for id in selected {
+            guard let text = originals[id]?.text else { throw BrainStoreError.invalid }
             let label = quotes.contains(id) ? "original quote" : "original detail"
-            if try !add(block: "[\(label) source=\(id)]\n\(text)", ids: [id]) {
-                // Never turn a truncated prefix or a gist into a claimed full exact quotation.
-                try add(truncations: [.init(evidenceID: id, originalUTF8Bytes: text.utf8.count,
-                                            includedUTF8Bytes: 0, reason: quotes.contains(id) ? "quoteOmittedBudget" : "detailOmittedBudget")])
-            }
+            var withoutDisclosure = draft
+            withoutDisclosure.truncations.removeAll { $0.evidenceID == id }
+            let delivered = adding(to: withoutDisclosure, block: "[\(label) source=\(id)]\n\(text)", ids: [id])
+            if try fits(delivered, request: request, revision: snapshot.revision) { draft = delivered }
         }
         for id in selection.claimIDs {
             guard let claim = claims[id] else { continue }
