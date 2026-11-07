@@ -40,7 +40,16 @@ public struct BrainContextRequest: Codable, Equatable, Sendable {
     }
 }
 
-/// Rendered context belongs to this turn and records the revisions and original sources used to build it.
+/// Rendered context belongs to this turn and records the revisions it was built at.
+///
+/// `sourceReferences` is every original this bundle **accounted for**, not every original it used.
+/// An entry there may have been delivered whole, delivered as a marked prefix, or withheld
+/// entirely: the id is registered so that an omission can name it and so that a caller can resolve
+/// and forget it, which means presence in this list is not evidence of delivery. Delivery is read
+/// from `truncations` — an original with no entry was delivered whole, `includedUTF8Bytes == 0`
+/// means it was withheld, and a value in between means a prefix was rendered. A consumer building
+/// citations from this list without consulting `truncations` will cite a source the model never
+/// saw.
 
 public struct BrainContextBundle: Codable, Equatable, Sendable {
     public let renderedContext: String
