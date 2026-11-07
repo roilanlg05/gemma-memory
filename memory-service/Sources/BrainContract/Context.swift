@@ -6,13 +6,19 @@ public struct BrainContextRequest: Codable, Equatable, Sendable {
     public let threadID: String
     public let query: String
     public let budget: BrainContextBudget
+    /// Explicit original selection within this thread. Quotes take precedence over details for
+    /// the same id. Leaving both fields absent lets an installed selector make the selection.
+    public let quoteEvidenceIDs: [String]?
+    public let detailEvidenceIDs: [String]?
 
     public init(
         schemaVersion: Int = 1,
         clientOperationID: String,
         threadID: String,
         query: String,
-        budget: BrainContextBudget
+        budget: BrainContextBudget,
+        quoteEvidenceIDs: [String]? = nil,
+        detailEvidenceIDs: [String]? = nil
     ) throws {
         try BrainValidation.request(schemaVersion, clientOperationID)
         self.schemaVersion = schemaVersion
@@ -20,10 +26,12 @@ public struct BrainContextRequest: Codable, Equatable, Sendable {
         self.threadID = threadID
         self.query = query
         self.budget = budget
+        self.quoteEvidenceIDs = quoteEvidenceIDs
+        self.detailEvidenceIDs = detailEvidenceIDs
     }
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, clientOperationID, threadID, query, budget
+        case schemaVersion, clientOperationID, threadID, query, budget, quoteEvidenceIDs, detailEvidenceIDs
     }
 
     public init(from decoder: Decoder) throws {
@@ -35,21 +43,25 @@ public struct BrainContextRequest: Codable, Equatable, Sendable {
             clientOperationID: try c.decode(String.self, forKey: .clientOperationID),
             threadID: try c.decode(String.self, forKey: .threadID),
             query: try c.decode(String.self, forKey: .query),
-            budget: try c.decode(BrainContextBudget.self, forKey: .budget)
+            budget: try c.decode(BrainContextBudget.self, forKey: .budget),
+            quoteEvidenceIDs: try c.decodeIfPresent([String].self, forKey: .quoteEvidenceIDs),
+            detailEvidenceIDs: try c.decodeIfPresent([String].self, forKey: .detailEvidenceIDs)
         )
     }
 }
 
-/// Rendered context belongs to this turn and records the revisions it was built at.
-///
-/// `sourceReferences` is every original this bundle **accounted for**, not every original it used.
-/// An entry there may have been delivered whole, delivered as a marked prefix, or withheld
-/// entirely: the id is registered so that an omission can name it and so that a caller can resolve
-/// and forget it, which means presence in this list is not evidence of delivery. Delivery is read
-/// from `truncations` — an original with no entry was delivered whole, `includedUTF8Bytes == 0`
-/// means it was withheld, and a value in between means a prefix was rendered. A consumer building
-/// citations from this list without consulting `truncations` will cite a source the model never
-/// saw.
+/// How an evidence source contributed to the delivered bundle. One source may have several uses.
+public enum BrainContextSourceUse: String, Codable, Equatable, Sendable {
+    case renderedQuote
+    case renderedDetail
+    case recentWhole
+    case recentPrefix
+    case derivedSupport
+}
+
+/// Context belongs to this turn and records the revisions it was built at.
+/// sourceReferences supplies metadata for used sources and individually named omissions.
+/// sourceUses records actual delivery independently of channel-specific omission notices.
 public struct BrainContextBundle: Codable, Equatable, Sendable {
     public let renderedContext: String
     public let recentMessageUnits: [BrainMessageUnit]
@@ -58,6 +70,21 @@ public struct BrainContextBundle: Codable, Equatable, Sendable {
     public let policyRevision: Int64
     public let accounting: BrainContextAccounting?
     public let truncations: [BrainContextTruncation]?
+    /// Sparse use records keyed by evidence id. An absent record makes no claim of delivery.
+    public let sourceUses: [String: [BrainContextSourceUse]]?
+
+    /// Sources whose complete original text was forwarded. Set includingRenderedContext only
+    /// when renderedContext was sent in full, and pass the IDs of recent units sent unchanged.
+    /// Legacy bundles without explicit use records yield no exact citation sources.
+    public func exactCitationSourceReferences(includingRenderedContext: Bool,
+                                              forwardedRecentUnitIDs: Set<String>) -> [BrainEvidence] {
+        sourceReferences.filter { source in
+            guard let uses = sourceUses?[source.id] else { return false }
+            let rendered = includingRenderedContext && (uses.contains(.renderedQuote) || uses.contains(.renderedDetail))
+            let recent = forwardedRecentUnitIDs.contains(source.id) && uses.contains(.recentWhole)
+            return rendered || recent
+        }
+    }
 
     public init(
         renderedContext: String,
@@ -66,7 +93,8 @@ public struct BrainContextBundle: Codable, Equatable, Sendable {
         revision: Int64,
         policyRevision: Int64,
         accounting: BrainContextAccounting? = nil,
-        truncations: [BrainContextTruncation]? = nil
+        truncations: [BrainContextTruncation]? = nil,
+        sourceUses: [String: [BrainContextSourceUse]]? = nil
     ) {
         self.renderedContext = renderedContext
         self.recentMessageUnits = recentMessageUnits
@@ -75,6 +103,7 @@ public struct BrainContextBundle: Codable, Equatable, Sendable {
         self.policyRevision = policyRevision
         self.accounting = accounting
         self.truncations = truncations
+        self.sourceUses = sourceUses
     }
 }
 
@@ -96,38 +125,31 @@ public struct BrainContextAccounting: Codable, Equatable, Sendable {
     }
 }
 
-/// Byte counts refer to an original source. A partial recent unit is never a full exact quote.
+/// Reports the effect of a budget limit in the section identified by reason.
+/// For example, a quote omitted from the rendered section can still have a whole original or
+/// prefix in the recent section. Consult BrainContextBundle.sourceUses for delivery.
 ///
-/// `evidenceID` is absent when the entry does not describe one original: a rendered section that
-/// did not fit, or an aggregate notice standing for several omissions at a budget too small to
-/// carry one entry each. The byte counts then describe that section or that aggregate.
-///
-/// A present `evidenceID` always resolves in `BrainContextBundle.sourceReferences`. The assembler
-/// reserves an original's metadata entry together with the notice that may name it, so an
-/// advertised id is followable and is a valid forget target whether or not the original itself was
-/// delivered. A subject, a predicate or any other kind of identifier is never put here, because an
-/// id that does not resolve is worse than no id at all.
-///
-/// Resolving is therefore not evidence of delivery, and the two are told apart from this type, not
-/// from `sourceReferences`: `includedUTF8Bytes == 0` means the original was wholly omitted, a value
-/// between zero and `originalUTF8Bytes` means a marked prefix of it was rendered, and an original
-/// with no entry at all was delivered whole. A `sourceReferences` entry is metadata about an
-/// original this bundle accounted for; it never carries text, for a delivered original or an
-/// omitted one.
+/// A named evidenceID resolves in BrainContextBundle.sourceReferences in an assembled bundle.
+/// An id-less notice describes a section or an aggregate. For selected quote and detail aggregates,
+/// the original byte count is the sum for the omitted originals and omittedEvidenceCount is the
+/// number of originals it covers.
 public struct BrainContextTruncation: Codable, Equatable, Sendable {
     public let evidenceID: String?
     public let originalUTF8Bytes: Int
     public let includedUTF8Bytes: Int
     public let reason: String
-    public init(evidenceID: String?, originalUTF8Bytes: Int, includedUTF8Bytes: Int, reason: String) {
+    public let omittedEvidenceCount: Int?
+    public init(evidenceID: String?, originalUTF8Bytes: Int, includedUTF8Bytes: Int, reason: String,
+                omittedEvidenceCount: Int? = nil) {
         self.evidenceID = evidenceID
         self.originalUTF8Bytes = originalUTF8Bytes
         self.includedUTF8Bytes = includedUTF8Bytes
         self.reason = reason
+        self.omittedEvidenceCount = omittedEvidenceCount
     }
 
     private enum CodingKeys: String, CodingKey {
-        case evidenceID, originalUTF8Bytes, includedUTF8Bytes, reason
+        case evidenceID, originalUTF8Bytes, includedUTF8Bytes, reason, omittedEvidenceCount
     }
 
     public init(from decoder: Decoder) throws {
@@ -136,7 +158,8 @@ public struct BrainContextTruncation: Codable, Equatable, Sendable {
             evidenceID: try c.decodeIfPresent(String.self, forKey: .evidenceID),
             originalUTF8Bytes: try c.decode(Int.self, forKey: .originalUTF8Bytes),
             includedUTF8Bytes: try c.decode(Int.self, forKey: .includedUTF8Bytes),
-            reason: try c.decode(String.self, forKey: .reason)
+            reason: try c.decode(String.self, forKey: .reason),
+            omittedEvidenceCount: try c.decodeIfPresent(Int.self, forKey: .omittedEvidenceCount)
         )
     }
 }

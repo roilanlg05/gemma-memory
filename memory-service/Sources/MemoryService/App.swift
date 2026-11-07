@@ -213,6 +213,7 @@ public func buildApp(services: Services, port: Int) async throws -> some Applica
     ConfigHandlers(services: services).register(on: v1)
     ConnectionServicesHandlers(services: services).register(on: v1)
     AgentHandlers(services: services).register(on: v1)
+    BrainHandlers(services: services).register(on: v1)
     v1.get("/echo") { _, _ -> Response in
         return Response(
             status: .ok,

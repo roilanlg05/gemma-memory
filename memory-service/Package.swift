@@ -30,6 +30,7 @@ let package = Package(
         .executableTarget(
             name: "MemoryService",
             dependencies: [
+                "BrainContract",
                 "MemoryCore",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
@@ -42,6 +43,7 @@ let package = Package(
         .testTarget(
             name: "MemoryServiceTests",
             dependencies: [
+                "BrainContract",
                 "MemoryService",
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
             ]),

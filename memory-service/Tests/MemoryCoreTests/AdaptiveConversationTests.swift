@@ -52,6 +52,7 @@ final class AdaptiveConversationTests: XCTestCase {
         let detailed = try await BrainContextAssembler(store: state, selector: selector).context(request("¿Y el columpio?"))
         XCTAssertTrue(detailed.renderedContext.contains("El columpio azul estaba roto."))
         XCTAssertTrue(detailed.sourceReferences.contains { $0.id == "park" })
+        XCTAssertEqual(detailed.sourceUses?["park"], [.renderedDetail, .derivedSupport])
     }
     func testLiteralQuoteUsesOriginalBytesNeverSummaryParaphrase() async throws {
         let (_, brain, state) = try setup()
@@ -203,6 +204,8 @@ final class AdaptiveConversationTests: XCTestCase {
         let bundle = try await BrainContextAssembler(store: reader, selector: selector).context(request())
         XCTAssertTrue(bundle.renderedContext.contains("No peanuts"))
         XCTAssertTrue(bundle.sourceReferences.contains { $0.id == "shared" })
+        XCTAssertEqual(bundle.sourceUses?["shared"], [.derivedSupport])
+        XCTAssertTrue(bundle.exactCitationSourceReferences(includingRenderedContext: true, forwardedRecentUnitIDs: []).isEmpty)
         XCTAssertFalse(bundle.renderedContext.contains("Private other constraint"))
     }
     func testMalformedSummaryCannotPersistInventedSource() async throws {
@@ -410,18 +413,92 @@ final class AdaptiveConversationTests: XCTestCase {
             try source(brain, "second", second, 2)
             let selector = ContextSelector { _ in .init(quoteEvidenceIDs: ["first", "second"]) }
             let bundle = try await BrainContextAssembler(store: state, selector: selector).context(request(tokens: 4096))
+            var omitted = [String: Int]()
             for (id, original) in [("first", first), ("second", second)] {
-                let full = bundle.renderedContext.contains("[original quote source=\(id)]\n\(original)")
-                let omitted = bundle.truncations?.contains {
-                    $0.evidenceID == id && $0.reason == "quoteOmittedBudget"
-                        && $0.originalUTF8Bytes == original.utf8.count && $0.includedUTF8Bytes == 0
-                } == true
-                XCTAssertTrue(full || omitted, "Missing quote or disclosure for \(id), first length \(length)")
-                XCTAssertFalse(full && omitted, "A delivered full quote must not also be marked omitted")
+                let header = "[original quote source=\(id)]\n"
+                let full = bundle.renderedContext.contains(header + original)
+                XCTAssertEqual(bundle.renderedContext.contains(header), full, "Partial quote for \(id)")
+                XCTAssertEqual(bundle.sourceUses?[id]?.contains(.renderedQuote) == true, full)
+                if !full { omitted[id] = original.utf8.count }
+            }
+            let truncations = bundle.truncations ?? []
+            let resolved = Set(bundle.sourceReferences.map(\.id))
+            XCTAssertTrue(Set(truncations.compactMap(\.evidenceID)).isSubset(of: resolved))
+            let notices = truncations.filter { $0.reason == "quoteOmittedBudget" }
+            let aggregates = notices.filter { $0.evidenceID == nil }
+            XCTAssertLessThanOrEqual(aggregates.count, 1)
+            for notice in notices {
+                XCTAssertEqual(notice.includedUTF8Bytes, 0)
+                if let id = notice.evidenceID {
+                    XCTAssertNil(notice.omittedEvidenceCount)
+                    XCTAssertEqual(omitted.removeValue(forKey: id), notice.originalUTF8Bytes,
+                                   "Unexpected quote omission for \(id), first length \(length)")
+                }
+            }
+            if let aggregate = aggregates.first {
+                XCTAssertFalse(omitted.isEmpty)
+                XCTAssertEqual(aggregate.omittedEvidenceCount, omitted.count)
+                XCTAssertEqual(aggregate.originalUTF8Bytes, omitted.values.reduce(0, +))
+            } else {
+                XCTAssertTrue(omitted.isEmpty, "Missing quote omissions at first length \(length)")
+            }
+            if length == 2000 {
+                XCTAssertEqual(notices.map(\.evidenceID), ["second"], "Roomy quote omission should name the source")
             }
             XCTAssertLessThanOrEqual(try XCTUnwrap(bundle.accounting).estimatedInputTokens + 896, 4096)
         }
     }
+    func testSelectedOriginalsUseBoundedDisclosureFloor() async throws {
+        let (_, brain, state) = try setup()
+        let ids = (0..<20).map { String(format: "selected-%02d", $0) }
+        let exact = "Cita exacta: ¡sí! 🛝"
+        let long = String(repeating: "x", count: 6000)
+        for (index, id) in ids.enumerated() {
+            try source(brain, id, index == 0 ? exact : long, Double(index + 1))
+        }
+        try source(brain, "newest", "Seguimos aquí.", 21)
+        let selector = ContextSelector { input in
+            XCTAssertTrue(Set(ids).isSubset(of: Set(input.sourceReferences.map(\.id))))
+            return .init(detailEvidenceIDs: Array(ids.dropFirst(11)), quoteEvidenceIDs: Array(ids.prefix(11)))
+        }
+        let req = try request("cita", tokens: 4096)
+        let bundle: BrainContextBundle
+        do {
+            bundle = try await BrainContextAssembler(store: state, selector: selector).context(req)
+        } catch BrainContextAssemblyError.insufficientBudget {
+            return XCTFail("3200 input tokens should fit bounded omissions for 20 selected originals")
+        }
+        XCTAssertTrue(bundle.renderedContext.contains("[original quote source=selected-00]\n" + exact))
+        XCTAssertTrue(bundle.recentMessageUnits.contains { $0.id == "newest" && $0.text == "Seguimos aquí." })
+        let truncations = try XCTUnwrap(bundle.truncations)
+        let quote = try XCTUnwrap(truncations.first { $0.reason == "quoteOmittedBudget" && $0.evidenceID == nil })
+        XCTAssertEqual(quote.originalUTF8Bytes, 60_000)
+        XCTAssertEqual(quote.omittedEvidenceCount, 10)
+        let details = truncations.filter { $0.reason == "detailOmittedBudget" }
+        XCTAssertEqual(details.reduce(0) { $0 + $1.originalUTF8Bytes }, 54_000)
+        XCTAssertEqual(details.reduce(0) { $0 + ($1.omittedEvidenceCount ?? 1) }, 9)
+        let resolved = Set(bundle.sourceReferences.map(\.id))
+        XCTAssertTrue(Set(truncations.compactMap(\.evidenceID)).isSubset(of: resolved))
+        let encoded = try JSONEncoder().encode(bundle)
+        let estimate = try XCTUnwrap(bundle.accounting).estimatedInputTokens
+        XCTAssertGreaterThanOrEqual(estimate, encoded.count + req.query.utf8.count + 64)
+        XCTAssertLessThanOrEqual(estimate, 3200)
+    }
+
+    func testBundleWireDistinguishesOriginalFromGistSupport() async throws {
+        let (_, brain, state) = try setup()
+        try source(brain, "park", "El columpio azul estaba roto.")
+        try await compact(state, through: "park", candidate: .init(gist: [statement("Visitó el parque.", ["park"])]))
+        try source(brain, "now", "¿Cómo sigue?", 2)
+        let bundle = try await BrainContextAssembler(store: state).context(request())
+        XCTAssertTrue(bundle.renderedContext.contains("Visitó el parque."))
+        XCTAssertTrue(bundle.sourceReferences.contains { $0.id == "park" })
+        let decoded = try JSONDecoder().decode(BrainContextBundle.self, from: JSONEncoder().encode(bundle))
+        XCTAssertEqual(decoded.sourceUses?["park"], [.derivedSupport])
+        XCTAssertEqual(decoded.sourceUses?["now"], [.recentWhole])
+        XCTAssertEqual(decoded.exactCitationSourceReferences(includingRenderedContext: false, forwardedRecentUnitIDs: ["now"]).map(\.id), ["now"])
+    }
+
     func testMixedOriginalsShareChronologyForRecentContextAndCompactionPrefix() async throws {
         let (db, brain, state) = try setup()
         try source(brain, "earlier", "Earlier persisted original", 1)

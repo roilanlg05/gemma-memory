@@ -36,10 +36,11 @@ public final class BrainContextAssembler {
         // The envelope and the disclosure floor are checked before the selector runs, so a window
         // that cannot honestly report what it dropped fails before a model is called.
         var empty = Draft()
-        empty.truncations = Self.disclosureFloor(snapshot)
+        empty.truncations = Self.snapshotDisclosureFloor(snapshot).map { $0.1 }
         guard try fits(empty, request: request, revision: snapshot.revision) else { throw BrainContextAssemblyError.insufficientBudget }
-        var selection = ConversationSelection()
-        if let selector {
+        var selection = ConversationSelection(detailEvidenceIDs: request.detailEvidenceIDs ?? [],
+                                              quoteEvidenceIDs: request.quoteEvidenceIDs ?? [])
+        if let selector, request.detailEvidenceIDs == nil, request.quoteEvidenceIDs == nil {
             let input = try selectionInput(snapshot, request: request)
             do { selection = try await selector.select(input) }
             catch {
@@ -54,27 +55,25 @@ public final class BrainContextAssembler {
         var units = [BrainMessageUnit]()
         var references = [String: BrainEvidence]()
         var truncations = [BrainContextTruncation]()
+        var sourceUses = [String: [BrainContextSourceUse]]()
+
+        mutating func recordUse(_ use: BrainContextSourceUse, id: String) {
+            if sourceUses[id]?.contains(use) != true {
+                sourceUses[id, default: []].append(use)
+            }
+        }
     }
-    /// The disclosure classes whose omissions can only be discovered after content has already
-    /// been offered space: the agent identity section, and a recent raw group that would not fit
-    /// even as a prefix. Every other omission in this file is known before the thing it describes
-    /// is offered, and is reserved at that point.
-    ///
-    /// One entry per class is reserved before any content is spent. A bundle must never render
-    /// with admitted content excluded and no `truncations` to say so, and a disclosure that is
-    /// merely attempted after the content has eaten the window is not a disclosure. Reserving
-    /// first means the space is already there when the omission is discovered; if the window
-    /// cannot hold even this floor, the request is unsatisfiable and fails with
-    /// `BrainContextAssemblyError.insufficientBudget` instead of rendering a silent bundle.
-    ///
-    /// `Int.max` is what makes the reservation sound: a placeholder encodes to at least as many
-    /// bytes as the single aggregate notice that may replace it, because that notice carries the
-    /// same `reason`, no `evidenceID`, and a byte count that cannot have more decimal digits than
-    /// `Int.max` has. Unused placeholders are stripped before the bundle is returned, so a caller
-    /// never sees one.
-    /// The whole disclosure vocabulary, in one place. The reason strings used to be literals
-    /// duplicated across the declaration, the two call sites and the finalizer, which is how a
-    /// reason that matched nothing could be recorded and then silently never rendered.
+    private struct SelectedOriginal {
+        let id: String
+        let text: String
+        let reason: DisclosureReason
+
+        var omission: BrainContextTruncation {
+            .init(evidenceID: id, originalUTF8Bytes: text.utf8.count,
+                  includedUTF8Bytes: 0, reason: reason.rawValue)
+        }
+    }
+    /// Each omission class reserves room for one aggregate before any content is admitted.
     enum DisclosureReason: String, CaseIterable, Sendable {
         /// An original the model asked to quote or to see in detail was not delivered.
         case quoteOmittedBudget
@@ -86,23 +85,10 @@ public final class BrainContextAssembler {
         /// A recent raw group did not fit, not even as a prefix of every member.
         case groupOmittedBudget
 
-        /// The classes whose omission can only be discovered after content has been offered space,
-        /// and which therefore need a reservation held for them through the whole assembly. Every
-        /// other reason is reserved against the very thing it describes, at the moment that thing
-        /// is offered, which is Task 8's rule and still runs first.
-        static let lateDiscovered: [DisclosureReason] = [.agentIdentityOmittedBudget, .groupOmittedBudget]
+        static let selectedOmissions: [Self] = [.quoteOmittedBudget, .detailOmittedBudget]
+        static let snapshotOmissions: [Self] = [.agentIdentityOmittedBudget, .groupOmittedBudget]
 
-        /// Whether this class has anything at all it could omit, decided from the snapshot alone
-        /// and therefore before a single byte of content has been spent.
-        ///
-        /// Deliberately conservative: each predicate is a *superset* of the condition that
-        /// actually produces the disclosure — any non-empty source set could yield a recent group,
-        /// whether or not this budget ends up omitting one — so a class that might fire is always
-        /// reserved for. The cost of being wrong in this direction is a reservation nobody uses,
-        /// stripped before the bundle is returned. The cost of being wrong in the other direction
-        /// would be an omission with no room left to disclose it, which the invariant forbids.
-        ///
-        /// The early reasons answer `false` because they never go through the floor.
+        /// Reserve only snapshot classes that might have something to omit.
         func canFire(_ snapshot: ConversationSnapshot) -> Bool {
             switch self {
             case .agentIdentityOmittedBudget:
@@ -114,19 +100,24 @@ public final class BrainContextAssembler {
             }
         }
     }
-    /// One placeholder per late class that can actually fire for this snapshot. A class that
-    /// provably cannot produce a disclosure is charged nothing: a caller with no agent identity at
-    /// all was paying 101 bytes for the identity notice, and losing its newest turn across the band
-    /// those bytes came out of.
-    private static func disclosureFloor(_ snapshot: ConversationSnapshot) -> [BrainContextTruncation] {
-        DisclosureReason.lateDiscovered.filter { $0.canFire(snapshot) }.map {
-            .init(evidenceID: nil, originalUTF8Bytes: Int.max, includedUTF8Bytes: 0, reason: $0.rawValue)
+    /// A maximum-size byte count bounds any actual aggregate from a snapshot class.
+    private static func snapshotDisclosureFloor(_ snapshot: ConversationSnapshot)
+        -> [(DisclosureReason, BrainContextTruncation)] {
+        DisclosureReason.snapshotOmissions.filter { $0.canFire(snapshot) }.map { reason in
+            (reason, .init(evidenceID: nil, originalUTF8Bytes: Int.max,
+                           includedUTF8Bytes: 0, reason: reason.rawValue))
         }
     }
-    private static func isDisclosurePlaceholder(_ truncation: BrainContextTruncation) -> Bool {
-        guard truncation.evidenceID == nil, truncation.originalUTF8Bytes == Int.max,
-              let reason = DisclosureReason(rawValue: truncation.reason) else { return false }
-        return DisclosureReason.lateDiscovered.contains(reason)
+    private static func aggregateNotice(_ reason: DisclosureReason, entries: [BrainContextTruncation])
+        -> BrainContextTruncation {
+        var total = 0
+        for entry in entries {
+            let (sum, overflow) = total.addingReportingOverflow(entry.originalUTF8Bytes)
+            total = overflow ? Int.max : sum
+        }
+        return .init(evidenceID: nil, originalUTF8Bytes: total, includedUTF8Bytes: 0,
+                     reason: reason.rawValue,
+                     omittedEvidenceCount: DisclosureReason.selectedOmissions.contains(reason) ? entries.count : nil)
     }
     private func capacity(_ budget: BrainContextBudget) -> Int {
         budget.contextTokens - budget.outputTokens - budget.systemTokens - budget.toolTokens
@@ -137,7 +128,8 @@ public final class BrainContextAssembler {
               policyRevision: BrainConversationPolicy.canonical.revision,
               accounting: .init(estimatedInputTokens: estimate, reservedOutputTokens: request.budget.outputTokens,
                                 reservedSystemTokens: request.budget.systemTokens, reservedToolTokens: request.budget.toolTokens,
-                                totalWindowTokens: request.budget.contextTokens), truncations: draft.truncations)
+                                totalWindowTokens: request.budget.contextTokens), truncations: draft.truncations,
+              sourceUses: draft.sourceUses.isEmpty ? nil : draft.sourceUses)
     }
     private func estimatedInput(_ draft: Draft, request: BrainContextRequest, revision: Int64) throws -> Int {
         // Int.max's numeric encoding bounds the shorter estimate eventually put on the wire.
@@ -186,99 +178,102 @@ public final class BrainContextAssembler {
         for (id, source) in originals { available[id] = source }
         var draft = Draft()
         func adding(to old: Draft, block: String? = nil, units: [BrainMessageUnit] = [], ids: [String] = [],
+                    renderedUse: BrainContextSourceUse? = nil,
                     truncations: [BrainContextTruncation] = [], prependUnits: Bool = false) -> Draft {
             var next = old
             if let block { next.blocks.append(block) }
             next.units = prependUnits ? units + next.units : next.units + units
-            for id in ids { if let evidence = available[id] { next.references[id] = Self.metadata(evidence) } }
+            for id in ids {
+                guard let evidence = available[id] else { continue }
+                next.references[id] = Self.metadata(evidence)
+                if let renderedUse { next.recordUse(renderedUse, id: id) }
+            }
+            for unit in units {
+                guard let original = originals[unit.id]?.text else { continue }
+                let use: BrainContextSourceUse = unit.text.utf8.count == original.utf8.count ? .recentWhole : .recentPrefix
+                next.recordUse(use, id: unit.id)
+            }
             next.truncations += truncations
             return next
         }
         @discardableResult func add(block: String? = nil, units: [BrainMessageUnit] = [], ids: [String] = [],
+                                    renderedUse: BrainContextSourceUse? = nil,
                                     truncations: [BrainContextTruncation] = [], prependUnits: Bool = false,
                                     maximumInput: Int? = nil) throws -> Bool {
-            let next = adding(to: draft, block: block, units: units, ids: ids, truncations: truncations, prependUnits: prependUnits)
+            let next = adding(to: draft, block: block, units: units, ids: ids, renderedUse: renderedUse,
+                              truncations: truncations, prependUnits: prependUnits)
             guard try fits(next, request: request, revision: snapshot.revision) else { return false }
             if let maximumInput, try estimatedInput(next, request: request, revision: snapshot.revision) > maximumInput { return false }
             draft = next; return true
         }
         let quotes = Set(selection.quoteEvidenceIDs)
-        var detailed = Set<String>()
-        let selected = (selection.quoteEvidenceIDs + selection.detailEvidenceIDs).filter { detailed.insert($0).inserted }
-        // Every selected original must be delivered fully or explicitly accounted for. Reserve
-        // all omission notices first, so an earlier quote cannot consume a later disclosure.
-        let disclosures = try selected.map { id -> BrainContextTruncation in
+        var seen = Set<String>()
+        let selected = try (selection.quoteEvidenceIDs + selection.detailEvidenceIDs).compactMap { id -> SelectedOriginal? in
+            guard seen.insert(id).inserted else { return nil }
             guard let text = originals[id]?.text else { throw BrainStoreError.invalid }
-            return .init(evidenceID: id, originalUTF8Bytes: text.utf8.count, includedUTF8Bytes: 0,
-                         reason: (quotes.contains(id) ? DisclosureReason.quoteOmittedBudget
-                                                      : .detailOmittedBudget).rawValue)
+            return SelectedOriginal(id: id, text: text,
+                                    reason: quotes.contains(id) ? .quoteOmittedBudget : .detailOmittedBudget)
         }
-        // The notice and the metadata for the id it names are reserved together. An id advertised
-        // in a disclosure has to resolve in `sourceReferences`, because that is what makes it
-        // followable and a valid forget target; registering it only on a successful delivery meant
-        // the entries that reported an omission were exactly the ones whose id resolved to nothing.
-        // Registering here, before anything is spent, is also what keeps the reservation honest:
-        // the bytes are accounted for whether the original is later delivered or not.
-        draft = adding(to: draft, ids: selected, truncations: disclosures)
-        // Then the floor for the omissions nobody can predict yet. This comes after the selected
-        // originals' notices, which are owed to content a model already asked for, and before any
-        // block of content at all.
-        draft = adding(to: draft, truncations: Self.disclosureFloor(snapshot))
+        let requested = Dictionary(grouping: selected, by: \.reason)
+        var remaining = requested.mapValues(\.count)
+        var reservations = Dictionary(uniqueKeysWithValues: Self.snapshotDisclosureFloor(snapshot))
+        // One notice per selected class covers the case where every original is omitted. Actual
+        // omissions can only shrink the count and byte sum, so their aggregate also fits.
+        for (reason, originals) in requested {
+            reservations[reason] = Self.aggregateNotice(reason, entries: originals.map(\.omission))
+        }
+        draft.truncations = (DisclosureReason.selectedOmissions + DisclosureReason.snapshotOmissions)
+            .compactMap { reservations[$0] }
         guard try fits(draft, request: request, revision: snapshot.revision) else {
             throw BrainContextAssemblyError.insufficientBudget
         }
-        // Late-discovered omissions are recorded here and rendered once, in `finalizeDisclosures`.
-        // Recording rather than rendering is what keeps the reservation intact while later
-        // sections are still being offered content, and it is the single place a disclosure is
-        // produced: a future section that omits something calls `disclose` and cannot reintroduce
-        // the shape where a failed add silently drops the notice.
         var pending = [DisclosureReason: [BrainContextTruncation]]()
         func disclose(_ reason: DisclosureReason, _ entries: [BrainContextTruncation]) {
-            // A reason the finalizer does not visit would be recorded and then never rendered and
-            // never reported — the quiet drop this mechanism exists to make impossible. The enum
-            // already rules out an unknown string; this rules out a known one that has no
-            // reservation behind it. Both are programmer errors, not budget outcomes.
-            precondition(DisclosureReason.lateDiscovered.contains(reason),
-                         "\(reason.rawValue) is not reserved through the disclosure floor")
-            guard !entries.isEmpty else { return }
+            precondition(reservations[reason] != nil, "\(reason.rawValue) has no disclosure reservation")
             pending[reason, default: []] += entries
         }
-        func finalizeDisclosures() throws {
-            for reason in DisclosureReason.lateDiscovered {
-                var released = draft
-                released.truncations.removeAll {
-                    Self.isDisclosurePlaceholder($0) && $0.reason == reason.rawValue
-                }
+        func releasing(_ reason: DisclosureReason, from draft: Draft) -> Draft {
+            guard let reserved = reservations[reason] else { return draft }
+            var released = draft
+            released.truncations.removeAll { $0 == reserved }
+            return released
+        }
+        let groups = ConversationCompactor.groups(snapshot.sources)
+        func recentUnits(_ group: [ConversationSource], cap: Int? = nil) -> [BrainMessageUnit] {
+            group.map { source in
+                let original = source.evidence.text ?? ""
+                let text = cap.map { Self.prefix(original, maximumUTF8Bytes: $0) } ?? original
+                return .init(id: source.evidence.id, speakerID: source.evidence.speakerID, text: text,
+                             observedAt: source.evidence.observedAt, evidenceIDs: [source.evidence.id], groupID: source.groupID)
+            }
+        }
+        func fitsWithNewestGroup(_ draft: Draft) throws -> Bool {
+            guard let newest = groups.last else { return false }
+            let withNewest = adding(to: draft, units: recentUnits(newest), ids: newest.map { $0.evidence.id })
+            return try fits(withNewest, request: request, revision: snapshot.revision)
+        }
+        func finalizeDisclosures(_ reasons: [DisclosureReason], preserveNewest: Bool = false) throws {
+            for reason in reasons {
+                let released = releasing(reason, from: draft)
                 guard let entries = pending[reason], !entries.isEmpty else {
                     draft = released
                     continue
                 }
-                // Prefer naming every omission. The per-original batch is the useful form, so it
-                // gets the first chance against whatever capacity is left — and it carries the
-                // metadata for every id it names, so those ids resolve.
-                let itemized = adding(to: released, ids: entries.compactMap(\.evidenceID),
-                                      truncations: entries)
-                if try fits(itemized, request: request, revision: snapshot.revision) {
-                    draft = itemized
-                    continue
-                }
-                // Otherwise one aggregate notice stands for the whole class. It carries no
-                // `evidenceID` because it describes several originals, and the summed byte count
-                // saturates rather than overflowing. This is the form the placeholder reserved
-                // room for, so it fits; the guard is here because a disclosure that cannot be
-                // rendered must fail loudly, never be dropped.
-                var total = 0
-                for entry in entries {
-                    let (sum, overflow) = total.addingReportingOverflow(entry.originalUTF8Bytes)
-                    total = overflow ? Int.max : sum
-                }
-                let aggregate = BrainContextTruncation(evidenceID: nil, originalUTF8Bytes: total,
-                                                       includedUTF8Bytes: 0, reason: reason.rawValue)
+                let aggregate = Self.aggregateNotice(reason, entries: entries)
                 let collapsed = adding(to: released, truncations: [aggregate])
                 guard try fits(collapsed, request: request, revision: snapshot.revision) else {
                     throw BrainContextAssemblyError.insufficientBudget
                 }
-                draft = collapsed
+                // Prefer names, registering their metadata with the notice. When finalizing
+                // selected omissions early, keep room for a newest whole group that could fit
+                // with the aggregate. The group remains higher priority than extra metadata.
+                let itemized = adding(to: released, ids: entries.compactMap(\.evidenceID), truncations: entries)
+                if try fits(itemized, request: request, revision: snapshot.revision),
+                   try (!preserveNewest || !fitsWithNewestGroup(collapsed) || fitsWithNewestGroup(itemized)) {
+                    draft = itemized
+                } else {
+                    draft = collapsed
+                }
             }
         }
         // The agent's identity gets its own section. It goes in before any conversation content,
@@ -295,7 +290,7 @@ public final class BrainContextAssembler {
             // drops the values and the boundaries — the only statement in the system that the
             // agent has no childhood, body or suffering — is strictly worse than no identity
             // section at all, so this is a mandatory reservation and not a best effort.
-            if try add(block: core, ids: identityIDs) {
+            if try add(block: core, ids: identityIDs, renderedUse: .derivedSupport) {
                 let base = try estimatedInput(draft, request: request, revision: snapshot.revision)
                 let limit = base + max(0, (capacity(request.budget) - base) / 4)
                 // The optional tail lives in its own quarter of what is left, so the identity
@@ -304,7 +299,7 @@ public final class BrainContextAssembler {
                 // stops the rest, so two budgets differ by a prefix of the section rather than by
                 // an arbitrary subset of it.
                 for (block, ids) in Self.identityOptionalBlocks(identity, resolvable: { available[$0] != nil }) {
-                    if try !add(block: block, ids: ids, maximumInput: limit) { break }
+                    if try !add(block: block, ids: ids, renderedUse: .derivedSupport, maximumInput: limit) { break }
                 }
             } else {
                 // Nothing goes missing silently: the caller is told the section did not fit,
@@ -317,17 +312,25 @@ public final class BrainContextAssembler {
                                 reason: DisclosureReason.agentIdentityOmittedBudget.rawValue)])
             }
         }
-        for id in selected {
-            guard let text = originals[id]?.text else { throw BrainStoreError.invalid }
-            let label = quotes.contains(id) ? "original quote" : "original detail"
-            var withoutDisclosure = draft
-            withoutDisclosure.truncations.removeAll { $0.evidenceID == id }
-            let delivered = adding(to: withoutDisclosure, block: "[\(label) source=\(id)]\n\(text)", ids: [id])
-            if try fits(delivered, request: request, revision: snapshot.revision) { draft = delivered }
+        for original in selected {
+            let reason = original.reason
+            let isQuote = reason == .quoteOmittedBudget
+            let label = isQuote ? "original quote" : "original detail"
+            let base = remaining[reason] == 1 ? releasing(reason, from: draft) : draft
+            let delivered = adding(to: base, block: "[\(label) source=\(original.id)]\n\(original.text)",
+                                   ids: [original.id], renderedUse: isQuote ? .renderedQuote : .renderedDetail)
+            if try fits(delivered, request: request, revision: snapshot.revision) {
+                draft = delivered
+                remaining[reason, default: 0] -= 1
+            } else {
+                disclose(reason, [original.omission])
+            }
         }
+        try finalizeDisclosures(DisclosureReason.selectedOmissions, preserveNewest: true)
         for id in selection.claimIDs {
             guard let claim = claims[id] else { continue }
-            try add(block: "[memory]\n" + BrainStore.encode(claim), ids: snapshot.claimEvidenceIDs[id] ?? [])
+            try add(block: "[memory]\n" + BrainStore.encode(claim), ids: snapshot.claimEvidenceIDs[id] ?? [],
+                    renderedUse: .derivedSupport)
         }
         // Reserve half the remaining input capacity for recent raw groups. Continuity state
         // gets the other half first, so one oversized new message cannot evict an old constraint.
@@ -339,7 +342,8 @@ public final class BrainContextAssembler {
                 for (section, statements) in segment.state.sections where section == label {
                     for statement in statements {
                         let block = "[\(label) \(statement.modality.rawValue) sources=\(statement.evidenceIDs.joined(separator: ","))]\n\(statement.text)"
-                        try add(block: block, ids: statement.evidenceIDs, maximumInput: stateLimit)
+                        try add(block: block, ids: statement.evidenceIDs, renderedUse: .derivedSupport,
+                                maximumInput: stateLimit)
                     }
                 }
             }
@@ -347,26 +351,17 @@ public final class BrainContextAssembler {
         // Recent raw groups are adaptive to budget. Summarized old groups default to gist;
         // the newest group remains raw even when a background compaction just covered it.
         let covered = Set(snapshot.segments.flatMap { $0.sources.map(\.evidenceID) })
-        let groups = ConversationCompactor.groups(snapshot.sources)
         let newest = groups.last?.first?.groupID
         let recent = groups.filter { group in group.first?.groupID == newest || group.contains { !covered.contains($0.evidence.id) } }
         for group in recent.reversed() {
             let ids = group.map { $0.evidence.id }
-            func units(cap: Int?) -> [BrainMessageUnit] {
-                group.map { source in
-                    let original = source.evidence.text ?? ""
-                    let text = cap.map { Self.prefix(original, maximumUTF8Bytes: $0) } ?? original
-                    return .init(id: source.evidence.id, speakerID: source.evidence.speakerID, text: text,
-                                 observedAt: source.evidence.observedAt, evidenceIDs: [source.evidence.id], groupID: source.groupID)
-                }
-            }
-            if try add(units: units(cap: nil), ids: ids, prependUnits: true) { continue }
+            if try add(units: recentUnits(group), ids: ids, prependUnits: true) { continue }
             // Keep all members of an oversized group, or none. Each retained prefix is marked.
             var low = 0, high = group.map { $0.evidence.text?.utf8.count ?? 0 }.max() ?? 0
             var best: Draft?
             while low <= high {
                 let mid = low + (high - low) / 2
-                let partial = units(cap: mid)
+                let partial = recentUnits(group, cap: mid)
                 let truncations = zip(group, partial).compactMap { source, unit -> BrainContextTruncation? in
                     let bytes = source.evidence.text?.utf8.count ?? 0
                     guard unit.text.utf8.count < bytes else { return nil }
@@ -388,7 +383,7 @@ public final class BrainContextAssembler {
                     reason: DisclosureReason.groupOmittedBudget.rawValue) })
             }
         }
-        try finalizeDisclosures()
+        try finalizeDisclosures(DisclosureReason.snapshotOmissions)
         let estimate = try estimatedInput(draft, request: request, revision: snapshot.revision)
         guard estimate <= capacity(request.budget) else { throw BrainContextAssemblyError.insufficientBudget }
         return bundle(draft, request: request, revision: snapshot.revision, estimate: estimate)
