@@ -38,7 +38,7 @@ class InvokeBody(BaseModel):
 @app.post("/v1/browser/invoke", dependencies=[Depends(require_bearer)])
 async def browser_invoke(body: InvokeBody):
     try:
-        cli.validate(body.arguments)
+        cli.validate(body.arguments, body.stdin)
     except ValueError as motivo:
         raise HTTPException(status_code=400, detail=str(motivo))
     return await cli.run(body.arguments, timeout=body.timeout, stdin=body.stdin)

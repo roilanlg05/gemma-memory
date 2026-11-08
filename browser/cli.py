@@ -10,7 +10,9 @@ que sin lista de permitidos el endpoint sería ejecución remota de órdenes. Po
     execve, nunca pasa por un shell) y `stdin` viaja aparte, nunca en `argv`.
 """
 import asyncio
+import json
 import os
+import shlex
 import tempfile
 
 # Ruta del CLI; misma variable que lee app.py.
@@ -45,8 +47,12 @@ GLOBAL_FLAGS: dict[str, int] = {"--session": 1, "--json": 0}
 _FAKE_ENVELOPE = '{"success":true,"data":{},"error":null}'
 
 
-def validate(arguments: list[str]) -> None:
-    """Lanza ValueError con el motivo si el `argv` no es aceptable."""
+def validate(arguments: list[str], stdin: str | None = None) -> None:
+    """Lanza ValueError con el motivo si el `argv` (y el `stdin`) no son aceptables.
+
+    Nota de diseño: se rechaza cualquier argumento, también un posicional como el
+    texto de `fill`, que empiece por un prefijo de REJECTED_FLAG_PREFIXES. Falla
+    cerrado a propósito: los valores sensibles viajan por `stdin`, no por argv."""
     if not arguments:
         raise ValueError("arguments vacío")
 
@@ -68,6 +74,45 @@ def validate(arguments: list[str]) -> None:
     subcommand = arguments[i]
     if subcommand not in ALLOWED_SUBCOMMANDS:
         raise ValueError(f"subcomando no permitido: {subcommand}")
+
+    if subcommand == "batch":
+        validate_batch_payload(arguments[i + 1:], stdin)
+
+
+def validate_batch_payload(batch_arguments: list[str], stdin: str | None) -> None:
+    """Valida las órdenes que `batch` ejecutará, que llegan de dos formas:
+      - modo argumentos: cada argumento posicional es una orden completa
+        ("open https://a.test");
+      - modo stdin: un JSON con un arreglo de arreglos de strings.
+    Cada orden pasa por `validate`, así que `eval` queda fuera por esta vía igual
+    que por argv. Sin ninguna orden, se rechaza."""
+    commands: list[list[str]] = []
+
+    for argument in batch_arguments:
+        if argument.startswith("-"):
+            continue  # opciones de batch (--bail, --json, --omit-command)
+        try:
+            tokens = shlex.split(argument)
+        except ValueError as motivo:
+            raise ValueError(f"orden de batch ilegible: {motivo}")
+        commands.append(tokens)
+
+    if stdin is not None:
+        try:
+            payload = json.loads(stdin)
+        except ValueError as motivo:
+            raise ValueError(f"stdin de batch no es JSON válido: {motivo}")
+        if not isinstance(payload, list):
+            raise ValueError("stdin de batch debe ser un arreglo de órdenes")
+        for command in payload:
+            if not isinstance(command, list) or not all(isinstance(t, str) for t in command):
+                raise ValueError("cada orden de batch debe ser un arreglo de strings")
+            commands.append(command)
+
+    if not commands:
+        raise ValueError("batch sin órdenes")
+    for command in commands:
+        validate(command)
 
 
 async def run(arguments: list[str], timeout: float, stdin: str | None = None) -> dict:

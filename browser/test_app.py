@@ -2,6 +2,7 @@
     python3 -m pytest browser/test_app.py -v
 Usa BROWSER_FAKE_CLI=1 para no lanzar el binario de verdad."""
 import os, sys
+import pytest
 os.environ["BROWSER_FAKE_CLI"] = "1"
 os.environ["BROWSER_BEARER_TOKEN"] = "test-token"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -118,10 +119,13 @@ def test_stdin_se_pasa_al_proceso_y_no_al_argv(monkeypatch):
         return {"exitCode": 0, "stdout": "{}", "stderr": ""}
 
     monkeypatch.setattr(appmod.cli, "run", falso)
+    # La carga debe ser un batch válido (arreglo de órdenes): una de otra forma ya
+    # se rechaza antes de ejecutar, por la validación de la carga de batch.
+    carga = '[["fill","#clave","valor-secreto"]]'
     client.post("/v1/browser/invoke",
-                json={"arguments": ["batch", "--json"], "stdin": '{"secreto":"x"}'}, headers=AUTH)
-    assert visto["stdin"] == '{"secreto":"x"}'
-    assert "x" not in " ".join(visto["arguments"])
+                json={"arguments": ["batch", "--json"], "stdin": carga}, headers=AUTH)
+    assert visto["stdin"] == carga
+    assert "secreto" not in " ".join(visto["arguments"])
 
 
 def test_el_ejecutor_real_usa_exec_y_no_shell():
@@ -145,3 +149,51 @@ def test_el_ejecutor_no_espera_al_demonio_que_hereda_los_descriptores(monkeypatc
     resultado = asyncio.run(cli.run(["open", "https://a.test"], timeout=3))
     assert time.monotonic() - inicio < 2, "no debe esperar al demonio"
     assert resultado == {"exitCode": 0, "stdout": '{"success":true}\n', "stderr": ""}
+
+
+# --- carga de batch: la lista de permitidos también aplica a lo que batch ejecuta ---
+def _batch(**cuerpo):
+    return client.post("/v1/browser/invoke", json=cuerpo, headers=AUTH)
+
+
+def test_batch_con_una_orden_eval_en_stdin_se_rechaza():
+    r = _batch(arguments=["batch", "--json"], stdin='[["open","https://a.test"],["eval","1+1"]]')
+    assert r.status_code == 400
+    assert "eval" in r.json()["detail"]
+
+
+def test_batch_con_solo_ordenes_permitidas_en_stdin_pasa():
+    r = _batch(arguments=["batch", "--json"],
+               stdin='[["open","https://a.test"],["snapshot","-i"],["fill","#c","valor"]]')
+    assert r.status_code == 200
+
+
+def test_batch_con_stdin_que_no_es_json_se_rechaza():
+    assert _batch(arguments=["batch"], stdin="esto no es json").status_code == 400
+
+
+def test_batch_con_stdin_de_forma_incorrecta_se_rechaza():
+    assert _batch(arguments=["batch"], stdin='{"open":"x"}').status_code == 400
+    assert _batch(arguments=["batch"], stdin='["open"]').status_code == 400
+    assert _batch(arguments=["batch"], stdin='[[1,2]]').status_code == 400
+
+
+def test_batch_con_flag_prohibido_dentro_de_una_orden_se_rechaza():
+    r = _batch(arguments=["batch"], stdin='[["open","https://a.test","--state","/etc/passwd"]]')
+    assert r.status_code == 400
+
+
+def test_batch_en_modo_argumentos_tambien_se_valida():
+    assert _batch(arguments=["batch", "open https://a.test", "eval 1"]).status_code == 400
+    assert _batch(arguments=["batch", "--bail", "open https://a.test", "snapshot"]).status_code == 200
+
+
+def test_batch_sin_ordenes_se_rechaza():
+    assert _batch(arguments=["batch", "--json"]).status_code == 400
+
+
+def test_validate_batch_payload_se_prueba_sola():
+    import cli
+    cli.validate_batch_payload([], '[["open","https://a.test"]]')
+    with pytest.raises(ValueError, match="eval"):
+        cli.validate_batch_payload([], '[["eval","1"]]')

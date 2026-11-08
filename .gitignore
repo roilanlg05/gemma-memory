@@ -3,6 +3,8 @@
 
 # Python
 embedder/__pycache__/
+browser/__pycache__/
+voice/__pycache__/
 embedder/models/
 embedder/.pytest_cache/
 embedder/.venv/
