@@ -632,14 +632,23 @@ def test_el_stream_que_declara_la_sesion_del_rele_se_comporta_como_siempre():
 def test_el_stream_que_declara_otra_sesion_cierra_nombrando_las_dos():
     # Un motivo que solo dijera «sesión equivocada» no sirve para arreglarlo: hacen
     # falta los dos valores, porque el fallo es justamente que no se sabe cuál es
-    # cuál. La app pinta el motivo de un `closed`, así que esto llega a la pantalla.
+    # cuál.
+    #
+    # Y el `state` de delante es parte del contrato, no ruido: el visor no dibuja el
+    # panel hasta haber recibido algo del servidor, y un `closed` NO cuenta para eso
+    # —el cliente se fabrica uno él mismo cuando la conexión falla—, así que sin el
+    # `state` este motivo moriría en una fila vacía y la guardia no serviría de nada.
+    # Por eso el orden se asevera, no solo el contenido.
     with client.websocket_connect(
             "/v1/browser/stream?token=test-token&session=gemma-live-test") as ws:
+        primero = ws.receive_json()
         mensaje = ws.receive_json()
+    assert primero["type"] == "state", primero
+    assert primero["live"] is False, primero
     assert mensaje["type"] == "closed"
     assert relay.SESSION in mensaje["reason"], mensaje["reason"]
     assert "gemma-live-test" in mensaje["reason"], mensaje["reason"]
-    _comprobar_esquema([mensaje])
+    _comprobar_esquema([primero, mensaje])
 
 
 def test_la_comparacion_de_sesion_se_prueba_sola():
