@@ -4,6 +4,14 @@
 # (~/Projects/gemma-browser/docker-compose.yml) se sincroniza desde aquí; no se
 # edita a mano allí.
 #
+# CÓMO DESPLEGARLO: se copia a ~/Projects/gemma-browser/ (junto al directorio
+# browser/) con su propio `.env` al lado, creado a partir de browser/.env.example.
+# NO se levanta desde la raíz del repositorio: allí ya existe docker-compose.yml
+# con otro servicio `browser` en el mismo puerto 8083 (mismo nombre de proyecto,
+# choque y huérfanos), y `env_file: .env` se resolvería contra el `.env` del
+# servicio de memoria, no contra el del navegador. Sin token falla cerrado (401),
+# pero es una trampa silenciosa.
+#
 # Va aparte del compose de gemma-memory a propósito: el checkout del i3 está en
 # `main` con diez ficheros modificados sin commitear, así que cambiarle la rama
 # para traer la rama del navegador habría puesto en riesgo ese trabajo local.

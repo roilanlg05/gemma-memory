@@ -5,9 +5,17 @@ dependencia de pruebas en la imagen de producción. El fichero bajo prueba lo
 escribimos nosotros, así que `_config()` lo lee con un parseo de líneas mínimo
 (mapas, listas de escalares y listas en línea). La validación real del YAML la
 hace `docker compose config`.
+
+Limitaciones a tener presentes al editar el compose:
+- No admite comentarios en línea: `- FOO=bar # nota` metería la nota dentro del
+  valor. Los comentarios van en su propia línea.
+- Una sangría incoherente NO se ignora: `_config()` lanza ValueError si quedan
+  líneas sin consumir, para que las aserciones negativas no pasen en falso.
 """
 import json
 import pathlib
+
+import pytest
 
 _RAIZ = pathlib.Path(__file__).parent.parent
 _COMPOSE = _RAIZ / "docker-compose.browser.yml"
@@ -22,9 +30,9 @@ def _escalar(texto):
     return texto
 
 
-def _lineas_utiles():
+def _lineas_utiles(texto):
     salida = []
-    for cruda in _COMPOSE.read_text().splitlines():
+    for cruda in texto.splitlines():
         if not cruda.strip() or cruda.lstrip().startswith("#"):
             continue
         salida.append((len(cruda) - len(cruda.lstrip()), cruda.strip()))
@@ -52,10 +60,18 @@ def _bloque(lineas, i, sangria):
     return mapa, i
 
 
-def _config() -> dict:
-    lineas = _lineas_utiles()
-    valor, _ = _bloque(lineas, 0, lineas[0][0])
+def _parsear(texto: str) -> dict:
+    lineas = _lineas_utiles(texto)
+    valor, i = _bloque(lineas, 0, lineas[0][0])
+    if i != len(lineas):
+        # Sin esto, una línea mal indentada cortaría el parseo en silencio y las
+        # aserciones "X not in env" pasarían aunque X esté en el fichero.
+        raise ValueError(f"sangría incoherente cerca de: {lineas[i][1]!r}")
     return valor
+
+
+def _config() -> dict:
+    return _parsear(_COMPOSE.read_text())
 
 
 def _env_del_servicio(nombre: str) -> dict:
@@ -90,7 +106,26 @@ def test_el_puerto_y_el_healthcheck_son_los_del_servicio_desplegado():
     assert svc["restart"] == "unless-stopped"
 
 
-def test_el_env_example_nombra_el_token_sin_traer_un_valor():
+def test_el_env_example_declara_el_token_sin_ningun_valor():
+    # Una línea NO comentada `BROWSER_BEARER_TOKEN=` con el resto vacío: ni un
+    # valor real, ni un placeholder, ni la variable comentada.
     texto = (pathlib.Path(__file__).parent / ".env.example").read_text()
-    assert "BROWSER_BEARER_TOKEN=" in texto
+    lineas = [l.strip() for l in texto.splitlines() if not l.strip().startswith("#")]
+    asignaciones = [l for l in lineas if l.startswith("BROWSER_BEARER_TOKEN=")]
+    assert len(asignaciones) == 1
+    assert asignaciones[0].partition("=")[2] == ""
     assert "replace-me" not in texto  # no se hereda el placeholder de la memoria
+
+
+def test_una_sangria_incoherente_hace_fallar_el_parseo():
+    # La línea del token está mal indentada a propósito: el parseo no puede
+    # perderla en silencio, porque entonces "token not in env" pasaría en falso.
+    roto = (
+        "services:\n"
+        "  browser:\n"
+        "    environment:\n"
+        "      - TZ=America/Havana\n"
+        "     - BROWSER_BEARER_TOKEN=abc\n"
+    )
+    with pytest.raises(ValueError):
+        _parsear(roto)
