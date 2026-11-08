@@ -96,9 +96,26 @@ def session_mismatch(requested: str | None) -> str | None:
 
 # Tope de fps que se le pide al demonio, declarado en la URL y no por un mensaje
 # `config`: es la única forma de que cubra el frame de apertura (spec §5.5, §6.2(c)).
-DAEMON_MAX_FPS = 10
-# Tope por omisión de un visor, y el que se usa si pide uno inválido.
-DEFAULT_VIEWER_MAX_FPS = 10
+#
+# 7 fps, y bajan LOS DOS topes. Procedencia: medición de nitidez, repositorio
+# personal_agent,
+# docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
+# Con 1080x608 q45 el fotograma más grande medido pesa 54 715 B; lo que decide es
+# el pico (tope de fps x fotograma máximo), no el caudal medio. A 10 fps serían
+# 547 kB/s y no caben en el presupuesto móvil de 400 kB/s; a 7 son 383 kB/s
+# (típico 361). Se baja la tasa y no la nitidez: una página de compras se mira, no
+# se anima. Los fps logrados medidos (5-7) no llegan al tope porque el demonio
+# emite por cambio y mantiene un solo fotograma en vuelo (pacing=ack), así que
+# pasar de 10 a 7 no quita ningún fotograma de los que el usuario veía de verdad:
+# solo acota el pico de una página que se anime sola.
+# Se bajan los dos porque el salto demonio -> relé es localhost y es gratis, así
+# que bastaría estrangular al visor; pero con el demonio a 10, en el caso de pico
+# (una página que se anime sola y llegue al tope) el i3 codificaría en JPEG
+# fotogramas que el relé tiraría: CPU quemada para nadie. En el uso normal (5-7
+# fps) no ocurre; es una protección del peor caso, no un desperdicio diario.
+DAEMON_MAX_FPS = 7
+# Tope por omisión de un visor, y el que se usa si pide uno inválido (ver arriba).
+DEFAULT_VIEWER_MAX_FPS = 7
 
 # Plazo del `stream status --json`, POR DEBAJO de PORT_TIMEOUT a propósito: así el
 # que salta es este, que es el camino limpio —`cli.run` mata el CLI y devuelve un
@@ -242,6 +259,25 @@ class PanelState:
         if self.host:
             messages.append({"type": "host", "host": self.host})
         return messages
+
+
+def viewer_max_fps(crudo) -> int:
+    """El tope de fps que se le concede a un visor, a partir de lo que pidió.
+
+    Es la puerta de entrada: el presupuesto de caudal lo sostiene
+    DEFAULT_VIEWER_MAX_FPS, así que ningún valor pedido puede superarlo. Ausente,
+    vacío, no numérico (`abc`, `7.5`), `0`, negativo o fuera de 1..120 cae en el
+    tope por omisión; uno válido por encima del tope se recorta a él, y uno menor
+    se respeta (un visor puede pedir MENOS). `0` ya NO significa «sin tope» para un
+    cliente de red: eso era un agujero por el que cualquiera pedía fps ilimitados.
+    (`add_viewer(max_fps=0)` sigue valiendo para las pruebas internas.)"""
+    try:
+        fps = int(crudo)
+    except (TypeError, ValueError):
+        return DEFAULT_VIEWER_MAX_FPS
+    if not 1 <= fps <= 120:
+        return DEFAULT_VIEWER_MAX_FPS
+    return min(fps, DEFAULT_VIEWER_MAX_FPS)
 
 
 def _frame_interval(max_fps) -> float:
