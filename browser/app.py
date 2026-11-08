@@ -3,9 +3,10 @@ Chromium) en el i3; la app de macOS lo invoca por HTTP en vez de lanzarlo en loc
 /v1/browser/invoke valida el argv y lo ejecuta vía cli.py; el WebSocket de
 streaming llega en la Tarea 4."""
 import os
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 import cli
 
@@ -29,10 +30,11 @@ def healthz():
 
 
 class InvokeBody(BaseModel):
-    arguments: list[str]
+    # Topes: un cuerpo sin límite crecería sin freno en el servidor.
+    arguments: list[Annotated[str, StringConstraints(max_length=8192)]] = Field(max_length=64)
     timeout: float = Field(default=30, gt=0, le=300)
     # Va al stdin del proceso, nunca a argv: `ps` lee el argv de cualquier proceso.
-    stdin: str | None = None
+    stdin: str | None = Field(default=None, max_length=262144)
 
 
 @app.post("/v1/browser/invoke", dependencies=[Depends(require_bearer)])

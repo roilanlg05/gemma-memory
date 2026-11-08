@@ -197,3 +197,148 @@ def test_validate_batch_payload_se_prueba_sola():
     cli.validate_batch_payload([], '[["open","https://a.test"]]')
     with pytest.raises(ValueError, match="eval"):
         cli.validate_batch_payload([], '[["eval","1"]]')
+
+
+# --- lista de permitidos de flags, en cualquier posición ---
+def _invoca(*arguments, stdin=None):
+    return client.post("/v1/browser/invoke",
+                       json={"arguments": list(arguments), "stdin": stdin}, headers=AUTH).status_code
+
+
+def test_rechaza_init_script_que_carga_javascript_del_disco():
+    assert _invoca("open", "https://a.test", "--init-script", "/ruta/x.js") == 400
+
+
+def test_rechaza_extension_que_carga_codigo_del_disco():
+    assert _invoca("open", "https://a.test", "--extension", "/ruta/dir") == 400
+
+
+def test_rechaza_restore_check_fn_con_javascript_en_la_linea_de_ordenes():
+    assert _invoca("open", "https://a.test", "--restore", "k",
+                   "--restore-check-fn", "fetch('http://x')") == 400
+
+
+def test_rechaza_la_forma_corta_de_provider():
+    assert _invoca("open", "https://a.test", "-p", "browserbase") == 400
+
+
+def test_rechaza_un_flag_inventado_en_cualquier_posicion():
+    assert _invoca("open", "https://a.test", "--loquesea") == 400
+    assert _invoca("--loquesea", "open", "https://a.test") == 400
+
+
+def test_rechaza_wait_fn_que_ejecuta_javascript():
+    assert _invoca("wait", "--fn", "document.title") == 400
+
+
+def test_rechaza_flags_de_red_sin_permiso():
+    for flag in ["--proxy", "--headers", "--ca-cert", "--namespace", "--engine"]:
+        assert _invoca("open", "https://a.test", flag, "x") == 400, flag
+
+
+def test_un_flag_es_valido_solo_en_el_subcomando_que_lo_declara():
+    assert _invoca("snapshot", "-i", "--json") == 200
+    assert _invoca("open", "https://a.test", "-i") == 400
+
+
+def test_un_valor_con_forma_de_flag_se_rechaza():
+    assert _invoca("wait", "--text", "--fn") == 400
+
+
+def test_batch_rechaza_flags_peligrosos_dentro_de_sus_ordenes():
+    carga = '[["open","https://a.test","--init-script","/x.js"]]'
+    assert _invoca("batch", stdin=carga) == 400
+
+
+def test_stream_enable_y_disable_se_rechazan_y_status_pasa():
+    assert _invoca("--session", "gemma", "stream", "status", "--json") == 200
+    r = client.post("/v1/browser/invoke",
+                    json={"arguments": ["--session", "gemma", "stream", "enable"]},
+                    headers=AUTH)
+    assert r.status_code == 400 and "enable" in r.json()["detail"]
+    assert _invoca("--session", "gemma", "stream", "enable", "--port", "9999") == 400
+    assert _invoca("stream", "disable") == 400
+    assert _invoca("stream") == 400
+
+
+# Una prueba por cada forma de invocación real de la app (AgentBrowserService
+# antepone --session y añade --json). Protegen de cerrar demasiado.
+def test_pasan_las_invocaciones_reales_de_las_herramientas_de_la_app():
+    s = ["--session", "gemma"]
+    formas = [
+        s + ["open", "https://example.com", "--json"],
+        s + ["click", "@e3", "--json"],
+        s + ["fill", "#correo", "hola mundo", "--json"],
+        s + ["press", "Enter", "--json"],
+        s + ["close", "--json"],
+        s + ["snapshot", "-i", "--json"],
+        s + ["snapshot", "-i", "-s", "main", "--json"],
+        s + ["snapshot", "--json"],
+        s + ["wait", "--text", "Listo", "--json"],
+        s + ["wait", "--url", "**/gracias", "--json"],
+        s + ["wait", "#cargando", "--json"],
+        s + ["wait", "1500", "--json"],
+        s + ["get", "title", "--json"],
+        s + ["get", "url", "--json"],
+        s + ["get", "text", "@e2", "--json"],
+        s + ["get", "html", "main", "--json"],
+        s + ["get", "value", "#q", "--json"],
+        s + ["get", "count", "li", "--json"],
+        # read_webpage no lleva sesión
+        ["read", "https://example.com", "--json"],
+        ["read", "https://example.com", "--outline", "--json"],
+        ["read", "https://example.com", "--filter", "precio", "--json"],
+        ["read", "https://example.com", "--outline", "--filter", "precio", "--json"],
+    ]
+    for forma in formas:
+        assert _invoca(*forma) == 200, forma
+
+
+# --- ejecutor: plazo y huérfanos ---
+def test_el_stdin_mas_grande_que_el_pipe_vuelve_por_plazo(monkeypatch, tmp_path):
+    # Un hijo que no lee su stdin: sin plazo propio, drain() colgaba la petición.
+    import asyncio, time, cli
+    guion = tmp_path / "no-lee-stdin"
+    guion.write_text("#!/bin/sh\nexec sleep 30\n")
+    guion.chmod(0o755)
+    monkeypatch.setenv("BROWSER_FAKE_CLI", "0")
+    monkeypatch.setattr(cli, "BROWSER_BIN", str(guion))
+    inicio = time.monotonic()
+    resultado = asyncio.run(cli.run(["batch"], timeout=1, stdin="x" * 1_000_000))
+    assert time.monotonic() - inicio < 5
+    assert resultado["exitCode"] == -1 and "timeout" in resultado["stderr"]
+
+
+def test_el_proceso_se_mata_si_se_cancela_la_peticion(monkeypatch, tmp_path):
+    import asyncio, cli, os, signal
+    pidfile = tmp_path / "pid"
+    guion = tmp_path / "duerme"
+    guion.write_text(f"#!/bin/sh\necho $$ > {pidfile}\nexec sleep 30\n")
+    guion.chmod(0o755)
+    monkeypatch.setenv("BROWSER_FAKE_CLI", "0")
+    monkeypatch.setattr(cli, "BROWSER_BIN", str(guion))
+
+    async def escenario():
+        tarea = asyncio.create_task(cli.run(["open", "https://a.test"], timeout=20))
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+        tarea.cancel()
+        try:
+            await tarea
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(escenario())
+    pid = int(pidfile.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_el_cuerpo_tiene_topes():
+    assert client.post("/v1/browser/invoke", json={"arguments": ["wait"] * 65},
+                       headers=AUTH).status_code == 422
+    assert client.post("/v1/browser/invoke",
+                       json={"arguments": ["batch"], "stdin": "x" * 262145},
+                       headers=AUTH).status_code == 422
