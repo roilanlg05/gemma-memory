@@ -6,8 +6,8 @@ con solo los campos que el relé necesita, o los mensajes del cable.
 El demonio emite `frame`, `status` y, sin documentar, un eco `command` por cada
 orden ejecutada, con un objeto `params` que lleva los argumentos crudos (el
 número de tarjeta de un `fill`, por ejemplo). Este módulo es el filtro: de
-`params` solo se lee `url`, y solo cuando la acción es `navigate`; nada más
-sobrevive. Lo que sale al cable de un `fill` es la frase «rellenando un campo».
+`params` solo se lee `url`, y solo cuando la acción es `navigate` u `open`; nada
+más sobrevive. Lo que sale al cable de un `fill` es la frase «rellenando un campo».
 
 El módulo es puro: sin red, sin ficheros, sin estado, sin reloj, y SIN registrar nunca el
 cuerpo de un mensaje (ni en un log, ni en un error). Las excepciones se

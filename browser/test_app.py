@@ -1,14 +1,18 @@
 """Pruebas del servicio de navegador. Correr con:
     python3 -m pytest browser/test_app.py -v
 Usa BROWSER_FAKE_CLI=1 para no lanzar el binario de verdad."""
-import os, sys
+import asyncio, base64, contextlib, json, os, sys, time
 import pytest
 os.environ["BROWSER_FAKE_CLI"] = "1"
 os.environ["BROWSER_BEARER_TOKEN"] = "test-token"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import websockets
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 import app as appmod
+import relay
+from relay import PanelState
 
 client = TestClient(appmod.app)
 AUTH = {"Authorization": "Bearer test-token"}
@@ -377,3 +381,441 @@ def test_el_nombre_de_sesion_es_un_juego_de_caracteres_seguro():
         assert _invoca("--session", malo, "open", "https://a.test") == 400, malo
     for bueno in ["gemma", "gemma-live-test", "sesion_1"]:
         assert _invoca("--session", bueno, "open", "https://a.test") == 200, bueno
+
+
+# ===========================================================================
+# El relé del stream (Tarea 4): el predicado de «en vivo», el cable y el acuse
+# encadenado. El cable es contrato con el lado de Swift: seis mensajes y nada más.
+# ===========================================================================
+
+# --- el predicado de «en vivo» ---
+def test_nace_en_vivo_si_el_cli_dijo_screencasting_sin_haber_visto_ningun_status():
+    # §5.9: el canal de status no es durable. Si el predicado exigiera haberlo visto,
+    # un panel que pinta frames nuevos se marcaría congelado.
+    assert PanelState(screencasting=True).live is True
+
+
+def test_nace_no_vivo_si_el_cli_dijo_que_no():
+    assert PanelState(screencasting=False).live is False
+
+
+def test_pagina_quieta_sigue_en_vivo():
+    s = PanelState(screencasting=True)
+    s.apply({"kind": "frame", "seq": 1, "captured_at": 0, "jpeg_b64": "x"})
+    assert s.live is True, "los frames se emiten por cambio, no por reloj: la edad no decide nada"
+
+
+def test_un_status_con_screencasting_false_quita_el_en_vivo():
+    s = PanelState(screencasting=True)
+    s.apply({"kind": "status", "screencasting": False})
+    assert s.live is False
+
+
+def test_freeze_colapsa_y_deja_de_estar_vivo():
+    s = PanelState(screencasting=True)
+    s.freeze()
+    assert s.collapsed is True and s.live is False
+
+
+def test_cuenta_acciones_y_recuerda_el_host():
+    s = PanelState(screencasting=True)
+    s.apply({"kind": "command", "action": "navigate", "url": "https://amazon.es/x"})
+    s.apply({"kind": "command", "action": "click", "url": None})
+    assert s.action_count == 2 and s.host == "amazon.es"
+
+
+def test_un_frame_prueba_que_el_screencast_corre_y_devuelve_el_en_vivo():
+    # Observado en vivo: el demonio manda `status` con `screencasting:false` justo
+    # al engancharse el relé y lo corrige unos segundos después. Un frame recibido
+    # ES el screencast ocurriendo, así que el panel no puede decir «congelado»
+    # mientras pinta uno nuevo. Decide su LLEGADA, nunca su antigüedad.
+    s = PanelState(screencasting=True)
+    s.apply({"kind": "status", "screencasting": False})
+    assert s.live is False
+    s.apply({"kind": "frame", "seq": 1, "captured_at": 0, "jpeg_b64": "x"})
+    assert s.live is True
+
+
+def test_el_socket_caido_quita_el_en_vivo():
+    s = PanelState(screencasting=True)
+    s.socket_closed()
+    assert s.live is False
+
+
+def test_dejar_de_acusar_quita_el_en_vivo():
+    # Spec §6.2(f): en pacing=ack, dejar de acusar es la forma de congelar el panel.
+    s = PanelState(screencasting=True)
+    s.set_acking(False)
+    assert s.live is False
+
+
+def test_un_panel_colapsado_ya_no_cuenta_ni_narra():
+    s = PanelState(screencasting=True)
+    s.freeze()
+    s.apply({"kind": "command", "action": "click", "url": None})
+    assert s.action_count == 0
+
+
+# Review Focus 4: un visor que entra a mitad recibe el estado actual.
+def test_un_visor_que_entra_a_mitad_recibe_estado_resumen_y_host():
+    s = PanelState(screencasting=True)
+    s.apply({"kind": "command", "action": "navigate", "url": "https://amazon.es/x"})
+    kinds = [m["type"] for m in s.snapshot_messages()]
+    assert "state" in kinds and "summary" in kinds and "host" in kinds
+
+
+# --- el endpoint ---
+def test_el_stream_sin_token_se_rechaza():
+    with pytest.raises(Exception):
+        with client.websocket_connect("/v1/browser/stream"):
+            pass
+
+
+def test_el_stream_con_un_token_malo_se_rechaza():
+    with pytest.raises(Exception):
+        with client.websocket_connect("/v1/browser/stream?token=otro"):
+            pass
+
+
+def test_el_stream_manda_state_al_conectar():
+    with client.websocket_connect("/v1/browser/stream?token=test-token") as ws:
+        first = ws.receive_json()
+        assert first["type"] == "state"
+        assert set(first) >= {"type", "live", "collapsed"}
+
+
+def test_el_stream_acepta_el_token_en_la_cabecera():
+    with client.websocket_connect("/v1/browser/stream", headers=AUTH) as ws:
+        assert ws.receive_json()["type"] == "state"
+
+
+def test_sin_puerto_del_demonio_el_visor_recibe_closed_y_el_servicio_sigue_vivo():
+    # BROWSER_FAKE_CLI=1: `stream status` no trae puerto. Degradación §6.2(e): el
+    # panel no aparece y nada más se rompe.
+    tipos = []
+    with contextlib.suppress(Exception):
+        with client.websocket_connect("/v1/browser/stream?token=test-token") as ws:
+            for _ in range(5):
+                tipos.append(ws.receive_json()["type"])
+    assert tipos[0] == "state"
+    assert "closed" in tipos
+    assert client.get("/healthz").status_code == 200
+
+
+# --- el cable, contra un demonio falso: sin Docker y sin el CLI de verdad ---
+_JPEG_B64 = base64.b64encode(bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"relleno" * 8).decode()
+
+
+def _frame(seq, timestamp=1793996915607):
+    cuerpo = {"type": "frame", "seq": seq, "data": _JPEG_B64}
+    if timestamp is not None:
+        cuerpo["metadata"] = {"timestamp": timestamp}
+    return json.dumps(cuerpo)
+
+
+def _paso(texto, espera_acuse=False):
+    return {"texto": texto, "espera_acuse": espera_acuse}
+
+
+class VisorFalso:
+    """Un visor de prueba. Guarda lo que le llega al cable y, si se le pide, acusa
+    cada frame como hará la app. `lento` imita un socket que tarda en drenar."""
+
+    def __init__(self, auto_ack=True, lento=0.0, se_va_tras_frames=None):
+        self.enviados = []
+        self.auto_ack = auto_ack
+        self.lento = lento
+        self.se_va_tras_frames = se_va_tras_frames
+        self._entrada = []
+        self._cerrado = False
+
+    async def send_json(self, mensaje):
+        if self._cerrado:
+            raise RuntimeError("visor cerrado")
+        if self.lento:
+            await asyncio.sleep(self.lento)
+        self.enviados.append(mensaje)
+        if mensaje.get("type") == "frame":
+            if self.auto_ack:
+                self._entrada.append(json.dumps({"type": "ack", "seq": mensaje["seq"]}))
+            if self.se_va_tras_frames is not None and len(self.frames) >= self.se_va_tras_frames:
+                self._cerrado = True
+
+    async def receive_text(self):
+        while True:
+            if self._entrada:
+                return self._entrada.pop(0)
+            if self._cerrado:
+                raise WebSocketDisconnect(code=1000)
+            await asyncio.sleep(0.005)
+
+    async def close(self, code=1000):
+        self._cerrado = True
+
+    def desconectar(self):
+        self._cerrado = True
+
+    @property
+    def frames(self):
+        return [m for m in self.enviados if m.get("type") == "frame"]
+
+    @property
+    def tipos(self):
+        return [m.get("type") for m in self.enviados]
+
+
+@contextlib.asynccontextmanager
+async def _demonio_falso(guion, acuses, lecturas, cierra=False):
+    """Imita el servidor del stream del demonio: manda cada paso del guion y, en
+    los pasos marcados, no manda nada hasta que llega el acuse del relé. Así el
+    flujo se corta en seco si el encadenado del acuse está roto (§5.8: el servidor
+    de verdad ignora en silencio lo que no entiende, así que solo se puede probar
+    por el efecto)."""
+
+    async def manejar(ws):
+        with contextlib.suppress(Exception):
+            for paso in guion:
+                if paso["espera_acuse"]:
+                    acuses.append(json.loads(await ws.recv()))
+                await ws.send(paso["texto"])
+            if cierra:
+                return
+            async for crudo in ws:
+                acuses.append(json.loads(crudo))
+
+    async with websockets.serve(manejar, "127.0.0.1", 0) as servidor:
+        puerto = servidor.sockets[0].getsockname()[1]
+
+        async def leer_puerto():
+            lecturas.append(puerto)
+            return puerto
+
+        yield leer_puerto
+
+
+async def _esperar(predicado, timeout=6.0):
+    limite = time.monotonic() + timeout
+    while time.monotonic() < limite:
+        if predicado():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+async def _cablear(guion, visores, hasta, acuses=None, lecturas=None,
+                   stall_grace=5.0, cierra=False, timeout=6.0, tras=None):
+    """Levanta el demonio falso, conecta el relé y los visores [(visor, max_fps)],
+    espera a que `hasta` se cumpla, corre `tras` con todo todavía conectado, y
+    desmonta."""
+    acuses = [] if acuses is None else acuses
+    lecturas = [] if lecturas is None else lecturas
+    async with _demonio_falso(guion, acuses, lecturas, cierra=cierra) as leer_puerto:
+        rele = relay.Relay(leer_puerto, stall_grace=stall_grace)
+        tareas = [asyncio.create_task(rele.add_viewer(v, max_fps=f)) for v, f in visores]
+        try:
+            await _esperar(hasta, timeout)
+            if tras is not None:
+                await tras()
+        finally:
+            for visor, _ in visores:
+                visor.desconectar()
+            for tarea in tareas:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(tarea, 2.0)
+            await rele.shutdown()
+    return acuses, lecturas
+
+
+def test_el_cable_no_lleva_params_nunca():
+    # LA prueba del diseño entero: el `params` de un `fill` lleva el valor
+    # tecleado, y el cable no puede transportarlo ni por un error de programación
+    # de la app, porque nunca sale de este proceso (spec §6.3 y §5.10).
+    visor = VisorFalso()
+    guion = [_paso(json.dumps({
+        "type": "command", "action": "fill", "id": "r1",
+        "params": {"action": "fill", "id": "r1", "selector": "#tarjeta",
+                   "value": "4111111111111111"}}))]
+    asyncio.run(_cablear(guion, [(visor, 0)], lambda: "narration" in visor.tipos))
+    cable = json.dumps(visor.enviados, ensure_ascii=False)
+    assert "4111111111111111" not in cable
+    assert "#tarjeta" not in cable
+    assert "params" not in cable
+    assert {"type": "narration", "text": "rellenando un campo"} in visor.enviados
+
+
+def test_una_accion_desconocida_sale_con_su_nombre_a_secas():
+    visor = VisorFalso()
+    guion = [_paso(json.dumps({"type": "command", "action": "teletransportar",
+                               "params": {"value": "SECRETO"}}))]
+    asyncio.run(_cablear(guion, [(visor, 0)], lambda: "narration" in visor.tipos))
+    assert {"type": "narration", "text": "teletransportar"} in visor.enviados
+    assert "SECRETO" not in json.dumps(visor.enviados)
+
+
+def test_llegan_dos_frames_porque_el_acuse_encadena():
+    # §5.8, por el efecto: si `{"type":"ack","seq":N}` estuviera mal formado, el
+    # demonio no mandaría nada más y el flujo se pararía en el primer frame.
+    visor = VisorFalso()
+    guion = [_paso(_frame(1)), _paso(_frame(2), espera_acuse=True),
+             _paso(_frame(3), espera_acuse=True)]
+    acuses, _ = asyncio.run(_cablear(guion, [(visor, 0)], lambda: len(visor.frames) >= 3))
+    assert len(visor.frames) >= 3, "el encadenado visor→relé→demonio no fluye"
+    assert [a["seq"] for a in acuses[:2]] == [1, 2]
+    assert all(a["type"] == "ack" for a in acuses[:2])
+
+
+def test_el_acuse_al_demonio_no_se_manda_antes_que_el_del_visor():
+    # Spec §6.4: si el relé acusara por su cuenta, el anti objetivo principal
+    # volvería un salto más atrás. Se mira con el visor todavía conectado: al irse
+    # el último visor sí se acusa a propósito, y eso lo prueba otro test.
+    visor, acuses, vistos = VisorFalso(auto_ack=False), [], []
+
+    async def comprobar():
+        await asyncio.sleep(0.3)  # tiempo de sobra para un acuse inventado
+        vistos.extend(acuses)
+
+    asyncio.run(_cablear([_paso(_frame(1))], [(visor, 0)], lambda: visor.frames,
+                         acuses=acuses, tras=comprobar))
+    assert visor.frames, "el frame sí se reparte"
+    assert vistos == [], "el relé no acusa al demonio por su cuenta"
+
+
+def test_un_frame_sin_timestamp_sale_con_captured_at_numerico():
+    # `stream.decode` es puro y se quedó sin reloj: el sello lo pone el relé, y el
+    # cable fija `captured_at` como número (un null rompería al lado de Swift).
+    visor = VisorFalso()
+    asyncio.run(_cablear([_paso(_frame(7, timestamp=None))], [(visor, 0)],
+                         lambda: visor.frames))
+    capturado = visor.frames[0]["captured_at"]
+    assert isinstance(capturado, (int, float)) and not isinstance(capturado, bool)
+    assert capturado > 0
+
+
+def test_un_frame_ilegible_se_acusa_igual_y_no_se_manda_al_cable():
+    visor, acuses = VisorFalso(), []
+    malo = json.dumps({"type": "frame", "seq": 4, "data": "no-soy-un-jpeg"})
+    asyncio.run(_cablear([_paso(malo)], [(visor, 0)], lambda: acuses, acuses=acuses))
+    assert acuses and acuses[0] == {"type": "ack", "seq": 4}, "el ritmo no se atasca"
+    assert visor.frames == []
+
+
+def test_sin_visores_el_rele_acusa_igual():
+    # El visor se va con el frame 1 en vuelo y el 2 llega sin nadie mirando: si el
+    # relé no acusara, el ritmo del demonio quedaría atascado para siempre.
+    visor, acuses = VisorFalso(auto_ack=False, se_va_tras_frames=1), []
+    guion = [_paso(_frame(1)), _paso(_frame(2), espera_acuse=True)]
+    asyncio.run(_cablear(guion, [(visor, 0)], lambda: len(acuses) >= 2, acuses=acuses))
+    assert [a["seq"] for a in acuses[:2]] == [1, 2]
+
+
+def test_dos_visores_ven_lo_mismo_y_el_lento_no_retrasa_al_rapido():
+    # Review Focus 3: el tope de fps de cada visor se aplica al DESCARTE y no a la
+    # cola. Al de 1 fps le toca saltarse frames; el de sin tope los ve todos.
+    rapido, lento = VisorFalso(), VisorFalso()
+    guion = [_paso(_frame(1)), _paso(_frame(2), espera_acuse=True),
+             _paso(_frame(3), espera_acuse=True)]
+    asyncio.run(_cablear(guion, [(rapido, 0), (lento, 1)],
+                         lambda: len(rapido.frames) >= 3))
+    assert len(rapido.frames) >= 3
+    assert len(lento.frames) == 1, "al lento le toca saltárselos, no encolarlos"
+    assert rapido.frames[0]["seq"] == lento.frames[0]["seq"], "los dos ven lo mismo"
+
+
+def test_un_visor_que_deja_de_acusar_marca_el_panel_congelado():
+    # Spec §6.2(f): dejar de acusar congela el panel, y el relé NO se inventa un
+    # acuse para destrabarlo. El plazo mide el tiempo sin poder acusar, no la edad
+    # del frame: una página quieta no manda frames y no tiene nada en vuelo.
+    visor, acuses, vistos = VisorFalso(auto_ack=False), [], []
+
+    async def comprobar():
+        vistos.extend(acuses)
+
+    asyncio.run(_cablear(
+        [_paso(_frame(1))], [(visor, 0)],
+        lambda: len([m for m in visor.enviados if m["type"] == "state"]) >= 3,
+        acuses=acuses, stall_grace=0.05, tras=comprobar))
+    estados = [m for m in visor.enviados if m["type"] == "state"]
+    assert estados[-1]["live"] is False, "el panel no puede decir «en vivo» atascado"
+    assert vistos == [], "el relé no se inventa el acuse para destrabarse"
+
+
+def test_el_socket_caido_congela_el_panel_con_resumen_y_closed():
+    # Degradación §6.2(e) y §6.2(g): el panel se marca congelado, suelta su imagen
+    # y deja solo la línea de resumen.
+    visor = VisorFalso()
+    guion = [_paso(json.dumps({"type": "command", "action": "navigate", "id": "r1",
+                               "params": {"url": "https://www.amazon.es/dp/x"}}))]
+    asyncio.run(_cablear(guion, [(visor, 0)], lambda: "closed" in visor.tipos,
+                         cierra=True))
+    assert {"type": "host", "host": "www.amazon.es"} in visor.enviados
+    resumen = [m for m in visor.enviados if m["type"] == "summary"][-1]
+    assert resumen["text"] == "navegó en www.amazon.es · 1 acción"
+    estado = [m for m in visor.enviados if m["type"] == "state"][-1]
+    assert estado["live"] is False and estado["collapsed"] is True
+    assert visor.tipos[-1] == "closed"
+
+
+def test_el_cable_solo_lleva_los_seis_mensajes_de_la_spec():
+    visor = VisorFalso()
+    guion = [_paso(_frame(1)),
+             _paso(json.dumps({"type": "status", "screencasting": True})),
+             _paso(json.dumps({"type": "command", "action": "click",
+                               "params": {"selector": "#comprar"}})),
+             _paso(json.dumps({"type": "result", "action": "click", "data": {"x": 1}})),
+             _paso(json.dumps({"type": "console", "text": "ruido"}))]
+    asyncio.run(_cablear(guion, [(visor, 0)], lambda: "narration" in visor.tipos,
+                         cierra=True))
+    assert set(visor.tipos) <= {"frame", "narration", "host", "state", "summary", "closed"}
+
+
+def test_el_puerto_se_lee_en_cada_reconexion():
+    # Review Focus 1 y §5.2: el demonio se apaga por inactividad y al volver el
+    # puerto es otro. Un relé que lo cachea deja el panel muerto el resto de la
+    # sesión.
+    async def escenario():
+        acuses, lecturas = [], []
+        async with _demonio_falso([], acuses, lecturas, cierra=True) as leer_puerto:
+            rele = relay.Relay(leer_puerto)
+            for _ in range(2):
+                visor = VisorFalso()
+                tarea = asyncio.create_task(rele.add_viewer(visor, max_fps=0))
+                await _esperar(lambda: "closed" in visor.tipos)
+                visor.desconectar()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(tarea, 2.0)
+            await rele.shutdown()
+        return lecturas
+
+    assert len(asyncio.run(escenario())) == 2, "el puerto se lee en cada (re)conexión"
+
+
+def test_el_visor_no_puede_mandar_nada_que_no_sea_un_acuse():
+    # Spec §7: nada de control remoto. Un `input_mouse` del visor no se reenvía.
+    assert relay._ack_from(json.dumps({"type": "input_mouse", "x": 1})) is None
+    assert relay._ack_from(json.dumps({"type": "config", "maxFps": 120})) is None
+    assert relay._ack_from("no soy json") is None
+    assert relay._ack_from(json.dumps({"type": "ack", "seq": True})) is None
+    assert relay._ack_from(json.dumps({"type": "ack", "seq": 41})) == 41
+
+
+def test_read_port_saca_el_puerto_del_envelope_del_cli(monkeypatch):
+    async def falso(arguments, timeout, stdin=None):
+        assert arguments == ["--session", relay.SESSION, "stream", "status", "--json"]
+        assert "enable" not in arguments, "nunca se llama a stream enable (§5.1)"
+        return {"exitCode": 0, "stderr": "", "stdout": json.dumps(
+            {"success": True, "data": {"connected": True, "enabled": True,
+                                       "port": 55058, "screencasting": False},
+             "error": None})}
+
+    monkeypatch.setattr(relay.cli, "run", falso)
+    assert asyncio.run(relay.read_port()) == 55058
+
+
+def test_read_port_devuelve_none_cuando_el_cli_no_da_puerto(monkeypatch):
+    casos = ['{"success":false,"data":null,"error":"nope"}', '{"success":true,"data":{}}',
+             "no soy json", "", '{"success":true,"data":{"port":"55058"}}']
+    for salida in casos:
+        async def falso(arguments, timeout, stdin=None, salida=salida):
+            return {"exitCode": 0, "stdout": salida, "stderr": ""}
+        monkeypatch.setattr(relay.cli, "run", falso)
+        assert asyncio.run(relay.read_port()) is None, salida
