@@ -492,14 +492,31 @@ def test_el_stream_acepta_el_token_en_la_cabecera():
 def test_sin_puerto_del_demonio_el_visor_recibe_closed_y_el_servicio_sigue_vivo():
     # BROWSER_FAKE_CLI=1: `stream status` no trae puerto. Degradación §6.2(e): el
     # panel no aparece y nada más se rompe.
-    tipos = []
+    tipos, termino = [], False
     with contextlib.suppress(Exception):
         with client.websocket_connect("/v1/browser/stream?token=test-token") as ws:
             for _ in range(5):
-                tipos.append(ws.receive_json()["type"])
-    assert tipos[0] == "state"
-    assert "closed" in tipos
+                try:
+                    tipos.append(ws.receive_json()["type"])
+                except Exception:
+                    termino = True  # el relé cerró en vez de dejar al visor colgado
+                    break
+    assert tipos[0] == "state", "el state sale incondicional, antes de hablar con el CLI"
+    assert tipos[-1] == "closed"
+    assert [m for m in tipos if m == "closed"], "con motivo, no un cuelgue"
+    assert termino, "la conexión termina; un visor en blanco para siempre es el peor fallo"
     assert client.get("/healthz").status_code == 200
+
+
+def test_el_motivo_del_closed_sin_navegador_es_legible():
+    with contextlib.suppress(Exception):
+        with client.websocket_connect("/v1/browser/stream?token=test-token") as ws:
+            for _ in range(5):
+                m = ws.receive_json()
+                if m["type"] == "closed":
+                    assert m["reason"] == "el navegador no está disponible"
+                    return
+    pytest.fail("no llegó el closed")
 
 
 # --- el cable, contra un demonio falso: sin Docker y sin el CLI de verdad ---
@@ -652,6 +669,54 @@ def test_una_accion_desconocida_sale_con_su_nombre_a_secas():
     assert "SECRETO" not in json.dumps(visor.enviados)
 
 
+def test_launch_no_narra_ni_cuenta_porque_no_es_una_accion_del_agente():
+    # Observado en vivo: el demonio hace eco de `launch` antes de CADA orden,
+    # porque el CLI asegura el navegador en cada invocación. Narrarla pondría
+    # «launch» en una interfaz en español, y contarla duplicaría la cuenta del
+    # resumen, que es lo único que queda cuando el panel colapsa.
+    import stream as streammod
+    crudo = json.dumps({"type": "command", "action": "launch", "id": "r1",
+                        "params": {"url": "https://amazon.es/x"}})
+    decodificado = streammod.decode(crudo)
+    assert decodificado["kind"] == "other"
+    assert streammod.wire_messages(decodificado) == []
+
+    s = PanelState(screencasting=True)
+    s.apply(decodificado)
+    assert s.action_count == 0 and s.host is None
+
+    visor = VisorFalso()
+    guion = [_paso(crudo),
+             _paso(json.dumps({"type": "command", "action": "click", "params": {}}))]
+    asyncio.run(_cablear(guion, [(visor, 0)], lambda: "narration" in visor.tipos))
+    narraciones = [m["text"] for m in visor.enviados if m["type"] == "narration"]
+    assert narraciones == ["haciendo clic"], "launch no llega al cable"
+
+
+def test_las_seis_formas_de_get_narran_leyendo_la_pagina():
+    # El eco no usa el nombre del subcomando sino la operación del protocolo.
+    # Observados en vivo, uno por uno, con las seis formas que llama la app:
+    # url→url, title→title, count→count, text→gettext, html→innerhtml,
+    # value→inputvalue. Los cuatro últimos son alias por si cambian.
+    import stream as streammod
+    observados = ["url", "title", "count", "gettext", "innerhtml", "inputvalue"]
+    alias = ["get", "text", "html", "value"]
+    for palabra in observados + alias:
+        assert streammod.phrase(palabra, None) == "leyendo la página", palabra
+
+
+def test_la_accion_url_no_navega_ni_emite_host():
+    # `url` es el nombre de una acción de lectura, no una navegación: la url de
+    # `params` se lee solo para `navigate` y `open`.
+    import stream as streammod
+    decodificado = streammod.decode(json.dumps({
+        "type": "command", "action": "url",
+        "params": {"url": "https://www.amazon.es/dp/secreto"}}))
+    assert decodificado["url"] is None
+    assert streammod.wire_messages(decodificado) == [
+        {"type": "narration", "text": "leyendo la página"}]
+
+
 def test_llegan_dos_frames_porque_el_acuse_encadena():
     # §5.8, por el efecto: si `{"type":"ack","seq":N}` estuviera mal formado, el
     # demonio no mandaría nada más y el flujo se pararía en el primer frame.
@@ -719,6 +784,19 @@ def test_dos_visores_ven_lo_mismo_y_el_lento_no_retrasa_al_rapido():
     assert len(rapido.frames) >= 3
     assert len(lento.frames) == 1, "al lento le toca saltárselos, no encolarlos"
     assert rapido.frames[0]["seq"] == lento.frames[0]["seq"], "los dos ven lo mismo"
+
+
+def test_basta_el_primer_acuse_y_el_que_no_acusa_no_frena_a_nadie():
+    # Review Focus 3: si el relé esperara el acuse de TODOS, el visor que no
+    # acusa marcaría el ritmo del demonio y sería el reloj de los demás.
+    acusador, callado = VisorFalso(), VisorFalso(auto_ack=False)
+    guion = [_paso(_frame(1)), _paso(_frame(2), espera_acuse=True),
+             _paso(_frame(3), espera_acuse=True)]
+    acuses, _ = asyncio.run(_cablear(guion, [(acusador, 0), (callado, 0)],
+                                     lambda: len(acusador.frames) >= 3))
+    assert len(acusador.frames) >= 3, "el callado no puede frenar el flujo"
+    assert [a["seq"] for a in acuses[:2]] == [1, 2]
+    assert len(callado.frames) >= 1, "los dos ven lo mismo mientras drenen"
 
 
 def test_un_visor_que_deja_de_acusar_marca_el_panel_congelado():

@@ -55,6 +55,9 @@ DAEMON_MAX_FPS = 10
 DEFAULT_VIEWER_MAX_FPS = 10
 
 STATUS_TIMEOUT = 20.0          # plazo del `stream status --json`
+# Plazo del lector del puerto visto desde el relé, por encima del que ya tiene
+# `cli.run`: el lector se inyecta, y el relé no cuelga del plazo de quien le pasen.
+PORT_TIMEOUT = 25.0
 PORT_TRIES = 3                 # el demonio puede estar arrancando todavía
 PORT_RETRY_SECONDS = 2.0
 CONNECT_TIMEOUT = 10.0
@@ -345,14 +348,16 @@ class Relay:
             await self._remove_viewer(viewer)
 
     async def on_viewer_ack(self, viewer, seq: int) -> None:
-        """El visor acusó un frame. Acumulativo: un seq más nuevo cubre los
-        anteriores. Cuando ya no queda ningún visor con el frame en vuelo, el relé
-        acusa al demonio y no antes."""
+        """El visor acusó un frame, y el relé acusa al demonio en ese momento.
+
+        Basta el PRIMER acuse del frame en vuelo, no el de todos los visores: si
+        hiciera falta el de todos, el visor más lento marcaría el ritmo del
+        demonio y sería el reloj de los demás (Review Focus 3). Un visor lento
+        recibe descartes por su tope de fps, y eso es toda su degradación. Los
+        acuses son acumulativos, así que uno más nuevo cubre los anteriores."""
         if self._pending_seq is None or seq < self._pending_seq:
             return
-        self._pending_viewers.discard(viewer)
-        if not self._pending_viewers:
-            await self._ack_daemon(self._pending_seq)
+        await self._ack_daemon(self._pending_seq)
 
     async def shutdown(self) -> None:
         """Suelta el socket del demonio y las tareas de todos los visores."""
@@ -434,8 +439,11 @@ class Relay:
             "socket caído" if connected else "el navegador no está disponible")
 
     async def _read_port_safely(self) -> int | None:
+        """Con plazo propio: en el camino de arranque del panel no hay ningún
+        `await` sin plazo, porque un visor que acepta la conexión y no recibe
+        nunca nada es peor que un panel que dice que no hay navegador."""
         try:
-            return await self._read_port()
+            return await asyncio.wait_for(self._read_port(), PORT_TIMEOUT)
         except Exception:
             return None  # sin registrar el motivo: arrastraría el stdout del CLI
 

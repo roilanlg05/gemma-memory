@@ -9,6 +9,11 @@ número de tarjeta de un `fill`, por ejemplo). Este módulo es el filtro: de
 `params` solo se lee `url`, y solo cuando la acción es `navigate` u `open`; nada
 más sobrevive. Lo que sale al cable de un `fill` es la frase «rellenando un campo».
 
+Algunas acciones del eco no son acciones del agente, y este módulo es el único
+punto donde se descartan: ver IGNORED_ACTIONS. Al clasificarlas como `other` se
+saltan de una vez la narración y la cuenta del panel, sin un segundo filtro en el
+relé.
+
 El módulo es puro: sin red, sin ficheros, sin estado, sin reloj, y SIN registrar nunca el
 cuerpo de un mensaje (ni en un log, ni en un error). Las excepciones se
 tragan sin reproducir el texto que las causó.
@@ -26,6 +31,14 @@ _SAFE_ACTION = re.compile(r"[^A-Za-z0-9_.:-]")
 # `open` es el subcomando del CLI y `navigate` el nombre del protocolo: el
 # demonio puede decir cualquiera, así que ambos son navegar.
 _NAVIGATE = ("navigate", "open")
+
+# Acciones del eco que NO son acciones del agente. `launch` lo observé en vivo
+# llegando antes de CADA orden, porque el CLI asegura el navegador en cada
+# invocación: narrarla pondría «launch» en una interfaz en español, y contarla
+# duplicaría la cuenta del resumen del panel (un turno de 7 acciones diría 14, y
+# el resumen es lo único que queda cuando el panel colapsa). Se clasifican como
+# `other`, así que se saltan la narración y la cuenta en el mismo punto.
+IGNORED_ACTIONS: frozenset[str] = frozenset({"launch"})
 
 
 def _empty(kind: str) -> dict:
@@ -67,10 +80,13 @@ def _decode_frame(msg: dict) -> dict:
 
 
 def _decode_command(msg: dict) -> dict:
-    out = _empty("command")
     action = msg.get("action")
-    if isinstance(action, str):
-        out["action"] = _SAFE_ACTION.sub("", action)[:_MAX_ACTION] or None
+    name = _SAFE_ACTION.sub("", action)[:_MAX_ACTION] if isinstance(action, str) else ""
+    if name in IGNORED_ACTIONS:
+        # Ni narración ni cuenta: para el panel esto no ha pasado.
+        return _empty("other")
+    out = _empty("command")
+    out["action"] = name or None
     params = msg.get("params")
     # Única lectura de params: la url, y solo si la acción es navegar.
     if out["action"] in _NAVIGATE and isinstance(params, dict):
@@ -125,10 +141,27 @@ def phrase(action: str, url: str | None) -> str:
         "type": "rellenando un campo",
         "snapshot": "leyendo la página",
         "read": "leyendo la página",
-        "get": "leyendo la página",
         "press": "pulsando una tecla",
         "wait": "esperando",
         "close": "cerrando la pestaña",
+        # Las seis formas de `get` que llama la app. El eco NO usa el nombre del
+        # subcomando sino la operación del protocolo, y los nombres se observaron
+        # en vivo uno por uno: `get url`→`url`, `get title`→`title`,
+        # `get count`→`count`, `get text`→`gettext`, `get html`→`innerhtml`,
+        # `get value`→`inputvalue`. `get`, `text`, `html` y `value` se quedan como
+        # alias por si otra versión del CLI usa la palabra llana; no estorban.
+        # Ojo: `url` es aquí un nombre de acción de lectura y NO navega — la url de
+        # `params` se lee solo para `navigate` y `open`.
+        "get": "leyendo la página",
+        "url": "leyendo la página",
+        "title": "leyendo la página",
+        "count": "leyendo la página",
+        "gettext": "leyendo la página",
+        "innerhtml": "leyendo la página",
+        "inputvalue": "leyendo la página",
+        "text": "leyendo la página",
+        "html": "leyendo la página",
+        "value": "leyendo la página",
     }
     return fixed.get(action, action)
 
