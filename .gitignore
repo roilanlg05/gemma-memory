@@ -20,3 +20,6 @@ docker-data/
 # OS
 .DS_Store
 .venv-voicetest/
+
+# Git worktrees (aislamiento de ramas de trabajo)
+.worktrees/
