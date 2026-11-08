@@ -96,9 +96,25 @@ def session_mismatch(requested: str | None) -> str | None:
 
 # Tope de fps que se le pide al demonio, declarado en la URL y no por un mensaje
 # `config`: es la única forma de que cubra el frame de apertura (spec §5.5, §6.2(c)).
-DAEMON_MAX_FPS = 10
-# Tope por omisión de un visor, y el que se usa si pide uno inválido.
-DEFAULT_VIEWER_MAX_FPS = 10
+#
+# 7 fps, y bajan LOS DOS topes. Procedencia: medición de nitidez, repositorio
+# personal_agent (commit 03ba854),
+# docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
+# Con 1080x608 q45 el fotograma más grande medido pesa 54 715 B; lo que decide es
+# el pico (tope de fps x fotograma máximo), no el caudal medio. A 10 fps serían
+# 547 kB/s y no caben en el presupuesto móvil de 400 kB/s; a 7 son 383 kB/s
+# (típico 361). Se baja la tasa y no la nitidez: una página de compras se mira, no
+# se anima. Los fps logrados medidos (5-7) no llegan al tope porque el demonio
+# emite por cambio y mantiene un solo fotograma en vuelo (pacing=ack), así que
+# pasar de 10 a 7 no quita ningún fotograma de los que el usuario veía de verdad:
+# solo acota el pico de una página que se anime sola.
+# Se bajan los dos porque el salto demonio -> relé es localhost y es gratis, así
+# que bastaría estrangular al visor; pero con el demonio a 10 el i3 codificaría
+# en JPEG tres de cada diez fotogramas solo para que el relé los tire: CPU
+# quemada para nadie.
+DAEMON_MAX_FPS = 7
+# Tope por omisión de un visor, y el que se usa si pide uno inválido (ver arriba).
+DEFAULT_VIEWER_MAX_FPS = 7
 
 # Plazo del `stream status --json`, POR DEBAJO de PORT_TIMEOUT a propósito: así el
 # que salta es este, que es el camino limpio —`cli.run` mata el CLI y devuelve un

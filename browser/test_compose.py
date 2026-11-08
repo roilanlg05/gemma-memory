@@ -129,3 +129,18 @@ def test_una_sangria_incoherente_hace_fallar_el_parseo():
     )
     with pytest.raises(ValueError):
         _parsear(roto)
+
+
+def test_la_nitidez_es_la_medida_no_la_heredada():
+    # Candado de regresión. Estos números salen de la medición de 25 fotogramas por
+    # combinación sobre una página de resultados real; está en el repositorio
+    # personal_agent, commit 03ba854:
+    #   docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
+    # Si alguien los cambia sin medir, esta prueba se pone roja y le obliga a leerla.
+    # (Los 640x360 q20 heredados daban un panel borroso.)
+    env = _env_del_servicio("browser")
+    assert env["AGENT_BROWSER_STREAM_MAX_WIDTH"] == "1080"
+    assert env["AGENT_BROWSER_STREAM_MAX_HEIGHT"] == "608"
+    assert env["AGENT_BROWSER_STREAM_QUALITY"] == "45"
+    # Valores fuera de rango no pueden llegar al demonio.
+    assert 1 <= int(env["AGENT_BROWSER_STREAM_QUALITY"]) <= 100

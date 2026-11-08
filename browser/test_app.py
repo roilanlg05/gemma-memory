@@ -1283,3 +1283,13 @@ def test_read_port_devuelve_none_cuando_el_cli_no_da_puerto(monkeypatch):
             return {"exitCode": 0, "stdout": salida, "stderr": ""}
         monkeypatch.setattr(relay.cli, "run", falso)
         assert asyncio.run(relay.read_port()) is None, salida
+
+
+def test_el_caudal_del_panel_cabe_en_un_enlace_movil():
+    # Lo que decide es el PICO, no la media: tope de fps x fotograma más grande
+    # medido (1080x608 q45: 54 715 B; media 51 594 B). Presupuesto: 400 kB/s.
+    # Medición: personal_agent, commit 03ba854,
+    # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
+    assert relay.DEFAULT_VIEWER_MAX_FPS * 54_715 <= 400_000
+    # El demonio no debe codificar más fotogramas de los que el relé deja pasar.
+    assert relay.DAEMON_MAX_FPS <= relay.DEFAULT_VIEWER_MAX_FPS

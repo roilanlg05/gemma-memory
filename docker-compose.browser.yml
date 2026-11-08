@@ -47,10 +47,17 @@ services:
       # El demonio se apaga por inactividad; media hora cubre una conversación larga.
       - AGENT_BROWSER_IDLE_TIMEOUT_MS=1800000
       - AGENT_BROWSER_SOCKET_DIR=/run/agent-browser
-      # Calidad y tamaño máximo del JPEG del streaming.
-      - AGENT_BROWSER_STREAM_QUALITY=20
-      - AGENT_BROWSER_STREAM_MAX_WIDTH=640
-      - AGENT_BROWSER_STREAM_MAX_HEIGHT=360
+      # Calidad y tamaño máximo del JPEG del streaming: 1080x608 a calidad 45.
+      # Salen de una medición real (25 fotogramas por combinación, página de
+      # resultados de una tienda), NO de un valor heredado: el 640x360 q20 anterior
+      # se veía borroso. Ver, en el repositorio personal_agent (commit 03ba854),
+      # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
+      # Fotograma medio 51 594 B, máximo 54 715 B. Con el tope de 7 fps de
+      # browser/relay.py el pico es 383 kB/s, bajo el presupuesto de 400 kB/s.
+      # Si se cambian, hay que volver a medir y actualizar test_compose.py.
+      - AGENT_BROWSER_STREAM_QUALITY=45
+      - AGENT_BROWSER_STREAM_MAX_WIDTH=1080
+      - AGENT_BROWSER_STREAM_MAX_HEIGHT=608
       # Que no toque la red en cada llamada.
       - AGENT_BROWSER_NO_VERSION_CHECK=1
     healthcheck:
