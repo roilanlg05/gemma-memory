@@ -465,6 +465,58 @@ def test_un_visor_que_entra_a_mitad_recibe_estado_resumen_y_host():
 
 
 # --- el endpoint ---
+def _linea_filtrada(plantilla, args):
+    """Pasa un registro por el filtro y devuelve la línea que se escribiría."""
+    import logging
+    registro = logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1,
+                                 plantilla, args, None)
+    assert appmod.RedactTokenFilter().filter(registro) is True
+    return registro.getMessage()
+
+
+def test_el_token_se_tacha_en_mayusculas_y_en_cualquier_forma_de_args():
+    # Las tres vías que dejaba pasar el filtro, una por una. Un cliente que mande
+    # `?Token=` falla la autenticación, que es sensible a mayúsculas, pero su
+    # token se escribiría en el log igual de claro.
+    assert "SECRETO" not in _linea_filtrada("%s", ("/s?Token=SECRETO",))
+    assert "SECRETO" not in _linea_filtrada("%s", ("/s?TOKEN=SECRETO",))
+    # `args` como mapping: logging colapsa una tupla de un solo dict en el propio
+    # dict, y por esa vía el scope entero de uvicorn —con la query string— llega
+    # al log. Se construye como lo construye logging, con el dict en una tupla.
+    assert "SECRETO" not in _linea_filtrada("%(path)s", ({"path": "/s?token=SECRETO"},))
+    # Y sin pasar por un str: bytes, y un dict que NO va solo en la tupla.
+    assert "SECRETO" not in _linea_filtrada("%s", (b"/s?token=SECRETO",))
+    assert "SECRETO" not in _linea_filtrada("%s %s", ("x", {"q": "token=SECRETO"}))
+    # El token también puede venir en la propia plantilla.
+    assert "SECRETO" not in _linea_filtrada("GET /s?token=SECRETO", ())
+    # Y lo que no es el token sobrevive, incluido un %d que no se puede convertir
+    # a texto sin romper el formateo.
+    linea = _linea_filtrada('%s [%d] scope=%s', ("cliente", 7, "/s?token=X&maxFps=10"))
+    assert "maxFps=10" in linea and "[7]" in linea and "cliente" in linea
+    assert "token=[redactado]" in linea
+
+
+def test_el_filtro_del_token_nunca_tira_al_que_registra():
+    # `Logger.handle` NO envuelve los filtros: una excepción aquí saldría por el
+    # `logger.info` del handshake del WebSocket y tiraría la conexión.
+    import logging
+
+    class _MsgQueRevienta:
+        def __str__(self):
+            raise RuntimeError("no me conviertas")
+
+    registro = logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1,
+                                 _MsgQueRevienta(), None, None)
+    assert appmod.RedactTokenFilter().filter(registro) is True
+
+
+def test_los_tres_loggers_que_escribirian_el_token_llevan_el_filtro():
+    import logging
+    for nombre in ("uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
+        assert any(isinstance(f, appmod.RedactTokenFilter)
+                   for f in logging.getLogger(nombre).filters), nombre
+
+
 def test_el_token_no_puede_acabar_en_un_log():
     # uvicorn registra el upgrade del WebSocket con su query string, y el panel
     # manda el bearer ahí porque un cliente de WebSocket no puede poner cabeceras.

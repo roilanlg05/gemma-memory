@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import weakref
+from collections.abc import Mapping
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket
@@ -36,21 +37,51 @@ class RedactTokenFilter(logging.Filter):
     Esto lo cierra sin depender de cómo se lance el proceso, que es lo que importa
     porque este es el primer endpoint que sirve imágenes de la pantalla."""
 
-    _TOKEN = re.compile(r"(token=)[^&\s\"']+")
+    # Sin mayúsculas no vale: un cliente que mande `?Token=` falla la
+    # autenticación (el parámetro es sensible a mayúsculas) pero su token se
+    # escribiría en el log igual de claro.
+    _TOKEN = re.compile(r"(token=)[^&\s\"']+", re.IGNORECASE)
 
     @classmethod
     def redact(cls, text: str) -> str:
         return cls._TOKEN.sub(r"\1[redactado]", text)
 
+    @classmethod
+    def _clean(cls, value):
+        """Redacta cualquier argumento, no solo los `str`: logging acepta dicts,
+        bytes y lo que tenga `__str__`. Si no había nada que tachar devuelve el
+        valor TAL CUAL, para no romper un `%d` convirtiendo un número en texto."""
+        try:
+            text = value if isinstance(value, str) else str(value)
+            redacted = cls.redact(text)
+        except Exception:
+            return value
+        return redacted if redacted != text else value
+
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = self.redact(str(record.msg))
-        if isinstance(record.args, tuple):
-            record.args = tuple(
-                self.redact(a) if isinstance(a, str) else a for a in record.args)
+        # Un filtro de logging no puede tirar a quien registra: `Logger.handle` no
+        # envuelve los filtros, así que una excepción aquí saldría por el
+        # `logger.info` del handshake del WebSocket.
+        try:
+            record.msg = self._clean(record.msg)
+            args = record.args
+            if isinstance(args, Mapping):
+                # logging guarda así un único argumento dict (`%(path)s`), y por
+                # esa vía el scope entero —con la query string— llega al log.
+                record.args = {k: self._clean(v) for k, v in args.items()}
+            elif isinstance(args, tuple):
+                record.args = tuple(self._clean(a) for a in args)
+        except Exception:
+            pass
         return True
 
 
-for _nombre in ("uvicorn.error", "uvicorn.access"):
+# `uvicorn.error` emite la línea del upgrade del WebSocket con su query string, y
+# es la que importa. `uvicorn.access`, el log de acceso. `uvicorn.asgi` registra
+# el scope completo —`query_string` incluido— y solo se alcanza con
+# `--log-level trace`, que el CMD no pone: está aquí porque el día que alguien
+# suba el nivel de log para depurar, el token no debe aparecer.
+for _nombre in ("uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
     logging.getLogger(_nombre).addFilter(RedactTokenFilter())
 
 

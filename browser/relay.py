@@ -59,9 +59,17 @@ DAEMON_MAX_FPS = 10
 # Tope por omisión de un visor, y el que se usa si pide uno inválido.
 DEFAULT_VIEWER_MAX_FPS = 10
 
-STATUS_TIMEOUT = 20.0          # plazo del `stream status --json`
-# Plazo del lector del puerto visto desde el relé, por encima del que ya tiene
-# `cli.run`: el lector se inyecta, y el relé no cuelga del plazo de quien le pasen.
+# Plazo del `stream status --json`, POR DEBAJO de PORT_TIMEOUT a propósito: así el
+# que salta es este, que es el camino limpio —`cli.run` mata el CLI y devuelve un
+# envelope de plazo agotado— y no la cancelación del `wait_for` de fuera. Medido
+# en vivo en el contenedor, con cero demonios corriendo: la primera llamada tarda
+# **0,38 s** y ya devuelve puerto (el servidor del stream no espera a que Chromium
+# arranque); la segunda, 0,00 s. Cinco segundos son un orden de magnitud de
+# margen.
+STATUS_TIMEOUT = 5.0
+# Plazo del lector del puerto visto desde el relé, por encima del de `cli.run`: el
+# lector se inyecta, y el relé no cuelga del plazo de quien se lo pase. Es la red,
+# no el plazo de trabajo.
 PORT_TIMEOUT = 8.0
 PORT_TRIES = 3                 # el demonio puede estar arrancando todavía
 PORT_RETRY_SECONDS = 2.0
@@ -269,6 +277,14 @@ class Viewer:
                 await self.ws.close()
 
 
+def _swallow(task: asyncio.Task) -> None:
+    """Recoge la excepción de una tarea de la que ya no se espera nada, para que
+    asyncio no la registre con su traceback completo."""
+    if not task.cancelled():
+        with contextlib.suppress(Exception):
+            task.exception()
+
+
 def _ack_from(text: str) -> int | None:
     """El `seq` de un `{"type":"ack","seq":N}` del visor, o None.
 
@@ -336,6 +352,7 @@ class Relay:
         self._daemon: object | None = None     # el socket al demonio, mientras vive
         self._daemon_task: asyncio.Task | None = None
         self._linger_task: asyncio.Task | None = None
+        self._closing_task: asyncio.Task | None = None
         self._ack_lock = asyncio.Lock()
         # El frame que está en vuelo y los visores que todavía no lo han acusado.
         # Con `pacing=ack` el demonio mantiene como máximo uno (spec §5.6).
@@ -465,8 +482,13 @@ class Relay:
             return
         _log.error("la era del socket del demonio terminó por %s", type(error).__name__)
         with contextlib.suppress(Exception):
-            asyncio.get_running_loop().create_task(
+            # Se guarda la referencia por dos razones: asyncio solo mantiene
+            # referencias débiles a las tareas, y una excepción sin recoger la
+            # registraría él con el traceback completo, que sería la única vía de
+            # log del módulo fuera de la disciplina del nombre de la clase.
+            self._closing_task = asyncio.get_running_loop().create_task(
                 self._announce_gone("el panel se cortó"))
+            self._closing_task.add_done_callback(_swallow)
 
     async def _run_daemon(self) -> None:
         """Una era del socket del demonio: arranca, reparte y acusa hasta que se
