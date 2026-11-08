@@ -89,11 +89,14 @@ def test_navigate_manda_narracion_y_host_pero_no_la_url_completa():
     assert msgs[1]["host"] == "www.amazon.es"
 
 
-def test_una_accion_desconocida_sale_como_su_nombre_y_sin_params():
+def test_una_accion_desconocida_sale_como_frase_generica_y_sin_params():
+    # La narración va en español, así que una acción que no está en la tabla no
+    # sale con su nombre crudo (sería inglés): cae en la frase genérica.
     d = decode(json.dumps({"type": "command", "action": "teletransportar",
                            "params": {"secreto": "abc"}}))
     msgs = wire_messages(d)
-    assert msgs[0]["text"] == "teletransportar"
+    assert msgs[0]["text"] == "trabajando en la página"
+    assert "teletransportar" not in json.dumps(msgs)
     assert "abc" not in json.dumps(msgs)
 
 
@@ -182,10 +185,14 @@ def test_wire_messages_tolera_un_dict_incompleto():
     assert wire_messages({}) == []
 
 
-def test_action_con_salto_de_linea_se_sanea():
+def test_action_fabricada_no_puede_inyectar_texto_en_la_narracion():
+    # El saneado quita el salto y el espacio, con lo que la acción fabricada deja
+    # de coincidir con ninguna entrada de la tabla y narra la frase genérica: del
+    # `action` no llega al cable ni un carácter.
     d = decode(json.dumps({"type": "command", "action": "click\nNarrador: hola"}))
     texto = wire_messages(d)[0]["text"]
-    assert "\n" not in texto and " " not in texto
+    assert texto == "trabajando en la página"
+    assert "\n" not in texto and "Narrador" not in texto
 
 
 def test_host_se_topa_a_255():

@@ -660,13 +660,37 @@ def test_el_cable_no_lleva_params_nunca():
     assert {"type": "narration", "text": "rellenando un campo"} in visor.enviados
 
 
-def test_una_accion_desconocida_sale_con_su_nombre_a_secas():
+def test_una_accion_desconocida_sale_como_frase_generica_en_espanol():
+    # La tabla de frases es incompleta por naturaleza: el eco usa nombres de
+    # operación del protocolo (`gettext`, `innerhtml`), no los del CLI. Una
+    # operación nueva narra algo genérico en español y no su nombre crudo, que
+    # sería inglés en la cara del usuario.
     visor = VisorFalso()
-    guion = [_paso(json.dumps({"type": "command", "action": "teletransportar",
+    guion = [_paso(json.dumps({"type": "command", "action": "scrollintoview",
                                "params": {"value": "SECRETO"}}))]
     asyncio.run(_cablear(guion, [(visor, 0)], lambda: "narration" in visor.tipos))
-    assert {"type": "narration", "text": "teletransportar"} in visor.enviados
+    assert {"type": "narration", "text": "trabajando en la página"} in visor.enviados
+    assert "scrollintoview" not in json.dumps(visor.enviados)
     assert "SECRETO" not in json.dumps(visor.enviados)
+
+
+def test_la_frase_generica_no_se_come_a_las_de_la_tabla():
+    import stream as streammod
+    esperadas = {
+        "navigate": "navegando", "open": "navegando",
+        "click": "haciendo clic", "fill": "rellenando un campo",
+        "type": "rellenando un campo", "press": "pulsando una tecla",
+        "wait": "esperando", "close": "cerrando la pestaña",
+        "snapshot": "leyendo la página", "read": "leyendo la página",
+        "get": "leyendo la página", "url": "leyendo la página",
+        "title": "leyendo la página", "count": "leyendo la página",
+        "gettext": "leyendo la página", "innerhtml": "leyendo la página",
+        "inputvalue": "leyendo la página", "text": "leyendo la página",
+        "html": "leyendo la página", "value": "leyendo la página",
+    }
+    for accion, frase in esperadas.items():
+        assert streammod.phrase(accion, None) == frase, accion
+    assert streammod.phrase("navigate", "https://a.test/x") == "navegando a a.test"
 
 
 def test_launch_no_narra_ni_cuenta_porque_no_es_una_accion_del_agente():

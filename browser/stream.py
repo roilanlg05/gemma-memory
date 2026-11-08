@@ -40,6 +40,14 @@ _NAVIGATE = ("navigate", "open")
 # `other`, así que se saltan la narración y la cuenta en el mismo punto.
 IGNORED_ACTIONS: frozenset[str] = frozenset({"launch"})
 
+# Frase de reserva para una acción que no está en la tabla. El vocabulario del
+# eco NO es el del CLI (`get text` llega como `gettext`), así que la tabla es
+# incompleta por naturaleza y cualquier operación nueva cae aquí. Se narra en
+# español y no con el nombre crudo porque el panel es lo que el usuario mira, no
+# una traza de depuración, y el nombre crudo saldría en inglés. El saneado de
+# `action` se queda donde está por si acaso, pero deja de ser lo que se ve.
+GENERIC_PHRASE = "trabajando en la página"
+
 
 def _empty(kind: str) -> dict:
     return {"kind": kind, "seq": None, "jpeg_b64": None, "captured_at": None,
@@ -131,7 +139,8 @@ def host_of(url: str | None) -> str | None:
 
 
 def phrase(action: str, url: str | None) -> str:
-    """Frase de narración para una acción; nunca incluye argumentos."""
+    """Frase de narración para una acción; nunca incluye argumentos. Una acción
+    que no esté en la tabla cae en GENERIC_PHRASE, no en su nombre crudo."""
     if action in _NAVIGATE:
         host = host_of(url)
         return f"navegando a {host}" if host else "navegando"
@@ -163,7 +172,7 @@ def phrase(action: str, url: str | None) -> str:
         "html": "leyendo la página",
         "value": "leyendo la página",
     }
-    return fixed.get(action, action)
+    return fixed.get(action, GENERIC_PHRASE)
 
 
 def wire_messages(decoded: dict) -> list[dict]:
