@@ -78,6 +78,35 @@ services:
       retries: 3
     restart: unless-stopped
 
+  browser:
+    build:
+      context: ./browser
+    ports:
+      - "8083:8083"
+    environment:
+      - BROWSER_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
+      - TZ=${TZ:-America/Havana}
+      # Chrome de Debian; sin esto el CLI busca uno que no existe en la imagen.
+      - AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+      # AGENT_BROWSER_NO_XVFB queda SIN declarar a propósito: en Linux el CLI usa
+      # Xvfb (la imagen lo instala). No añadirla.
+      # El demonio se apaga por inactividad; media hora cubre una conversación larga.
+      - AGENT_BROWSER_IDLE_TIMEOUT_MS=1800000
+      - AGENT_BROWSER_SOCKET_DIR=/run/agent-browser
+      # Calidad y tamaño máximo del JPEG del streaming.
+      - AGENT_BROWSER_STREAM_QUALITY=20
+      - AGENT_BROWSER_STREAM_MAX_WIDTH=640
+      - AGENT_BROWSER_STREAM_MAX_HEIGHT=360
+      # Que no toque la red en cada llamada.
+      - AGENT_BROWSER_NO_VERSION_CHECK=1
+    # Sin depends_on: el navegador no necesita la memoria.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
 volumes:
   embedder-models:
   voice-models:

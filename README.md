@@ -17,6 +17,11 @@ Two containers, one network:
 │    Python 3.11 + FastAPI + sentence-transformers         │
 │    Model: BAAI/bge-m3 (1024-dim multilingual)            │
 │                                                          │
+│  browser    :8083 (host)                                 │
+│    Python 3.11 + FastAPI + agent-browser 0.41.2          │
+│    Chromium + Xvfb en la imagen; Bearer en todo menos    │
+│    /healthz (mismo MEMORY_BEARER_TOKEN)                  │
+│                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -101,6 +106,15 @@ Footprint native: memory-service ≈ 200 MB, embedder ≈ 1 GB. Compose adds ~2-
 ```bash
 cd memory-service && swift test           # 94 tests (handlers + core)
 cd embedder && .venv/bin/pytest -q        # smoke + ES↔EN cosine
+python3 -m pytest browser/test_app.py -v  # servicio de navegador (sin lanzar el CLI)
+```
+
+Comprobación manual de la imagen del navegador (necesita red para construirla):
+
+```bash
+docker compose build browser
+docker compose run --rm --entrypoint agent-browser browser --version   # 0.41.2
+docker compose run --rm --entrypoint chromium browser --version        # una versión
 ```
 
 ## Deploying to the i3 (or anywhere Linux)
