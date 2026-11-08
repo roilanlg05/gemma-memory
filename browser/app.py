@@ -1,12 +1,15 @@
 """Pasarela del navegador del agente. Es dueña del CLI `agent-browser` (y de su
 Chromium) en el i3; la app de macOS lo invoca por HTTP en vez de lanzarlo en local.
-Esta tarea entrega el esqueleto autenticado: el cuerpo de /v1/browser/invoke llega
-en la Tarea 2 y el WebSocket de streaming en la Tarea 4."""
+/v1/browser/invoke valida el argv y lo ejecuta vía cli.py; el WebSocket de
+streaming llega en la Tarea 4."""
 import os
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 
-# Ruta del CLI; la Tarea 2 lo usa para lanzar el proceso.
+import cli
+
+# Ruta del CLI (la misma que usa cli.py para lanzar el proceso).
 BROWSER_BIN = os.environ.get("AGENT_BROWSER_BIN", "agent-browser")
 
 
@@ -25,7 +28,17 @@ def healthz():
     return {"status": "ok"}
 
 
+class InvokeBody(BaseModel):
+    arguments: list[str]
+    timeout: float = Field(default=30, gt=0, le=300)
+    # Va al stdin del proceso, nunca a argv: `ps` lee el argv de cualquier proceso.
+    stdin: str | None = None
+
+
 @app.post("/v1/browser/invoke", dependencies=[Depends(require_bearer)])
-def browser_invoke():
-    # Temporal: la Tarea 2 implementa la invocación del CLI.
-    raise HTTPException(status_code=501, detail="not implemented")
+async def browser_invoke(body: InvokeBody):
+    try:
+        cli.validate(body.arguments)
+    except ValueError as motivo:
+        raise HTTPException(status_code=400, detail=str(motivo))
+    return await cli.run(body.arguments, timeout=body.timeout, stdin=body.stdin)
