@@ -1290,6 +1290,9 @@ def test_el_caudal_del_panel_cabe_en_un_enlace_movil():
     # medido (1080x608 q45: 54 715 B; media 51 594 B). Presupuesto: 400 kB/s.
     # Medición: personal_agent, commit 03ba854,
     # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
+    # OJO: 54_715 B es el máximo de 25 fotogramas medidos a 1080x608 q45 exactamente.
+    # Si cambia la resolución o la calidad del compose, este número no se adivina:
+    # se vuelve a medir (método en la nota citada arriba).
     assert relay.DEFAULT_VIEWER_MAX_FPS * 54_715 <= 400_000
     # El demonio no debe codificar más fotogramas de los que el relé deja pasar.
     assert relay.DAEMON_MAX_FPS <= relay.DEFAULT_VIEWER_MAX_FPS

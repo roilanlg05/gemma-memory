@@ -109,9 +109,10 @@ def session_mismatch(requested: str | None) -> str | None:
 # pasar de 10 a 7 no quita ningún fotograma de los que el usuario veía de verdad:
 # solo acota el pico de una página que se anime sola.
 # Se bajan los dos porque el salto demonio -> relé es localhost y es gratis, así
-# que bastaría estrangular al visor; pero con el demonio a 10 el i3 codificaría
-# en JPEG tres de cada diez fotogramas solo para que el relé los tire: CPU
-# quemada para nadie.
+# que bastaría estrangular al visor; pero con el demonio a 10, en el caso de pico
+# (una página que se anime sola y llegue al tope) el i3 codificaría en JPEG
+# fotogramas que el relé tiraría: CPU quemada para nadie. En el uso normal (5-7
+# fps) no ocurre; es una protección del peor caso, no un desperdicio diario.
 DAEMON_MAX_FPS = 7
 # Tope por omisión de un visor, y el que se usa si pide uno inválido (ver arriba).
 DEFAULT_VIEWER_MAX_FPS = 7

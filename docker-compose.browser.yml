@@ -54,7 +54,12 @@ services:
       # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
       # Fotograma medio 51 594 B, máximo 54 715 B. Con el tope de 7 fps de
       # browser/relay.py el pico es 383 kB/s, bajo el presupuesto de 400 kB/s.
-      # Si se cambian, hay que volver a medir y actualizar test_compose.py.
+      # Si se cambian, hay que volver a medir y actualizar test_compose.py Y
+      # browser/test_app.py. El 54 715 de test_el_caudal_del_panel_cabe_en_un_enlace_movil
+      # es una MEDICIÓN (máximo de 25 fotogramas a 1080x608 q45), no una constante
+      # de diseño: con otra resolución o calidad ese número deja de ser cierto y la
+      # prueba seguiría en verde con un dato falso. No se actualiza a ojo: se mide
+      # de nuevo con el método de la nota citada arriba.
       - AGENT_BROWSER_STREAM_QUALITY=45
       - AGENT_BROWSER_STREAM_MAX_WIDTH=1080
       - AGENT_BROWSER_STREAM_MAX_HEIGHT=608
