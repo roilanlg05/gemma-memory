@@ -365,6 +365,28 @@ def test_el_motivo_de_una_url_mala_nombra_el_esquema():
     assert r.status_code == 400 and "file" in r.json()["detail"]
 
 
+def test_el_motivo_de_un_argumento_rechazado_no_reproduce_su_valor():
+    # El `detail` de un 400 viaja hasta el log del chat de la app, así que una
+    # contraseña que empiece por `-` acabaría en la pantalla del usuario. El motivo
+    # debe nombrar el problema (el prefijo, el flag, la posición) y no el contenido.
+    # Mismo criterio que `_validate_url`, que nombra el esquema y no la URL.
+    secreto = "SECRETO-7f3a9c"
+    casos = [
+        # un posicional (el texto de un `fill`) que empieza por un prefijo prohibido
+        ["--session", "gemma", "fill", "#clave", f"--profile{secreto}"],
+        # un posicional con forma de flag que no está en la tabla
+        ["--session", "gemma", "fill", "#clave", f"-{secreto}"],
+        # el valor de un flag permitido, con forma de flag
+        ["--session", "gemma", "wait", "--text", f"-{secreto}"],
+    ]
+    for argumentos in casos:
+        r = client.post("/v1/browser/invoke", json={"arguments": argumentos}, headers=AUTH)
+        assert r.status_code == 400, argumentos
+        detalle = r.json()["detail"]
+        assert secreto not in detalle, detalle
+        assert detalle.strip(), "y sigue diciendo algo: un motivo vacío no se depura"
+
+
 def test_open_y_read_con_http_y_https_pasan_aunque_vengan_en_mayusculas():
     for url in ["https://a.test", "http://a.test/x?y=1", "HTTPS://A.TEST"]:
         assert _invoca("open", url) == 200, url
@@ -496,6 +518,17 @@ def test_el_token_se_tacha_en_mayusculas_y_en_cualquier_forma_de_args():
     assert "token=[redactado]" in linea
 
 
+def test_tachar_el_token_no_puede_romper_el_formateo_de_la_linea():
+    # El caso que hacía peligrosa la redacción pieza a pieza: el `token=` está en la
+    # PLANTILLA y el secreto en los `args`. Redactando la plantilla se comía el
+    # `%s`, el `getMessage()` del formateador reventaba con un TypeError y
+    # `Handler.handleError` escribía en stderr el `record.args` entero — el token,
+    # por haber intentado tacharlo.
+    linea = _linea_filtrada("GET /s?token=%s&maxFps=%d", ("SECRETO", 10))
+    assert "SECRETO" not in linea, linea
+    assert "token=[redactado]" in linea and "maxFps=10" in linea, linea
+
+
 def test_el_filtro_del_token_nunca_tira_al_que_registra():
     # `Logger.handle` NO envuelve los filtros: una excepción aquí saldría por el
     # `logger.info` del handshake del WebSocket y tiraría la conexión.
@@ -515,6 +548,21 @@ def test_los_tres_loggers_que_escribirian_el_token_llevan_el_filtro():
     for nombre in ("uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
         assert any(isinstance(f, appmod.RedactTokenFilter)
                    for f in logging.getLogger(nombre).filters), nombre
+
+
+def test_un_logger_que_nadie_registro_tambien_sale_tachado():
+    # Un filtro puesto en un logger NO se aplica a los registros que le llegan por
+    # propagación de un hijo (`callHandlers` recorre handlers, no filtros), así que
+    # «ponerlo también en el root» no cubriría un logger nuevo. Lo que lo cubre es
+    # la fábrica de registros, que corre para CADA LogRecord del proceso.
+    import logging
+    nombre = "un.logger.que.nadie.registro"
+    registro = logging.getLogger(nombre).makeRecord(
+        nombre, logging.INFO, __file__, 1,
+        "upgrade /v1/browser/stream?token=%s", ("secreto-de-la-casa",), None)
+    linea = registro.getMessage()
+    assert "secreto-de-la-casa" not in linea, linea
+    assert "token=[redactado]" in linea, linea
 
 
 def test_el_token_no_puede_acabar_en_un_log():
@@ -561,6 +609,44 @@ def test_el_stream_manda_state_al_conectar():
 def test_el_stream_acepta_el_token_en_la_cabecera():
     with client.websocket_connect("/v1/browser/stream", headers=AUTH) as ws:
         assert ws.receive_json()["type"] == "state"
+
+
+# --- la guardia de sesión: el visor declara y el relé compara ---
+# El relé sigue UNA sesión del CLI (BROWSER_STREAM_SESSION) y la app usa su propio
+# AGENT_BROWSER_SESSION, en otro repositorio. Coincidían por dos valores por
+# omisión iguales: si alguien define una y no la otra, el navegador sigue
+# funcionando y el panel se queda en blanco, en silencio. Con la guardia, el visor
+# declara su sesión y el relé la compara.
+def test_el_stream_sin_declarar_sesion_se_comporta_como_siempre():
+    # Opcional a propósito: un visor viejo, que no manda el parámetro, no se rompe.
+    with client.websocket_connect("/v1/browser/stream?token=test-token") as ws:
+        assert ws.receive_json()["type"] == "state"
+
+
+def test_el_stream_que_declara_la_sesion_del_rele_se_comporta_como_siempre():
+    with client.websocket_connect(
+            f"/v1/browser/stream?token=test-token&session={relay.SESSION}") as ws:
+        assert ws.receive_json()["type"] == "state"
+
+
+def test_el_stream_que_declara_otra_sesion_cierra_nombrando_las_dos():
+    # Un motivo que solo dijera «sesión equivocada» no sirve para arreglarlo: hacen
+    # falta los dos valores, porque el fallo es justamente que no se sabe cuál es
+    # cuál. La app pinta el motivo de un `closed`, así que esto llega a la pantalla.
+    with client.websocket_connect(
+            "/v1/browser/stream?token=test-token&session=gemma-live-test") as ws:
+        mensaje = ws.receive_json()
+    assert mensaje["type"] == "closed"
+    assert relay.SESSION in mensaje["reason"], mensaje["reason"]
+    assert "gemma-live-test" in mensaje["reason"], mensaje["reason"]
+    _comprobar_esquema([mensaje])
+
+
+def test_la_comparacion_de_sesion_se_prueba_sola():
+    assert relay.session_mismatch("") is None, "sin declarar nada, como siempre"
+    assert relay.session_mismatch(relay.SESSION) is None
+    motivo = relay.session_mismatch("otra")
+    assert motivo is not None and relay.SESSION in motivo and "otra" in motivo
 
 
 def test_sin_puerto_del_demonio_el_visor_recibe_closed_y_el_servicio_sigue_vivo():
@@ -970,6 +1056,70 @@ def test_el_socket_caido_congela_el_panel_con_resumen_y_closed():
     assert estado["live"] is False and estado["collapsed"] is True
     assert visor.tipos[-1] == "closed"
     _comprobar_esquema(visor.enviados)  # aquí sí aparece `host`
+
+
+def _ultimo_resumen(visor):
+    resumenes = [m for m in visor.enviados if m.get("type") == "summary"]
+    return resumenes[-1]["text"] if resumenes else None
+
+
+def test_el_resumen_llega_durante_el_turno_y_no_solo_cuando_muere_el_demonio():
+    # El resumen es LO ÚNICO que queda del turno en el historial del chat (spec
+    # §6.2(g) y §10(2)): cuando la app congela el panel pinta el último `summary`
+    # que recibió. Si solo se emitiera al morir el socket del demonio —que en un
+    # turno normal no pasa, porque el que se va es el visor— la etiqueta del panel
+    # plegado se quedaría en el literal de reserva («navegador»).
+    visor = VisorFalso()
+    guion = [_paso(json.dumps({"type": "command", "action": "navigate", "id": "r1",
+                               "params": {"url": "https://www.amazon.es/dp/x"}})),
+             _paso(json.dumps({"type": "command", "action": "click", "id": "r2",
+                               "params": {"selector": "#comprar"}}))]
+    asyncio.run(_cablear(guion, [(visor, 0)],
+                         lambda: _ultimo_resumen(visor) == "navegó en www.amazon.es · 2 acciones"))
+    assert _ultimo_resumen(visor) == "navegó en www.amazon.es · 2 acciones"
+    _comprobar_esquema(visor.enviados)
+
+
+def test_un_visor_nuevo_resume_lo_que_ESE_visor_ha_visto_y_no_la_historia_del_demonio():
+    # Los dos ciclos de vida no son el mismo: el `PanelState` del relé vive por era
+    # del demonio (que sobrevive LINGER_SECONDS sin visores) y el panel de la app
+    # vive por turno. Sin reiniciar, un turno 2 que abra su panel dentro del plazo
+    # de gracia heredaría la cuenta del turno 1 y seguiría sumando: un turno de dos
+    # acciones diría siete. El resumen que recibe un visor describe lo que ese
+    # visor ha visto.
+    guion = [_paso(json.dumps({"type": "command", "action": "navigate", "id": "r1",
+                               "params": {"url": "https://www.amazon.es/dp/x"}})),
+             _paso(json.dumps({"type": "command", "action": "click", "id": "r2",
+                               "params": {"selector": "#comprar"}}))]
+
+    async def cuerpo():
+        acuses, lecturas = [], []
+        async with _demonio_falso(guion, acuses, lecturas) as leer_puerto:
+            rele = relay.Relay(leer_puerto, stall_grace=5.0)
+            primero = VisorFalso()
+            tarea = asyncio.create_task(rele.add_viewer(primero, max_fps=0))
+            esperado = "navegó en www.amazon.es · 2 acciones"
+            assert await _esperar(lambda: _ultimo_resumen(primero) == esperado), \
+                _ultimo_resumen(primero)
+            primero.desconectar()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(tarea, 2.0)
+            # El demonio sigue conectado (plazo de gracia): el visor nuevo entra
+            # sobre un `PanelState` que ya existe, que es el caso que mentía.
+            segundo = VisorFalso()
+            tarea = asyncio.create_task(rele.add_viewer(segundo, max_fps=0))
+            assert await _esperar(lambda: _ultimo_resumen(segundo) is not None, 3.0)
+            visto = (_ultimo_resumen(segundo), list(segundo.tipos))
+            segundo.desconectar()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(tarea, 2.0)
+            await rele.shutdown()
+            assert lecturas == [lecturas[0]] * len(lecturas), "un solo demonio"
+            return visto
+
+    resumen, tipos = asyncio.run(cuerpo())
+    assert resumen == "navegó en la web · 0 acciones", resumen
+    assert "host" not in tipos, "ni el host del turno anterior"
 
 
 def test_el_cable_solo_lleva_los_seis_mensajes_de_la_spec():

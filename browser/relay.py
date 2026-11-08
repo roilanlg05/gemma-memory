@@ -37,6 +37,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from typing import Awaitable, Callable
@@ -51,7 +52,47 @@ import stream
 _log = logging.getLogger(__name__)
 
 # Sesión del CLI que sigue el panel. Un panel, una sesión (spec, no objetivos).
+#
+# ⚠️ EL VALOR TIENE QUE COINCIDIR con el `AGENT_BROWSER_SESSION` de la app (cuyo
+# valor por omisión es `AgentBrowserService.defaultSessionName`, en el repositorio
+# `personal_agent`). Si divergen, el navegador sigue funcionando y el panel se queda
+# EN BLANCO, en silencio, sin un error en ninguna parte: es la avería más barata de
+# producir y la más cara de diagnosticar de todo el panel. Por eso (a) está
+# declarada con su valor escrito en el `docker-compose.yml`, con el comentario
+# simétrico —una variable que solo existe dentro de un `os.environ.get` es una
+# trampa para el yo del futuro—, y (b) el visor declara su sesión en la URL del
+# socket y `session_mismatch` las compara.
 SESSION = os.environ.get("BROWSER_STREAM_SESSION", "gemma")
+
+# Para componer el motivo del `closed`: lo que el visor declara es texto de un
+# cliente, y al cable solo salen textos compuestos en el servidor.
+_SAFE_SESSION = re.compile(r"[^A-Za-z0-9_-]")
+_MAX_SESSION_IN_REASON = 64
+
+
+def session_mismatch(requested: str | None) -> str | None:
+    """Motivo del `closed` si el visor sigue otra sesión que el relé, o None.
+
+    El parámetro es OPCIONAL a propósito: un visor que no declara nada se comporta
+    como siempre, así que un cliente viejo no se rompe. Lo que mata esta guardia es
+    una clase de avería entera: hasta ahora los dos lados coincidían por dos
+    valores por omisión iguales en dos repositorios, no por un contrato.
+
+    El motivo nombra LOS DOS valores a propósito: uno que solo dijera «sesión
+    equivocada» no sirve para arreglarlo, porque el fallo es justamente no saber
+    cuál de los dos lados está mal. La app pinta el motivo de un `closed`, así que
+    esto llega a la pantalla del usuario.
+
+    Y de paso deja de ser necesario que la prueba en vivo del lado de la app cierre
+    la sesión de producción: puede pedir la suya (`gemma-live-test`) y recibir un
+    cierre explicado en vez de un panel mudo."""
+    if not isinstance(requested, str) or not requested or requested == SESSION:
+        return None
+    pedida = _SAFE_SESSION.sub("", requested)[:_MAX_SESSION_IN_REASON] or "(ilegible)"
+    return (f"el relé sigue la sesión «{SESSION}» y el visor pide «{pedida}»: no "
+            "coinciden, así que este panel no vería nada. Ajusta "
+            "BROWSER_STREAM_SESSION en el i3 o AGENT_BROWSER_SESSION en la app.")
+
 
 # Tope de fps que se le pide al demonio, declarado en la URL y no por un mensaje
 # `config`: es la única forma de que cubra el frame de apertura (spec §5.5, §6.2(c)).
@@ -150,6 +191,32 @@ class PanelState:
             host = stream.host_of(decoded.get("url"))
             if host:
                 self.host = host
+
+    def begin_viewer_session(self) -> None:
+        """Arranca la cuenta del resumen para una observación nueva.
+
+        Los dos ciclos de vida no son el mismo, y aquí es donde se casan: el
+        `PanelState` vive por ERA DEL DEMONIO —que sobrevive `LINGER_SECONDS` sin
+        ningún visor, para que un visor que se va y vuelve a mitad de turno no
+        pague un arranque— y el panel de la app vive por TURNO. Sin este reinicio,
+        un turno que abre su panel dentro del plazo de gracia hereda la cuenta del
+        turno anterior y sigue sumando: el usuario vería «7 acciones» en un turno
+        en el que hizo dos, y el resumen es lo único que queda del turno en el
+        historial del chat.
+
+        Se llama cuando entra un visor y no había ninguno, que es el único momento
+        en que el relé puede alinear los dos ciclos sin añadir un contrato nuevo al
+        cable (el visor no declara turnos). El coste conocido: dos visores a la vez
+        (el Mac y el iPhone) comparten la cuenta, y el segundo hereda lo que el
+        primero llevaba visto. Es la misma consecuencia, ya aceptada, de que los
+        dos clientes compartan una sola sesión del navegador.
+
+        NO toca el predicado de «en vivo» —ni el socket, ni el acuse, ni el
+        screencast, ni `collapsed`—: el estado `live` lo sigue decidiendo el
+        servidor por la CONEXIÓN (spec §5.10), y el vigilante sigue mirando el
+        acuse y no la página, así que una página quieta sigue diciendo «en vivo»."""
+        self.action_count = 0
+        self.host = None
 
     def freeze(self) -> None:
         """El panel se congela: suelta su imagen y deja la línea de resumen."""
@@ -369,9 +436,15 @@ class Relay:
         `ack`: el acuse del visor es el único momento en que el relé acusa al
         demonio (spec §6.4)."""
         viewer = Viewer(ws, max_fps)
+        abre_la_observacion = not self._viewers
         self._viewers.add(viewer)
         viewer.start()
         self._cancel_linger()
+        if abre_la_observacion and self._panel is not None:
+            # Entra un visor sobre un panel que ya existía (el plazo de gracia
+            # mantuvo vivo el socket del demonio): su resumen tiene que describir
+            # lo que ESTE visor va a ver, no la historia del demonio.
+            self._panel.begin_viewer_session()
         for message in self._snapshot():
             viewer.offer(message)
         self._ensure_daemon()
@@ -586,12 +659,24 @@ class Relay:
             decoded["captured_at"] = time.time()
         panel = self._panel
         was_live = panel.live if panel is not None else False
+        resumen_antes = (panel.action_count, panel.host) if panel is not None else None
         if panel is not None:
             panel.apply(decoded)
         messages = stream.wire_messages(decoded)
         if panel is not None and panel.collapsed:
             messages = []  # un panel congelado no vuelve a pintar (spec §6.2(g))
         served = self._fan_out(decoded.get("kind") == "frame", messages)
+        if panel is not None and (panel.action_count, panel.host) != resumen_antes:
+            # El resumen se reenvía cada vez que cambia, y no solo al morir el
+            # socket del demonio: en un turno normal el que se va es el VISOR —la
+            # app cierra el socket al acabar el turno— y entonces ya no hay a quién
+            # mandárselo. Así el visor tiene SIEMPRE el resumen vigente en el
+            # instante en que la app congela el panel, que es cuando lo pinta; sin
+            # esto, la etiqueta del panel plegado se quedaba en su literal de
+            # reserva («navegador») y el turno no dejaba rastro (spec §6.2(g),
+            # §10(2)). Va después del reparto para que la narración de la acción
+            # llegue antes que el resumen que la cuenta.
+            self._broadcast(panel.summary_message())
         seq = stream.ack_seq(decoded)
         if seq is not None:
             self._pending_seq = seq

@@ -112,9 +112,19 @@ def validate(arguments: list[str], stdin: str | None = None) -> None:
     if not arguments:
         raise ValueError("arguments vacío")
 
-    for argument in arguments:
-        if argument.startswith(REJECTED_FLAG_PREFIXES):
-            raise ValueError(f"flag no permitido por red: {argument}")
+    # Los motivos de abajo viajan en el `detail` de un 400 hasta el log del chat de
+    # la app, así que NINGUNO reproduce el valor rechazado: aquí se rechaza también
+    # un POSICIONAL —que es por donde viaja el texto de un `fill`—, y una
+    # contraseña que empezara por `-` acabaría escrita en la pantalla del usuario.
+    # Nombran el problema (el prefijo que casó, la posición, el flag de la tabla) y
+    # lo que sí se acepta, que además depura mejor que repetir el valor malo. Mismo
+    # criterio que `_validate_url`, que nombra el esquema y no la URL.
+    for posicion, argument in enumerate(arguments):
+        prefijo = next((p for p in REJECTED_FLAG_PREFIXES if argument.startswith(p)), None)
+        if prefijo is not None:
+            raise ValueError(
+                f"argumento #{posicion} rechazado: empieza por «{prefijo}», "
+                "que no se acepta por red")
 
     subcommand: str | None = None
     positionals: list[str] = []
@@ -135,13 +145,21 @@ def validate(arguments: list[str], stdin: str | None = None) -> None:
         if arity is None and subcommand is not None:
             arity = FLAGS_BY_SUBCOMMAND[subcommand].get(argument)
         if arity is None:
-            raise ValueError(f"flag no permitido: {argument}")
+            # Sin citar el argumento: cualquier cosa que empiece por `-` llega
+            # aquí, también el valor de un `fill`. La lista de lo permitido dice
+            # más que el nombre rechazado.
+            permitidos = sorted(GLOBAL_FLAGS) + sorted(FLAGS_BY_SUBCOMMAND.get(subcommand, {}))
+            raise ValueError(
+                f"flag no permitido en el argumento #{i - 1}"
+                + (f" de «{subcommand}»" if subcommand else "")
+                + f"; solo: {', '.join(permitidos)}")
         for _ in range(arity):
             if i >= len(arguments):
                 raise ValueError(f"falta el valor de {argument}")
             if arguments[i].startswith("-"):
-                # Un valor con forma de flag haría que el CLI lo interprete de otra manera.
-                raise ValueError(f"el valor de {argument} parece un flag: {arguments[i]}")
+                # Un valor con forma de flag haría que el CLI lo interprete de otra
+                # manera. Se nombra el flag —que sale de la tabla— y no su valor.
+                raise ValueError(f"el valor de {argument} parece un flag (empieza por «-»)")
             valor = arguments[i]
             if argument == "--session" and not SESSION_NAME_PATTERN.fullmatch(valor):
                 raise ValueError("nombre de --session no permitido: solo letras, dígitos, - y _ (máx. 64)")
