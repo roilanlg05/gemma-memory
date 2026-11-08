@@ -1285,17 +1285,30 @@ def test_read_port_devuelve_none_cuando_el_cli_no_da_puerto(monkeypatch):
         assert asyncio.run(relay.read_port()) is None, salida
 
 
-def test_el_caudal_del_panel_cabe_en_un_enlace_movil():
-    # Lo que decide es el PICO, no la media: tope de fps x fotograma más grande
-    # medido (1080x608 q45: 54 715 B; media 51 594 B). Presupuesto: 400 kB/s.
-    # Medición: personal_agent,
-    # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
-    # OJO: 54_715 B es el máximo de 25 fotogramas medidos a 1080x608 q45 exactamente.
-    # Si cambia la resolución o la calidad del compose, este número no se adivina:
-    # se vuelve a medir (método en la nota citada arriba).
-    assert relay.DEFAULT_VIEWER_MAX_FPS * 54_715 <= 400_000
+def test_el_tope_de_fps_no_pasa_del_techo_medido_del_i3():
+    # Esta prueba SUSTITUYE a `test_el_caudal_del_panel_cabe_en_un_enlace_movil`,
+    # que afirmaba `DEFAULT_VIEWER_MAX_FPS * 54_715 <= 400_000` y por tanto
+    # clavaba el tope en 7. Ese presupuesto móvil de 400 kB/s no lo pidió el
+    # usuario; lo pidió el autor del comentario. Lo que el usuario pidió es que el
+    # panel sea fluido con vídeo, y 7 fps no lo es: lo llamó «súper lento».
+    #
+    # Lo que SÍ hay que seguir defendiendo es que nadie pida fotogramas que el i3
+    # no puede producir: medido el 2026-11-08 contra un vídeo reproduciéndose,
+    # pedir 30 y pedir 60 entregan los mismos 25,2 fps. Por encima de 25 solo se
+    # quema CPU. Método y tabla en personal_agent,
+    # docs/superpowers/notes/2026-11-08-medicion-fluidez-panel.md
+    TECHO_MEDIDO = 25
+    assert relay.DEFAULT_VIEWER_MAX_FPS <= TECHO_MEDIDO
     # El demonio no debe codificar más fotogramas de los que el relé deja pasar.
     assert relay.DAEMON_MAX_FPS <= relay.DEFAULT_VIEWER_MAX_FPS
+
+
+def test_un_movil_puede_pedir_menos_caudal_que_el_tope():
+    # El tope de 25 fps son ~11 Mbit/s de pico. La vía para datos contados no es
+    # bajar el tope de todos: es que ese cliente pida menos, y el servidor lo
+    # respete hacia abajo. Sin esto, subir el tope dejaría al móvil sin salida.
+    assert relay.viewer_max_fps("7") == 7
+    assert relay.viewer_max_fps("8") == 8
 
 
 # --- el tope de fps del visor lo decide el servidor ---
@@ -1333,8 +1346,11 @@ def test_un_maxfps_fuera_de_rango_cae_en_el_tope_por_omision(monkeypatch, pedido
 
 
 def test_un_maxfps_mayor_que_el_tope_se_recorta_al_tope(monkeypatch):
-    # 10 era el valor que mandaba la app y dejaba el tope del servidor inerte.
-    assert _max_fps_que_recibe_el_rele(monkeypatch, "&maxFps=10") == relay.DEFAULT_VIEWER_MAX_FPS
+    # El valor de prueba se calcula del tope, no se escribe a mano: antes era 10,
+    # que con el tope en 7 estaba por encima y con el tope en 25 está por debajo.
+    # Escrito a mano, esta prueba habría seguido verde sin probar nada.
+    por_encima = relay.DEFAULT_VIEWER_MAX_FPS + 1
+    assert _max_fps_que_recibe_el_rele(monkeypatch, f"&maxFps={por_encima}") == relay.DEFAULT_VIEWER_MAX_FPS
 
 
 def test_un_maxfps_menor_que_el_tope_se_respeta(monkeypatch):
@@ -1345,6 +1361,6 @@ def test_un_maxfps_menor_que_el_tope_se_respeta(monkeypatch):
 def test_ningun_maxfps_del_visor_supera_el_presupuesto():
     # El presupuesto es DEFAULT_VIEWER_MAX_FPS x 54 715 B; ninguna entrada puede
     # saltárselo. Es la prueba que impide que un cambio futuro reabra el agujero.
-    for crudo in (None, "", "0", "1", "7", "8", "120", "999", "-1", "abc", 10, 0, 1e9):
+    for crudo in (None, "", "0", "1", "7", "8", "26", "120", "999", "-1", "abc", 10, 0, 1e9):
         fps = relay.viewer_max_fps(crudo)
         assert 1 <= fps <= relay.DEFAULT_VIEWER_MAX_FPS, crudo

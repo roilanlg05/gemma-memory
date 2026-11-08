@@ -97,25 +97,50 @@ def session_mismatch(requested: str | None) -> str | None:
 # Tope de fps que se le pide al demonio, declarado en la URL y no por un mensaje
 # `config`: es la única forma de que cubra el frame de apertura (spec §5.5, §6.2(c)).
 #
-# 7 fps, y bajan LOS DOS topes. Procedencia: medición de nitidez, repositorio
+# 25 fps, LOS DOS topes. Procedencia: medición de fluidez, repositorio
 # personal_agent,
-# docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
-# Con 1080x608 q45 el fotograma más grande medido pesa 54 715 B; lo que decide es
-# el pico (tope de fps x fotograma máximo), no el caudal medio. A 10 fps serían
-# 547 kB/s y no caben en el presupuesto móvil de 400 kB/s; a 7 son 383 kB/s
-# (típico 361). Se baja la tasa y no la nitidez: una página de compras se mira, no
-# se anima. Los fps logrados medidos (5-7) no llegan al tope porque el demonio
-# emite por cambio y mantiene un solo fotograma en vuelo (pacing=ack), así que
-# pasar de 10 a 7 no quita ningún fotograma de los que el usuario veía de verdad:
-# solo acota el pico de una página que se anime sola.
-# Se bajan los dos porque el salto demonio -> relé es localhost y es gratis, así
-# que bastaría estrangular al visor; pero con el demonio a 10, en el caso de pico
-# (una página que se anime sola y llegue al tope) el i3 codificaría en JPEG
-# fotogramas que el relé tiraría: CPU quemada para nadie. En el uso normal (5-7
-# fps) no ocurre; es una protección del peor caso, no un desperdicio diario.
-DAEMON_MAX_FPS = 7
+# docs/superpowers/notes/2026-11-08-medicion-fluidez-panel.md
+#
+# ESTOS DOS NÚMEROS ERAN 7, Y EL 7 ESTABA MAL. No por un error de cálculo: por una
+# premisa falsa. El comentario que ocupaba este sitio decía «una página de compras
+# se mira, no se anima» y «pasar de 10 a 7 no quita ningún fotograma de los que el
+# usuario veía de verdad». Las dos frases están ahora medidas como falsas. El
+# usuario mira vídeo de YouTube por este panel, y un vídeo SÍ se anima: pedir 7
+# entregaba exactamente 7,07 fps, que es lo que él describió como «súper lento».
+#
+# Medición del 2026-11-08, dentro del contenedor, contra un vídeo de YouTube de
+# verdad reproduciéndose, con `pacing=ack` igual que el relé:
+#
+#   tope pedido | fps logrados | KB/fotograma | Mbit/s
+#          7    |     7,07     |     47,0     |  2,72
+#         15    |    14,87     |     49,8     |  6,07
+#         30    |    25,18     |     48,2     |  9,95
+#         60    |    25,27     |     47,9     |  9,92
+#
+# 25 fps es el TECHO del i3 (i3-13100, 4 núcleos): pedir 30 y pedir 60 entregan
+# los mismos 25,2, así que pedir más que 25 solo quemaría CPU comparando
+# fotogramas que no existen. CPU medida a 25 fps: 60% de un núcleo. Y la cadena de
+# acuses no estorba: RTT Mac->i3 por Tailscale = 6,3 ms de media, y con un solo
+# fotograma en vuelo el techo que impone es 1/RTT ~= 158 fps.
+#
+# EL COSTE, DICHO CLARO: el pico pasa de 383 kB/s a 1,37 MB/s (25 x 54 715 B), que
+# son ~11 Mbit/s. Eso REVIENTA por 3,4x el presupuesto móvil de 400 kB/s que
+# gobernaba el 7. Ese presupuesto lo puse yo y el usuario nunca lo pidió; lo que
+# él pidió, textual, es que el panel sea «fluido, como si estuviera reproduciendo
+# un video de YouTube». Se le da lo que pidió y se le dice el coste. Lo que lo hace
+# soportable es que el demonio emite POR CAMBIO: una página quieta no manda
+# fotogramas y no cuesta nada, así que los 11 Mbit/s solo corren mientras hay algo
+# moviéndose en la pantalla. No es un caudal permanente, es un pico.
+#
+# EL VISOR PUEDE PEDIR MENOS, y es la vía para un móvil con datos contados: el
+# parámetro `maxFps` de la URL del socket se respeta hacia abajo (ver
+# `viewer_max_fps`). Un cliente en red móvil debería pedir 7 u 8 explícitamente.
+#
+# Se suben los dos porque el visor no puede recibir más de lo que el relé le pide
+# al demonio: con el demonio en 7, subir solo el tope del visor no cambiaría nada.
+DAEMON_MAX_FPS = 25
 # Tope por omisión de un visor, y el que se usa si pide uno inválido (ver arriba).
-DEFAULT_VIEWER_MAX_FPS = 7
+DEFAULT_VIEWER_MAX_FPS = 25
 
 # Plazo del `stream status --json`, POR DEBAJO de PORT_TIMEOUT a propósito: así el
 # que salta es este, que es el camino limpio —`cli.run` mata el CLI y devuelve un
