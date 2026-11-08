@@ -1288,7 +1288,7 @@ def test_read_port_devuelve_none_cuando_el_cli_no_da_puerto(monkeypatch):
 def test_el_caudal_del_panel_cabe_en_un_enlace_movil():
     # Lo que decide es el PICO, no la media: tope de fps x fotograma más grande
     # medido (1080x608 q45: 54 715 B; media 51 594 B). Presupuesto: 400 kB/s.
-    # Medición: personal_agent, commit 03ba854,
+    # Medición: personal_agent,
     # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
     # OJO: 54_715 B es el máximo de 25 fotogramas medidos a 1080x608 q45 exactamente.
     # Si cambia la resolución o la calidad del compose, este número no se adivina:
@@ -1296,3 +1296,55 @@ def test_el_caudal_del_panel_cabe_en_un_enlace_movil():
     assert relay.DEFAULT_VIEWER_MAX_FPS * 54_715 <= 400_000
     # El demonio no debe codificar más fotogramas de los que el relé deja pasar.
     assert relay.DAEMON_MAX_FPS <= relay.DEFAULT_VIEWER_MAX_FPS
+
+
+# --- el tope de fps del visor lo decide el servidor ---
+# El cliente de la app dejó de mandar `maxFps`: el número es del servidor, que es su
+# dueño. De este parámetro ausente depende todo el presupuesto de caudal (ver
+# test_el_caudal_del_panel_cabe_en_un_enlace_movil), así que se fija por la puerta
+# real (el WebSocket), no solo por la función auxiliar.
+def _max_fps_que_recibe_el_rele(monkeypatch, query: str):
+    """Conecta un visor con `query` y devuelve el `max_fps` que llegó a add_viewer."""
+    recibido = {}
+
+    class ReleFalso:
+        async def add_viewer(self, ws, max_fps):
+            recibido["max_fps"] = max_fps
+
+    monkeypatch.setattr(appmod, "_relay", lambda: ReleFalso())
+    try:
+        with client.websocket_connect(f"/v1/browser/stream?token=test-token{query}"):
+            pass
+    except WebSocketDisconnect:
+        pass
+    return recibido.get("max_fps")
+
+
+def test_un_visor_sin_maxfps_recibe_el_tope_del_servidor(monkeypatch):
+    assert _max_fps_que_recibe_el_rele(monkeypatch, "") == relay.DEFAULT_VIEWER_MAX_FPS
+
+
+@pytest.mark.parametrize("pedido", ["0", "-3", "999", "121", "abc", "", "7.5", "1e9"])
+def test_un_maxfps_fuera_de_rango_cae_en_el_tope_por_omision(monkeypatch, pedido):
+    # Sin esto, cualquier cliente podría pedir 120 fps (o «sin tope» con 0) y
+    # reventar el presupuesto de caudal que la nitidez ya gastó.
+    recibido = _max_fps_que_recibe_el_rele(monkeypatch, f"&maxFps={pedido}")
+    assert recibido == relay.DEFAULT_VIEWER_MAX_FPS, pedido
+
+
+def test_un_maxfps_mayor_que_el_tope_se_recorta_al_tope(monkeypatch):
+    # 10 era el valor que mandaba la app y dejaba el tope del servidor inerte.
+    assert _max_fps_que_recibe_el_rele(monkeypatch, "&maxFps=10") == relay.DEFAULT_VIEWER_MAX_FPS
+
+
+def test_un_maxfps_menor_que_el_tope_se_respeta(monkeypatch):
+    # Un visor puede pedir MENOS que el servidor (móvil con poca batería).
+    assert _max_fps_que_recibe_el_rele(monkeypatch, "&maxFps=3") == 3
+
+
+def test_ningun_maxfps_del_visor_supera_el_presupuesto():
+    # El presupuesto es DEFAULT_VIEWER_MAX_FPS x 54 715 B; ninguna entrada puede
+    # saltárselo. Es la prueba que impide que un cambio futuro reabra el agujero.
+    for crudo in (None, "", "0", "1", "7", "8", "120", "999", "-1", "abc", 10, 0, 1e9):
+        fps = relay.viewer_max_fps(crudo)
+        assert 1 <= fps <= relay.DEFAULT_VIEWER_MAX_FPS, crudo

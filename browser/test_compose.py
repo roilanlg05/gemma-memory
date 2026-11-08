@@ -19,6 +19,11 @@ import pytest
 
 _RAIZ = pathlib.Path(__file__).parent.parent
 _COMPOSE = _RAIZ / "docker-compose.browser.yml"
+# El compose de la raíz TAMBIÉN define un servicio `browser` (el README manda
+# levantar desde ahí). Los dos tienen que decir lo mismo en nitidez.
+_COMPOSE_RAIZ = _RAIZ / "docker-compose.yml"
+_NITIDEZ = ("AGENT_BROWSER_STREAM_MAX_WIDTH", "AGENT_BROWSER_STREAM_MAX_HEIGHT",
+            "AGENT_BROWSER_STREAM_QUALITY")
 
 
 def _escalar(texto):
@@ -50,6 +55,11 @@ def _bloque(lineas, i, sangria):
     mapa = {}
     while i < len(lineas) and lineas[i][0] == sangria:
         clave, _, resto = lineas[i][1].partition(":")
+        if clave in mapa:
+            # Sin esto el segundo bloque sobrescribiría al primero en silencio: un
+            # `environment:` repetido dejaría el token en el primero y las pruebas
+            # verdes, porque solo verían el segundo.
+            raise ValueError(f"clave duplicada {clave!r} en el mismo nivel")
         i += 1
         if resto.strip():
             mapa[clave] = _escalar(resto)
@@ -70,13 +80,13 @@ def _parsear(texto: str) -> dict:
     return valor
 
 
-def _config() -> dict:
-    return _parsear(_COMPOSE.read_text())
+def _config(fichero=_COMPOSE) -> dict:
+    return _parsear(fichero.read_text())
 
 
-def _env_del_servicio(nombre: str) -> dict:
+def _env_del_servicio(nombre: str, fichero=_COMPOSE) -> dict:
     env = {}
-    for item in _config()["services"][nombre].get("environment", []):
+    for item in _config(fichero)["services"][nombre].get("environment", []):
         clave, _, valor = item.partition("=")
         env[clave] = valor
     return env
@@ -134,7 +144,7 @@ def test_una_sangria_incoherente_hace_fallar_el_parseo():
 def test_la_nitidez_es_la_medida_no_la_heredada():
     # Candado de regresión. Estos números salen de la medición de 25 fotogramas por
     # combinación sobre una página de resultados real; está en el repositorio
-    # personal_agent, commit 03ba854:
+    # personal_agent, en la nota (se cita la ruta y no un SHA, que un squash borra):
     #   docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
     # Si alguien los cambia sin medir, esta prueba se pone roja y le obliga a leerla.
     # (Los 640x360 q20 heredados daban un panel borroso.)
@@ -144,3 +154,46 @@ def test_la_nitidez_es_la_medida_no_la_heredada():
     assert env["AGENT_BROWSER_STREAM_QUALITY"] == "45"
     # Valores fuera de rango no pueden llegar al demonio.
     assert 1 <= int(env["AGENT_BROWSER_STREAM_QUALITY"]) <= 100
+    # Cota de CORDURA, no una verdad del universo: ancho 320..1920, alto 180..1080.
+    # Atrapa un 4000x4000 o un 10x10 por un cero de más o de menos. Un valor fuera
+    # de la cota obliga a MEDIR de nuevo (y a justificarlo en la nota), no a
+    # ensanchar la cota.
+    assert 320 <= int(env["AGENT_BROWSER_STREAM_MAX_WIDTH"]) <= 1920
+    assert 180 <= int(env["AGENT_BROWSER_STREAM_MAX_HEIGHT"]) <= 1080
+
+
+def test_los_dos_composes_dicen_lo_mismo_en_nitidez():
+    # El servicio `browser` está definido en docker-compose.browser.yml Y en el
+    # docker-compose.yml de la raíz. Si solo se actualiza uno, quien levante desde
+    # el otro (el README manda la raíz) obtiene el panel borroso que esta rama
+    # arregló. Esta prueba es la que impide que vuelvan a divergir.
+    a = _env_del_servicio("browser", _COMPOSE)
+    b = _env_del_servicio("browser", _COMPOSE_RAIZ)
+    for clave in _NITIDEZ:
+        assert clave in a and clave in b, clave
+        assert a[clave] == b[clave], f"{clave}: {a[clave]!r} vs {b[clave]!r}"
+
+
+def test_el_compose_de_la_raiz_conserva_su_token_propio_y_sin_literal():
+    # Diferencia deliberada respecto a docker-compose.browser.yml (ver el comentario
+    # del servicio en la raíz): el token viene del `.env` de la raíz como secreto
+    # PROPIO del navegador, nunca escrito en el fichero ni el de la memoria. La
+    # prueba de coincidencia de nitidez NO debe llevar a «uniformar» esto.
+    env = _env_del_servicio("browser", _COMPOSE_RAIZ)
+    assert env["BROWSER_BEARER_TOKEN"] == "${BROWSER_BEARER_TOKEN}"
+
+
+def test_una_clave_duplicada_en_el_mismo_nivel_hace_fallar_el_parseo():
+    # Escenario real: el token en un primer `environment:` y las claves de stream
+    # en un segundo. Sin el aviso, el segundo sobrescribe al primero y
+    # «el token no está en el env» pasa en verde con el token escrito en el fichero.
+    roto = (
+        "services:\n"
+        "  browser:\n"
+        "    environment:\n"
+        "      - BROWSER_BEARER_TOKEN=abc\n"
+        "    environment:\n"
+        "      - AGENT_BROWSER_STREAM_QUALITY=45\n"
+    )
+    with pytest.raises(ValueError, match="duplicada"):
+        _parsear(roto)

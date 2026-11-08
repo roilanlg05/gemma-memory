@@ -98,7 +98,7 @@ def session_mismatch(requested: str | None) -> str | None:
 # `config`: es la única forma de que cubra el frame de apertura (spec §5.5, §6.2(c)).
 #
 # 7 fps, y bajan LOS DOS topes. Procedencia: medición de nitidez, repositorio
-# personal_agent (commit 03ba854),
+# personal_agent,
 # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
 # Con 1080x608 q45 el fotograma más grande medido pesa 54 715 B; lo que decide es
 # el pico (tope de fps x fotograma máximo), no el caudal medio. A 10 fps serían
@@ -259,6 +259,25 @@ class PanelState:
         if self.host:
             messages.append({"type": "host", "host": self.host})
         return messages
+
+
+def viewer_max_fps(crudo) -> int:
+    """El tope de fps que se le concede a un visor, a partir de lo que pidió.
+
+    Es la puerta de entrada: el presupuesto de caudal lo sostiene
+    DEFAULT_VIEWER_MAX_FPS, así que ningún valor pedido puede superarlo. Ausente,
+    vacío, no numérico (`abc`, `7.5`), `0`, negativo o fuera de 1..120 cae en el
+    tope por omisión; uno válido por encima del tope se recorta a él, y uno menor
+    se respeta (un visor puede pedir MENOS). `0` ya NO significa «sin tope» para un
+    cliente de red: eso era un agujero por el que cualquiera pedía fps ilimitados.
+    (`add_viewer(max_fps=0)` sigue valiendo para las pruebas internas.)"""
+    try:
+        fps = int(crudo)
+    except (TypeError, ValueError):
+        return DEFAULT_VIEWER_MAX_FPS
+    if not 1 <= fps <= 120:
+        return DEFAULT_VIEWER_MAX_FPS
+    return min(fps, DEFAULT_VIEWER_MAX_FPS)
 
 
 def _frame_interval(max_fps) -> float:

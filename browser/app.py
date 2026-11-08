@@ -188,7 +188,7 @@ def _relay() -> relay.Relay:
 @app.websocket("/v1/browser/stream")
 async def browser_stream(
     ws: WebSocket,
-    maxFps: int = Query(default=relay.DEFAULT_VIEWER_MAX_FPS),
+    maxFps: str = Query(default=""),  # str a propósito: ver relay.viewer_max_fps
     token: str = Query(default=""),
     session: str = Query(default=""),
 ) -> None:
@@ -227,4 +227,4 @@ async def browser_stream(
         await ws.send_json({"type": "closed", "reason": motivo})
         await ws.close(code=1008)
         return
-    await _relay().add_viewer(ws, max_fps=maxFps)
+    await _relay().add_viewer(ws, max_fps=relay.viewer_max_fps(maxFps))

@@ -50,7 +50,7 @@ services:
       # Calidad y tamaño máximo del JPEG del streaming: 1080x608 a calidad 45.
       # Salen de una medición real (25 fotogramas por combinación, página de
       # resultados de una tienda), NO de un valor heredado: el 640x360 q20 anterior
-      # se veía borroso. Ver, en el repositorio personal_agent (commit 03ba854),
+      # se veía borroso. Ver, en el repositorio personal_agent,
       # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
       # Fotograma medio 51 594 B, máximo 54 715 B. Con el tope de 7 fps de
       # browser/relay.py el pico es 383 kB/s, bajo el presupuesto de 400 kB/s.
