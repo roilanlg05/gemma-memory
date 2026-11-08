@@ -342,3 +342,38 @@ def test_el_cuerpo_tiene_topes():
     assert client.post("/v1/browser/invoke",
                        json={"arguments": ["batch"], "stdin": "x" * 262145},
                        headers=AUTH).status_code == 422
+
+
+# --- esquema de URL y nombre de sesión ---
+def test_open_y_read_solo_admiten_http_y_https():
+    malas = ["file:///etc/passwd", "FILE://x", " file:///etc/passwd", "file:/etc/passwd",
+             "data:text/html,<script>alert(1)</script>", "javascript:alert(1)",
+             "chrome://settings", "about:blank", "view-source:https://a.test",
+             "ftp://a.test/x", "etc/passwd", "//a.test"]
+    for url in malas:
+        assert _invoca("open", url) == 400, url
+        assert _invoca("read", url) == 400, url
+
+
+def test_el_motivo_de_una_url_mala_nombra_el_esquema():
+    r = client.post("/v1/browser/invoke", json={"arguments": ["open", "file:///etc/passwd"]},
+                    headers=AUTH)
+    assert r.status_code == 400 and "file" in r.json()["detail"]
+
+
+def test_open_y_read_con_http_y_https_pasan_aunque_vengan_en_mayusculas():
+    for url in ["https://a.test", "http://a.test/x?y=1", "HTTPS://A.TEST"]:
+        assert _invoca("open", url) == 200, url
+        assert _invoca("read", url) == 200, url
+
+
+def test_una_url_mala_dentro_de_batch_tambien_se_rechaza():
+    assert _invoca("batch", stdin='[["open","file:///etc/passwd"]]') == 400
+    assert _invoca("batch", "open file:///etc/passwd") == 400
+
+
+def test_el_nombre_de_sesion_es_un_juego_de_caracteres_seguro():
+    for malo in ["../../etc/x", "a/b", "..", "", "a b", "a;b", "x" * 65]:
+        assert _invoca("--session", malo, "open", "https://a.test") == 400, malo
+    for bueno in ["gemma", "gemma-live-test", "sesion_1"]:
+        assert _invoca("--session", bueno, "open", "https://a.test") == 200, bueno

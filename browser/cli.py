@@ -18,6 +18,7 @@ que sin lista de permitidos el endpoint sería ejecución remota de órdenes. Po
 import asyncio
 import json
 import os
+import re
 import shlex
 import tempfile
 
@@ -88,6 +89,16 @@ ALLOWED_SECOND_WORD: dict[str, frozenset[str]] = {
     "get": frozenset({"text", "html", "value", "title", "url", "count"}),
 }
 
+# Esquemas de URL que `open` y `read` aceptan. Lista de permitidos: file:, data:,
+# javascript:, chrome:, about:, view-source:, ftp: y cualquier otro quedan fuera.
+# Verificado contra el CLI 0.41.2: `open file:///etc/passwd` NO lo bloquea el CLI
+# (devuelve success y luego `get text body` leería el fichero); `read` sí.
+ALLOWED_URL_PREFIXES: tuple[str, ...] = ("http://", "https://")
+
+# Nombre de sesión: el CLI puede usarlo para construir la ruta del socket
+# (AGENT_BROWSER_SOCKET_DIR), así que nada de `/`, `..` ni caracteres raros.
+SESSION_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
 _FAKE_ENVELOPE = '{"success":true,"data":{},"error":null}'
 
 
@@ -131,10 +142,16 @@ def validate(arguments: list[str], stdin: str | None = None) -> None:
             if arguments[i].startswith("-"):
                 # Un valor con forma de flag haría que el CLI lo interprete de otra manera.
                 raise ValueError(f"el valor de {argument} parece un flag: {arguments[i]}")
+            valor = arguments[i]
+            if argument == "--session" and not SESSION_NAME_PATTERN.fullmatch(valor):
+                raise ValueError("nombre de --session no permitido: solo letras, dígitos, - y _ (máx. 64)")
             i += 1
 
     if subcommand is None:
         raise ValueError("falta el subcomando")
+
+    if subcommand in ("open", "read") and positionals:
+        _validate_url(positionals[0])
 
     permitidas = ALLOWED_SECOND_WORD.get(subcommand)
     if permitidas is not None:
@@ -146,6 +163,15 @@ def validate(arguments: list[str], stdin: str | None = None) -> None:
 
     if subcommand == "batch":
         validate_batch_payload(positionals, stdin)
+
+
+def _validate_url(url: str) -> None:
+    """Solo http:// y https://. Se ignoran mayúsculas y espacios/control al principio,
+    que el navegador también ignora (" FILE:///x", "file:/etc/passwd" no pasan)."""
+    normalizada = url.lstrip().lower()
+    if not normalizada.startswith(ALLOWED_URL_PREFIXES):
+        esquema = normalizada.split(":", 1)[0] if ":" in normalizada else "(sin esquema)"
+        raise ValueError(f"esquema de URL no permitido: {esquema}; solo http y https")
 
 
 def validate_batch_payload(batch_arguments: list[str], stdin: str | None) -> None:
