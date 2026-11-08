@@ -20,7 +20,7 @@ Two containers, one network:
 │  browser    :8083 (host)                                 │
 │    Python 3.11 + FastAPI + agent-browser 0.41.2          │
 │    Chromium + Xvfb en la imagen; Bearer en todo menos    │
-│    /healthz (mismo MEMORY_BEARER_TOKEN)                  │
+│    /healthz (BROWSER_BEARER_TOKEN, el suyo propio)       │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -28,7 +28,8 @@ Two containers, one network:
 ## Quick start
 
 ```bash
-cp .env.example .env       # edit MEMORY_BEARER_TOKEN to a long random string
+cp .env.example .env       # set MEMORY_BEARER_TOKEN and BROWSER_BEARER_TOKEN to
+                           # two different long random strings
 docker compose up -d --build
 ```
 
@@ -51,7 +52,9 @@ All via environment in `docker-compose.yml`:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `MEMORY_BEARER_TOKEN` | _(required)_ | Shared secret for `Authorization: Bearer …` on every `/v1/*` route. |
+| `MEMORY_BEARER_TOKEN` | _(required)_ | Shared secret for `Authorization: Bearer …` on every `/v1/*` route of the **memory** service. |
+| `BROWSER_BEARER_TOKEN` | _(required)_ | Shared secret for every `/v1/*` route of the **browser** gateway (:8083). Its **own** secret, deliberately not the memory one: this service drives a real Chromium inside the network, and the live deployment already uses a separate token — reusing `MEMORY_BEARER_TOKEN` would 401 every browser tool on the next deploy. |
+| `BROWSER_STREAM_SESSION` | `gemma` | CLI session the browser panel's streaming relay follows. **Must match** the app's `AGENT_BROWSER_SESSION`; if they diverge the browser keeps working and the panel stays blank. The relay compares it against the session the viewer declares (`?session=` on the stream socket) and closes with a reason naming both. |
 | `MEMORY_DB_PATH` | `/data/memory.sqlite` | SQLite file inside the container; mounted via `./docker-data/memory`. |
 | `EMBEDDER_URL` | `http://embedder:8000` | Internal compose DNS. |
 | `MODEL_URL` | `http://host.docker.internal:8080` | The Mac running `mlx_vlm.server`. On Linux hosts, add `extra_hosts: ["host.docker.internal:host-gateway"]` (already set in compose). When the model is on a different machine, change to its Tailscale IP. |
