@@ -1,0 +1,53 @@
+# Despliegue independiente del servicio del navegador en el i3.
+#
+# FUENTE DE VERDAD: este fichero, versionado en git. El del i3
+# (~/Projects/gemma-browser/docker-compose.yml) se sincroniza desde aquí; no se
+# edita a mano allí.
+#
+# Va aparte del compose de gemma-memory a propósito: el checkout del i3 está en
+# `main` con diez ficheros modificados sin commitear, así que cambiarle la rama
+# para traer la rama del navegador habría puesto en riesgo ese trabajo local.
+# Este directorio es puramente aditivo y no toca nada de lo que ya corre.
+#
+# Diferencia deliberada respecto al compose de gemma-memory: allí el servicio
+# leía `BROWSER_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}`, reusando el token de la
+# memoria, que hoy sigue siendo el placeholder débil. Aquí el navegador tiene su
+# propio token largo y aleatorio: es un servicio nuevo expuesto en la red de
+# Tailscale que puede conducir un Chromium real, y no debe heredar un secreto
+# conocido.
+services:
+  browser:
+    build:
+      context: ./browser
+    ports:
+      - "8083:8083"
+    env_file:
+      - .env
+    environment:
+      - TZ=America/Havana
+      # Sesión del CLI que sigue el relé del panel. TIENE QUE COINCIDIR con el
+      # AGENT_BROWSER_SESSION de la app (valor por omisión `gemma`). Si divergen,
+      # el navegador sigue funcionando y el panel se queda en blanco; el relé lo
+      # compara con la sesión que declara el visor y cierra nombrando las dos.
+      # Se escribe con su valor a la vista: una variable que solo existe dentro
+      # de un `os.environ.get` es una trampa para el yo del futuro.
+      - BROWSER_STREAM_SESSION=gemma
+      # Chrome de Debian; sin esto el CLI busca uno que no existe en la imagen.
+      - AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+      # AGENT_BROWSER_NO_XVFB queda SIN declarar a propósito: en Linux el CLI usa
+      # Xvfb (la imagen lo instala). No añadirla.
+      # El demonio se apaga por inactividad; media hora cubre una conversación larga.
+      - AGENT_BROWSER_IDLE_TIMEOUT_MS=1800000
+      - AGENT_BROWSER_SOCKET_DIR=/run/agent-browser
+      # Calidad y tamaño máximo del JPEG del streaming.
+      - AGENT_BROWSER_STREAM_QUALITY=20
+      - AGENT_BROWSER_STREAM_MAX_WIDTH=640
+      - AGENT_BROWSER_STREAM_MAX_HEIGHT=360
+      # Que no toque la red en cada llamada.
+      - AGENT_BROWSER_NO_VERSION_CHECK=1
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
