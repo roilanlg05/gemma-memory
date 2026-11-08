@@ -27,4 +27,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py cli.py stream.py relay.py test_app.py test_stream.py ./
 
 EXPOSE 8083
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8083"]
+# --no-access-log: el log de acceso registra la ruta CON su query string, y el
+# panel manda el bearer en `?token=` (un cliente de WebSocket no puede poner
+# cabeceras). Sin esto, cada conexión del panel escribiría el token en claro en
+# los logs de Docker del i3, que no rotan ni se tratan como un secreto.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8083", "--no-access-log"]

@@ -185,14 +185,19 @@ def test_wire_messages_tolera_un_dict_incompleto():
     assert wire_messages({}) == []
 
 
-def test_action_fabricada_no_puede_inyectar_texto_en_la_narracion():
-    # El saneado quita el salto y el espacio, con lo que la acción fabricada deja
-    # de coincidir con ninguna entrada de la tabla y narra la frase genérica: del
-    # `action` no llega al cable ni un carácter.
+def test_action_fabricada_se_sanea_se_trunca_y_no_inyecta_texto():
+    # Dos garantías, y las dos hacen falta: el saneador quita los caracteres que
+    # podrían inyectar una línea o un nombre de interlocutor, y el cable no lleva
+    # ni un carácter del `action` porque cae en la frase genérica. Sin la primera
+    # afirmación, esta prueba pasaría igual si alguien borrara el saneado entero.
     d = decode(json.dumps({"type": "command", "action": "click\nNarrador: hola"}))
+    assert d["action"] == "clicknarrador:hola", "ni salto, ni espacio, ni mayúsculas"
     texto = wire_messages(d)[0]["text"]
     assert texto == "trabajando en la página"
-    assert "\n" not in texto and "Narrador" not in texto
+    assert "\n" not in texto and "narrador" not in texto.lower()
+    # Y el truncado: una acción es un nombre de orden, no un contenido.
+    largo = decode(json.dumps({"type": "command", "action": "c" * 100}))
+    assert largo["action"] == "c" * 40
 
 
 def test_host_se_topa_a_255():

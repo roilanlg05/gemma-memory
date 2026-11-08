@@ -89,7 +89,10 @@ def _decode_frame(msg: dict) -> dict:
 
 def _decode_command(msg: dict) -> dict:
     action = msg.get("action")
-    name = _SAFE_ACTION.sub("", action)[:_MAX_ACTION] if isinstance(action, str) else ""
+    # Minúsculas en el punto del saneado: así IGNORED_ACTIONS, _NAVIGATE y la
+    # tabla de frases dejan de ser sensibles a mayúsculas de una vez, y una
+    # versión del CLI que emitiera `Click` no cae en la frase genérica.
+    name = _SAFE_ACTION.sub("", action).lower()[:_MAX_ACTION] if isinstance(action, str) else ""
     if name in IGNORED_ACTIONS:
         # Ni narración ni cuenta: para el panel esto no ha pasado.
         return _empty("other")
@@ -140,7 +143,11 @@ def host_of(url: str | None) -> str | None:
 
 def phrase(action: str, url: str | None) -> str:
     """Frase de narración para una acción; nunca incluye argumentos. Una acción
-    que no esté en la tabla cae en GENERIC_PHRASE, no en su nombre crudo."""
+    que no esté en la tabla cae en GENERIC_PHRASE, no en su nombre crudo.
+
+    `decode` ya normaliza el nombre, pero esto es público y se prueba solo, así
+    que normaliza también aquí."""
+    action = action.lower() if isinstance(action, str) else ""
     if action in _NAVIGATE:
         host = host_of(url)
         return f"navegando a {host}" if host else "navegando"

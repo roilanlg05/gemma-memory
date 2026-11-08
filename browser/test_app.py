@@ -465,6 +465,28 @@ def test_un_visor_que_entra_a_mitad_recibe_estado_resumen_y_host():
 
 
 # --- el endpoint ---
+def test_el_token_no_puede_acabar_en_un_log():
+    # uvicorn registra el upgrade del WebSocket con su query string, y el panel
+    # manda el bearer ahí porque un cliente de WebSocket no puede poner cabeceras.
+    # Los logs de Docker del i3 no rotan ni se tratan como un secreto.
+    import logging
+    filtro = appmod.RedactTokenFilter()
+    registro = logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1,
+                                 '%s - "WebSocket %s" [accepted]',
+                                 (("10.0.0.1", 1234),
+                                  "/v1/browser/stream?token=secreto-de-verdad&maxFps=10"),
+                                 None)
+    assert filtro.filter(registro) is True
+    linea = registro.getMessage()
+    assert "secreto-de-verdad" not in linea
+    assert "token=[redactado]" in linea
+    assert "maxFps=10" in linea, "solo se tacha el token, no la línea entera"
+    # Y está puesto en los loggers que lo escribirían.
+    for nombre in ("uvicorn.error", "uvicorn.access"):
+        assert any(isinstance(f, appmod.RedactTokenFilter)
+                   for f in logging.getLogger(nombre).filters), nombre
+
+
 def test_el_stream_sin_token_se_rechaza():
     with pytest.raises(Exception):
         with client.websocket_connect("/v1/browser/stream"):
@@ -519,6 +541,26 @@ def test_el_motivo_del_closed_sin_navegador_es_legible():
     pytest.fail("no llegó el closed")
 
 
+# El esquema de los seis mensajes, clave por clave. El lado de Swift los lee por
+# nombre y por tipo, así que un campo de más es un campo que nadie decidió
+# mandar, y el sitio donde aparecería es el mismo por donde saldría un secreto.
+_ESQUEMA_DEL_CABLE = {
+    "frame": {"type", "seq", "jpeg", "captured_at"},
+    "narration": {"type", "text"},
+    "host": {"type", "host"},
+    "state": {"type", "live", "collapsed"},
+    "summary": {"type", "text"},
+    "closed": {"type", "reason"},
+}
+
+
+def _comprobar_esquema(enviados):
+    assert enviados, "sin mensajes no se está comprobando nada"
+    for mensaje in enviados:
+        assert mensaje["type"] in _ESQUEMA_DEL_CABLE, mensaje["type"]
+        assert set(mensaje) == _ESQUEMA_DEL_CABLE[mensaje["type"]], mensaje
+
+
 # --- el cable, contra un demonio falso: sin Docker y sin el CLI de verdad ---
 _JPEG_B64 = base64.b64encode(bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"relleno" * 8).decode()
 
@@ -571,6 +613,11 @@ class VisorFalso:
 
     def desconectar(self):
         self._cerrado = True
+
+    def inyectar_acuse(self, seq):
+        """Mete un acuse en la entrada, incluso de un frame que este visor no
+        recibió: así se puede probar que el relé no lo cuenta."""
+        self._entrada.append(json.dumps({"type": "ack", "seq": seq}))
 
     @property
     def frames(self):
@@ -729,6 +776,21 @@ def test_las_seis_formas_de_get_narran_leyendo_la_pagina():
         assert streammod.phrase(palabra, None) == "leyendo la página", palabra
 
 
+def test_el_nombre_de_la_accion_no_es_sensible_a_mayusculas():
+    # Una versión del CLI que emitiera `Click` no puede caer en la frase genérica,
+    # ni un `LAUNCH` colarse en la cuenta. El nombre se normaliza en el punto del
+    # saneado, así que IGNORED_ACTIONS, _NAVIGATE y la tabla lo ven ya en
+    # minúsculas; `phrase` normaliza también porque es público.
+    import stream as streammod
+    assert streammod.phrase("Click", None) == "haciendo clic"
+    assert streammod.decode(
+        json.dumps({"type": "command", "action": "LAUNCH"}))["kind"] == "other"
+    d = streammod.decode(json.dumps({"type": "command", "action": "Navigate",
+                                     "params": {"url": "https://a.test/x"}}))
+    assert d["action"] == "navigate" and d["url"] == "https://a.test/x"
+    assert {"type": "host", "host": "a.test"} in streammod.wire_messages(d)
+
+
 def test_la_accion_url_no_navega_ni_emite_host():
     # `url` es el nombre de una acción de lectura, no una navegación: la url de
     # `params` se lee solo para `navigate` y `open`.
@@ -855,6 +917,7 @@ def test_el_socket_caido_congela_el_panel_con_resumen_y_closed():
     estado = [m for m in visor.enviados if m["type"] == "state"][-1]
     assert estado["live"] is False and estado["collapsed"] is True
     assert visor.tipos[-1] == "closed"
+    _comprobar_esquema(visor.enviados)  # aquí sí aparece `host`
 
 
 def test_el_cable_solo_lleva_los_seis_mensajes_de_la_spec():
@@ -865,9 +928,97 @@ def test_el_cable_solo_lleva_los_seis_mensajes_de_la_spec():
                                "params": {"selector": "#comprar"}})),
              _paso(json.dumps({"type": "result", "action": "click", "data": {"x": 1}})),
              _paso(json.dumps({"type": "console", "text": "ruido"}))]
-    asyncio.run(_cablear(guion, [(visor, 0)], lambda: "narration" in visor.tipos,
+    asyncio.run(_cablear(guion, [(visor, 0)], lambda: "closed" in visor.tipos,
                          cierra=True))
-    assert set(visor.tipos) <= {"frame", "narration", "host", "state", "summary", "closed"}
+    # Igualdad y no subconjunto: con un subconjunto, un cable vacío pasaría.
+    assert set(visor.tipos) == {"state", "frame", "narration", "summary", "closed"}
+    _comprobar_esquema(visor.enviados)  # `host` lo cubre la prueba del socket caído
+
+
+class _FalloNoAtrapable(BaseException):
+    """Imita un fallo que los `except Exception` del relé no cubren."""
+
+
+async def _un_visor_contra(rele, hasta, timeout=3.0):
+    """Conecta un visor falso a un relé ya construido y espera a `hasta`."""
+    visor = VisorFalso()
+    tarea = asyncio.create_task(rele.add_viewer(visor, max_fps=0))
+    await _esperar(lambda: hasta(visor), timeout)
+    visor.desconectar()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(tarea, 2.0)
+    await asyncio.sleep(0.05)  # deja acabar lo que el relé haya programado
+    await rele.shutdown()
+    return visor
+
+
+def test_el_arranque_entero_tiene_un_presupuesto_y_el_visor_recibe_su_closed():
+    # La cota de lo que tarda un visor en saber que no hay panel no puede ser la
+    # suma de los plazos de cada intento: con tres intentos de leer el puerto y
+    # abrir el socket, pasaría del minuto esperando su `closed`.
+    async def escenario():
+        async def nunca_responde():
+            await asyncio.sleep(30)
+            return None
+
+        rele = relay.Relay(nunca_responde, startup_budget=0.3)
+        inicio = time.monotonic()
+        visor = await _un_visor_contra(rele, lambda v: "closed" in v.tipos)
+        return time.monotonic() - inicio, visor
+
+    tardo, visor = asyncio.run(escenario())
+    assert visor.tipos[0] == "state", "el state sale desde el primer instante"
+    assert "closed" in visor.tipos
+    assert tardo < 2.0, f"el arranque no quedó acotado: {tardo:.1f}s"
+
+
+def test_si_la_era_del_demonio_muere_de_algo_raro_el_visor_recibe_closed():
+    # El peor fallo posible es un visor con su `state{live:false}` y SIN `closed`:
+    # se queda en blanco para siempre y, con la política de no registrar cuerpos,
+    # sin rastro. La red de seguridad difunde el cierre.
+    async def escenario():
+        async def revienta():
+            raise _FalloNoAtrapable("este texto no se mira nunca")
+
+        rele = relay.Relay(revienta)
+        visor = VisorFalso()
+        tarea = asyncio.create_task(rele.add_viewer(visor, max_fps=0))
+        await _esperar(lambda: "closed" in visor.tipos, 3.0)
+        visor.desconectar()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(tarea, 2.0)
+        await asyncio.sleep(0.05)
+        # El fallo sigue guardado en la tarea de la era, y `shutdown` lo levanta
+        # al recogerla: es un BaseException y el relé no se los traga, con razón.
+        with contextlib.suppress(_FalloNoAtrapable):
+            await rele.shutdown()
+        return visor
+
+    visor = asyncio.run(escenario())
+    assert visor.tipos[0] == "state"
+    assert "closed" in visor.tipos, "la era murió sin avisar al visor"
+    _comprobar_esquema(visor.enviados)
+
+
+def test_el_acuse_de_un_visor_que_se_salto_el_frame_no_cuenta():
+    # A un visor que se saltó el frame por su tope de fps no se le puede dejar
+    # mover el ritmo del demonio ni mantener el panel «en vivo» sin haber pintado.
+    rapido, lento = VisorFalso(auto_ack=False), VisorFalso(auto_ack=False)
+    acuses, vistos = [], []
+
+    async def comprobar():
+        await _esperar(lambda: rapido.frames, 2.0)
+        rapido.inyectar_acuse(1)                    # el primero sí lo recibió
+        await _esperar(lambda: len(rapido.frames) >= 2, 2.0)
+        lento.inyectar_acuse(2)                     # este no: su tope lo saltó
+        await asyncio.sleep(0.3)
+        vistos.extend(a["seq"] for a in acuses)
+
+    asyncio.run(_cablear([_paso(_frame(1)), _paso(_frame(2), espera_acuse=True)],
+                         [(rapido, 0), (lento, 1)], lambda: True,
+                         acuses=acuses, tras=comprobar))
+    assert len(lento.frames) == 1, "al lento le tocó saltarse el segundo frame"
+    assert vistos == [1], "solo cuenta el acuse de quien SÍ se quedó el frame"
 
 
 def test_el_puerto_se_lee_en_cada_reconexion():

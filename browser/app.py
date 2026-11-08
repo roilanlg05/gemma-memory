@@ -3,7 +3,9 @@ Chromium) en el i3; la app de macOS lo invoca por HTTP en vez de lanzarlo en loc
 /v1/browser/invoke valida el argv y lo ejecuta vía cli.py; /v1/browser/stream es
 el relé del panel, que sirve el stream del demonio a uno o varios visores."""
 import asyncio
+import logging
 import os
+import re
 import weakref
 from typing import Annotated
 
@@ -22,6 +24,34 @@ def require_bearer(authorization: str = Header(default="")) -> None:
     expected = os.environ.get("BROWSER_BEARER_TOKEN", "")
     if not expected or authorization != f"Bearer {expected}":
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+class RedactTokenFilter(logging.Filter):
+    """Tacha `token=...` de cualquier línea de log.
+
+    El panel manda su bearer en `?token=` porque un cliente de WebSocket no puede
+    poner cabeceras, y uvicorn registra el upgrade **con su query string**. El
+    `--no-access-log` del `CMD` apaga el log de acceso, pero la línea del upgrade
+    sale por el logger `uvicorn.error` y seguía apareciendo: verificado en vivo.
+    Esto lo cierra sin depender de cómo se lance el proceso, que es lo que importa
+    porque este es el primer endpoint que sirve imágenes de la pantalla."""
+
+    _TOKEN = re.compile(r"(token=)[^&\s\"']+")
+
+    @classmethod
+    def redact(cls, text: str) -> str:
+        return cls._TOKEN.sub(r"\1[redactado]", text)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self.redact(str(record.msg))
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self.redact(a) if isinstance(a, str) else a for a in record.args)
+        return True
+
+
+for _nombre in ("uvicorn.error", "uvicorn.access"):
+    logging.getLogger(_nombre).addFilter(RedactTokenFilter())
 
 
 app = FastAPI(title="Gemma Browser Gateway", version="1.0")
