@@ -209,12 +209,21 @@ async def browser_stream(
     await ws.accept()
     motivo = relay.session_mismatch(session)
     if motivo is not None:
-        # Se acepta y se cierra con un `closed` en vez de rechazar el handshake: la
-        # app pinta el motivo de un `closed`, y un 1008 sin cuerpo dejaría al
-        # usuario mirando un rectángulo en blanco, que es justo la avería que esta
-        # guardia existe para matar. La comparación va DESPUÉS del token (nadie sin
-        # autenticar averigua el nombre de la sesión) y ANTES de `add_viewer`, para
-        # no levantar un Chromium en el i3 por un visor que no va a ver nada.
+        # Se acepta y se cierra con un `closed` en vez de rechazar el handshake,
+        # porque un 1008 sin cuerpo dejaría al usuario mirando un rectángulo en
+        # blanco, que es justo la avería que esta guardia existe para matar. La
+        # comparación va DESPUÉS del token (nadie sin autenticar averigua el nombre
+        # de la sesión) y ANTES de `add_viewer`, para no levantar un Chromium en el
+        # i3 por un visor que no va a ver nada.
+        #
+        # El `state` de delante NO es decorativo, y sin él esta guardia no sirve de
+        # nada: el visor no dibuja el panel hasta haber recibido algo del servidor,
+        # y un `closed` **no cuenta** para eso —el cliente se fabrica uno él mismo
+        # cuando la conexión falla, así que contarlo haría aparecer un panel gris
+        # con el i3 caído—. El `state` es la forma de decir «el servidor sí habló»,
+        # y es lo que hace que el motivo de abajo llegue a un píxel en vez de morir
+        # en una fila vacía.
+        await ws.send_json({"type": "state", "live": False, "collapsed": False})
         await ws.send_json({"type": "closed", "reason": motivo})
         await ws.close(code=1008)
         return
