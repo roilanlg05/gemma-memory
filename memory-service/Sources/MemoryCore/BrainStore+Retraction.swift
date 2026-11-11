@@ -505,6 +505,7 @@ extension BrainStore {
     private func purge(_ closure: BrainRetractionClosure, db: Database, revision: Int64) throws {
         var closure = closure
         _ = try expandTurnClosure(&closure, db: db)
+        if !closure.purgeEverything { try Self.preserveSupersession(of: closure.claimIDs, db: db) }
         try purgeTurnJournals(closure, db: db)
         try purgeIdentityJournals(closure, db: db)
         try Self.invalidateConversationState(evidenceIDs: closure.evidenceIDs, transcriptIDs: closure.transcriptIDs,
@@ -534,7 +535,7 @@ extension BrainStore {
             // and model configuration are not memory and are never erased by a memory scope.
             for table in ["node", "node_fts", "node_embedding", "node_tags", "edge", "transcript",
                           "transcript_embedding", "brain_evidence", "brain_evidence_operations",
-                          "brain_claim", "brain_commit", "brain_projection", "brain_legacy_binding",
+                          "brain_claim", "brain_commit", "brain_projection", "brain_legacy_binding", "brain_supersession_disposition",
                           "sleep_cycle"] {
                 try db.execute(sql: "DELETE FROM \(table)")
             }

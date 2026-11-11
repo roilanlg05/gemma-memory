@@ -57,6 +57,8 @@ public enum BrainContextSourceUse: String, Codable, Equatable, Sendable {
     case recentWhole
     case recentPrefix
     case derivedSupport
+    case recalledSupport
+    case startupOrientation
 }
 
 /// Context belongs to this turn and records the revisions it was built at.

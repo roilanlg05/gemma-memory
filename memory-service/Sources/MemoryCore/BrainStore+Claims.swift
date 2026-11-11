@@ -167,7 +167,8 @@ extension BrainStore {
                   Self.admitsPreference(claim, sources: sources, threadID: threadID) else { continue }
             visible.append(claim)
         }
-        let superseded = Set(visible.compactMap(\.supersedesID))
+        let superseded = Set(visible.compactMap(\.supersedesID)).union(
+            try Self.disposedPredecessors(visible, asOf: asOf, knownAtRevision: known, db: db))
         return visible.filter { claim in
             claim.status == .active && !superseded.contains(claim.id)
                 && (claim.predicate == includingExpiredPredicate || (claim.validTo.map { asOf < $0 } ?? true))

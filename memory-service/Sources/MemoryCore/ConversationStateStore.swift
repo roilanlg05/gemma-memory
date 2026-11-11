@@ -172,7 +172,8 @@ public final class ConversationStateStore {
                   BrainStore.admitsPreference(claim, sources: evidence, threadID: threadID) else { continue }
             visible.append(claim)
         }
-        let superseded = Set(visible.compactMap(\.supersedesID))
+        let superseded = Set(visible.compactMap(\.supersedesID)).union(
+            try BrainStore.disposedPredecessors(visible, asOf: brain.clock(), knownAtRevision: revision, db: db))
         let claims = visible.filter { $0.status == .active && !superseded.contains($0.id) && ($0.validTo.map { brain.clock() < $0 } ?? true) }
         var rootIDs = Set<String>(), claimEvidenceIDs = [String: [String]]()
         for claim in claims {

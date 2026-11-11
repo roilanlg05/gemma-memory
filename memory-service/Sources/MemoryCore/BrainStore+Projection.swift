@@ -68,7 +68,8 @@ extension BrainStore {
         let payloads = try String.fetchAll(db, sql: "SELECT payload FROM brain_claim")
         let claims = try payloads.map { try Self.decode(BrainClaim.self, $0) }
         let byID = Dictionary(uniqueKeysWithValues: claims.map { ($0.id, $0) })
-        let superseded = Set(claims.filter { $0.validFrom <= now }.compactMap(\.supersedesID))
+        let superseded = Set(claims.filter { $0.validFrom <= now }.compactMap(\.supersedesID)).union(
+            try Self.disposedPredecessors(claims, asOf: now, db: db))
         let rows = try Row.fetchAll(db, sql: "SELECT node_id, claim_id, suppressed FROM brain_projection")
         for row in rows {
             let nodeID: String = row["node_id"]

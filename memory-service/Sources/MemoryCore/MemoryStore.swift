@@ -370,6 +370,21 @@ public final class MemoryStore: @unchecked Sendable {
                     FROM brain_identity_revision r;
                 """)
         }
+        m.registerMigration("v21-erased-correction-disposition") { db in
+            // Live chains keep their existing source-visibility rules. At erasure, retain
+            // only the predecessor assertion's disposition, never the correction's content.
+            // Chains erased before this migration cannot be reconstructed without their data.
+            try db.execute(sql: """
+                CREATE TABLE brain_supersession_disposition (
+                    predecessor_id TEXT NOT NULL,
+                    assertion_fingerprint TEXT NOT NULL,
+                    effective_at DOUBLE NOT NULL,
+                    recorded_at DOUBLE NOT NULL,
+                    revision INTEGER NOT NULL,
+                    PRIMARY KEY(predecessor_id, assertion_fingerprint, revision)
+                );
+                """)
+        }
         return m
     }
 

@@ -64,6 +64,25 @@ public final class MemoryRetriever: @unchecked Sendable {
         return result
     }
 
+    /// Vector lane for the brain's scoped recall. The caller supplies claims with live,
+    /// authorized roots from the same transaction, so a legacy vector never grants access.
+    static func sourceBoundVectorScores(_ vector: [Float], supported: Set<String>, db: Database) throws -> [String: Double] {
+        guard !vector.isEmpty, vector.allSatisfy(\.isFinite) else { return [:] }
+        let rows = try Row.fetchCursor(db, sql: """
+            SELECT p.claim_id, e.embedding FROM brain_projection p
+            JOIN node n ON n.id=p.node_id AND n.deleted=0
+            JOIN node_embedding e ON e.node_id=p.node_id WHERE p.suppressed=0
+            """)
+        var scores = [String: Double]()
+        while let row = try rows.next() {
+            let id: String = row["claim_id"]
+            guard supported.contains(id) else { continue }
+            let distance = MemoryStore.cosineDistance(vector, MemoryStore.blobToFloats(row["embedding"]))
+            if distance.isFinite, distance < 0.65 { scores[id] = min(1, 1 - distance) }
+        }
+        return scores
+    }
+
     /// Render retrieved nodes as a compact injection block (empty string if none).
     /// Summaries (the "ruta") come first so the model gets the gist before individual facts.
     public func injectionBlock(for nodes: [Node]) -> String {

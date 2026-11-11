@@ -29,11 +29,15 @@ public final class BrainContextAssembler {
     private let store: ConversationStateStore
     private let selector: (any ConversationDetailSelector)?
     private let affect: AffectiveContextService?
+    private let recall: AssociativeRetriever?
+    private let opportunityGate: RecallOpportunityGate
     public init(store: ConversationStateStore, selector: (any ConversationDetailSelector)? = nil,
-                affect: AffectiveContextService? = nil) {
+                affect: AffectiveContextService? = nil, recall: AssociativeRetriever? = nil,
+                opportunityGate: RecallOpportunityGate = .init()) {
         self.store = store; self.selector = selector; self.affect = affect
+        self.recall = recall; self.opportunityGate = opportunityGate
     }
-    public func context(_ request: BrainContextRequest) async throws -> BrainContextBundle {
+    public func context(_ request: BrainContextRequest, recallOptions: RecallContextOptions? = nil) async throws -> BrainContextBundle {
         let snapshot = try store.snapshot(threadID: request.threadID)
         // The envelope and the disclosure floor are checked before the selector runs, so a window
         // that cannot honestly report what it dropped fails before a model is called.
@@ -50,10 +54,26 @@ public final class BrainContextAssembler {
                 selection = .init()
             }
         }
-        return try store.validatedInTransaction(snapshot) { current, db in
-            let interaction = try affect?.interaction(threadID: request.threadID, authorizedBy: store.brain, db: db)
-            return try assemble(current, request: request, selection: selection, interaction: interaction)
+        var vector: [Float]?
+        if let recallOptions {
+            guard let recall, recall.brain === store.brain else { throw BrainStoreError.denied }
+            guard recallOptions.asOf.isFinite else { throw BrainStoreError.invalid }
+            if recallOptions.finalizedCue == nil {
+                vector = try await recall.queryVector(request.query, threadID: request.threadID, scope: recallOptions.scope)
+            }
+            try Task.checkCancellation()
         }
+        let result = try store.validatedInTransaction(snapshot) { current, db in
+            let interaction = try affect?.interaction(threadID: request.threadID, authorizedBy: store.brain, db: db)
+            if let recall, let recallOptions, let content = try RecallContextContent.build(retriever: recall,
+                request: request, current: current, options: recallOptions, gate: opportunityGate, vector: vector, db: db) {
+                let assembled = try assemble(current, request: request, selection: selection, interaction: interaction, recall: content)
+                if recallOptions.acceptsPrepared(brain: recall.brain, request: request) { return assembled }
+            }
+            return try assemble(current, request: request, selection: selection, interaction: interaction, recall: nil)
+        }
+        try Task.checkCancellation()
+        return result
     }
     private struct Draft {
         var blocks = [String]()
@@ -83,6 +103,8 @@ public final class BrainContextAssembler {
         /// An original the model asked to quote or to see in detail was not delivered.
         case quoteOmittedBudget
         case detailOmittedBudget
+        case recalledQuoteOmittedBudget
+        case recalledDetailOmittedBudget
         /// A recent raw turn was delivered as a marked prefix of itself.
         case recentPrefixBudget
         /// The agent identity section did not fit.
@@ -91,6 +113,9 @@ public final class BrainContextAssembler {
         case groupOmittedBudget
 
         static let selectedOmissions: [Self] = [.quoteOmittedBudget, .detailOmittedBudget]
+        static let recalledOmissions: [Self] = [.recalledQuoteOmittedBudget, .recalledDetailOmittedBudget]
+        var isRecalled: Bool { Self.recalledOmissions.contains(self) }
+        var isQuote: Bool { self == .quoteOmittedBudget || self == .recalledQuoteOmittedBudget }
         static let snapshotOmissions: [Self] = [.agentIdentityOmittedBudget, .groupOmittedBudget]
 
         /// Reserve only snapshot classes that might have something to omit.
@@ -100,7 +125,8 @@ public final class BrainContextAssembler {
                 return snapshot.identity?.agentProfile != nil
             case .groupOmittedBudget:
                 return !snapshot.sources.isEmpty
-            case .quoteOmittedBudget, .detailOmittedBudget, .recentPrefixBudget:
+            case .quoteOmittedBudget, .detailOmittedBudget, .recalledQuoteOmittedBudget,
+                 .recalledDetailOmittedBudget, .recentPrefixBudget:
                 return false
             }
         }
@@ -122,7 +148,7 @@ public final class BrainContextAssembler {
         }
         return .init(evidenceID: nil, originalUTF8Bytes: total, includedUTF8Bytes: 0,
                      reason: reason.rawValue,
-                     omittedEvidenceCount: DisclosureReason.selectedOmissions.contains(reason) ? entries.count : nil)
+                     omittedEvidenceCount: (DisclosureReason.selectedOmissions.contains(reason) || reason.isRecalled) ? entries.count : nil)
     }
     private func capacity(_ budget: BrainContextBudget) -> Int {
         budget.contextTokens - budget.outputTokens - budget.systemTokens - budget.toolTokens
@@ -163,7 +189,7 @@ public final class BrainContextAssembler {
             segments.append(segment)
             if try JSONEncoder().encode(input()).count > limit { segments.removeLast() }
         }
-        for claim in snapshot.claims.reversed() where !BrainStore.requiresTurnSource(claim.predicate) {
+        for claim in snapshot.claims.reversed() where Self.admitsLegacySelection(claim) {
             claims.append(claim)
             if try JSONEncoder().encode(input()).count > limit { claims.removeLast() }
         }
@@ -173,16 +199,24 @@ public final class BrainContextAssembler {
         }
         return input()
     }
+    private static func admitsLegacySelection(_ claim: BrainClaim) -> Bool {
+        !BrainStore.requiresTurnSource(claim.predicate) && RecallClaimPredicate(rawValue: claim.predicate) == nil
+    }
+
     private func assemble(_ snapshot: ConversationSnapshot, request: BrainContextRequest, selection: ConversationSelection,
-                          interaction: BrainInteractionState?) throws -> BrainContextBundle {
+                          interaction: BrainInteractionState?, recall: RecallContextContent?) throws -> BrainContextBundle {
         let originals = Dictionary(uniqueKeysWithValues: snapshot.sources.map { ($0.evidence.id, $0.evidence) })
         let claims = Dictionary(uniqueKeysWithValues: snapshot.claims
-            .filter { !BrainStore.requiresTurnSource($0.predicate) }.map { ($0.id, $0) })
+            .filter(Self.admitsLegacySelection).map { ($0.id, $0) })
         guard selection.detailEvidenceIDs.allSatisfy({ originals[$0] != nil }),
               selection.quoteEvidenceIDs.allSatisfy({ originals[$0] != nil }),
               selection.claimIDs.allSatisfy({ claims[$0] != nil }) else { throw BrainStoreError.denied }
         var available = Dictionary(uniqueKeysWithValues: snapshot.memoryEvidence.map { ($0.id, $0) })
         for (id, source) in originals { available[id] = source }
+        for source in recall?.originals ?? [] { available[source.id] = source }
+        for source in (recall?.blocks ?? []).flatMap(\.sources) where available[source.id] == nil {
+            available[source.id] = source
+        }
         var draft = Draft()
         func adding(to old: Draft, block: String? = nil, units: [BrainMessageUnit] = [], ids: [String] = [],
                     renderedUse: BrainContextSourceUse? = nil,
@@ -215,11 +249,18 @@ public final class BrainContextAssembler {
         }
         let quotes = Set(selection.quoteEvidenceIDs)
         var seen = Set<String>()
-        let selected = try (selection.quoteEvidenceIDs + selection.detailEvidenceIDs).compactMap { id -> SelectedOriginal? in
+        var selected = try (selection.quoteEvidenceIDs + selection.detailEvidenceIDs).compactMap { id -> SelectedOriginal? in
             guard seen.insert(id).inserted else { return nil }
             guard let text = originals[id]?.text else { throw BrainStoreError.invalid }
             return SelectedOriginal(id: id, text: text,
                                     reason: quotes.contains(id) ? .quoteOmittedBudget : .detailOmittedBudget)
+        }
+        if let recall {
+            for source in recall.originals where seen.insert(source.id).inserted {
+                guard let text = source.text else { throw BrainStoreError.invalid }
+                selected.append(.init(id: source.id, text: text,
+                    reason: recall.quotes.contains(source.id) ? .recalledQuoteOmittedBudget : .recalledDetailOmittedBudget))
+            }
         }
         let requested = Dictionary(grouping: selected, by: \.reason)
         var remaining = requested.mapValues(\.count)
@@ -319,10 +360,10 @@ public final class BrainContextAssembler {
                                 reason: DisclosureReason.agentIdentityOmittedBudget.rawValue)])
             }
         }
-        for original in selected {
+        func admitOriginal(_ original: SelectedOriginal) throws {
             let reason = original.reason
-            let isQuote = reason == .quoteOmittedBudget
-            let label = isQuote ? "original quote" : "original detail"
+            let isQuote = reason.isQuote
+            let label = (reason.isRecalled ? "recalled " : "") + (isQuote ? "original quote" : "original detail")
             let base = remaining[reason] == 1 ? releasing(reason, from: draft) : draft
             let delivered = adding(to: base, block: "[\(label) source=\(original.id)]\n\(original.text)",
                                    ids: [original.id], renderedUse: isQuote ? .renderedQuote : .renderedDetail)
@@ -333,6 +374,7 @@ public final class BrainContextAssembler {
                 disclose(reason, [original.omission])
             }
         }
+        for original in selected where !original.reason.isRecalled { try admitOriginal(original) }
         try finalizeDisclosures(DisclosureReason.selectedOmissions, preserveNewest: true)
         for id in selection.claimIDs {
             guard let claim = claims[id] else { continue }
@@ -360,9 +402,9 @@ public final class BrainContextAssembler {
         let covered = Set(snapshot.segments.flatMap { $0.sources.map(\.evidenceID) })
         let newest = groups.last?.first?.groupID
         let recent = groups.filter { group in group.first?.groupID == newest || group.contains { !covered.contains($0.evidence.id) } }
-        for group in recent.reversed() {
+        func admitRecentGroup(_ group: [ConversationSource]) throws {
             let ids = group.map { $0.evidence.id }
-            if try add(units: recentUnits(group), ids: ids, prependUnits: true) { continue }
+            if try add(units: recentUnits(group), ids: ids, prependUnits: true) { return }
             // Keep all members of an oversized group, or none. Each retained prefix is marked.
             var low = 0, high = group.map { $0.evidence.text?.utf8.count ?? 0 }.max() ?? 0
             var best: Draft?
@@ -390,7 +432,28 @@ public final class BrainContextAssembler {
                     reason: DisclosureReason.groupOmittedBudget.rawValue) })
             }
         }
+        if let newestGroup = recent.last { try admitRecentGroup(newestGroup) }
+        // Explicit recalled originals reserve their mandatory omission notice only after
+        // the baseline newest local group has been admitted without optional recall pressure.
+        let recalledReservations = DisclosureReason.recalledOmissions.compactMap { reservations[$0] }
+        guard try add(truncations: recalledReservations) else { throw BrainContextAssemblyError.insufficientBudget }
+        for original in selected where original.reason.isRecalled { try admitOriginal(original) }
+        try finalizeDisclosures(DisclosureReason.recalledOmissions)
+        var deferredRecall = [RecallContextContent.Block]()
+        if let recall, !recall.blocks.isEmpty {
+            let spent = try estimatedInput(draft, request: request, revision: snapshot.revision)
+            let room = capacity(request.budget) - spent
+            let firstLimit = spent + (recent.count > 1 ? room / 2 : room)
+            for block in recall.blocks {
+                if try !add(block: block.text, ids: block.sources.map(\.id), renderedUse: block.use,
+                            maximumInput: firstLimit) { deferredRecall.append(block) }
+            }
+        }
+        for group in recent.dropLast().reversed() { try admitRecentGroup(group) }
         try finalizeDisclosures(DisclosureReason.snapshotOmissions)
+        for block in deferredRecall {
+            try add(block: block.text, ids: block.sources.map(\.id), renderedUse: block.use)
+        }
         // Guidance uses whatever capacity remains after original evidence and required notices.
         // Render only bounded cues, never the model's affect label or the source text again.
         if let advice = AffectiveContextService.advice(claims: snapshot.claims, threadID: request.threadID,
