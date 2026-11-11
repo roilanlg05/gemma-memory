@@ -62,6 +62,11 @@ public final class BrainStore {
     static func revision(_ db: Database) throws -> Int64 {
         try Int64.fetchOne(db, sql: "SELECT revision FROM brain_meta WHERE id=1") ?? 0
     }
+    static func advanceRevision(_ db: Database) throws {
+        let revision = try revision(db)
+        guard revision < Int64.max else { throw BrainStoreError.conflict }
+        try db.execute(sql: "UPDATE brain_meta SET revision=? WHERE id=1", arguments: [revision + 1])
+    }
     static func encode<T: Encodable>(_ value: T) throws -> String {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return String(decoding: try encoder.encode(value), as: UTF8.self)

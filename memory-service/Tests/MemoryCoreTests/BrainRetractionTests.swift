@@ -182,7 +182,7 @@ final class BrainRetractionTests: XCTestCase {
         try db.upsert(node("quoted-1", kind: .task, label: "Permit", body: sameThread))
 
         _ = try service.forget(scope: BrainForgetScope(kind: .thread, id: "thread-1"),
-                               expectedRevision: 1, operationID: "forget-thread")
+                               expectedRevision: BrainStore(store: db, authorization: authorization()).revision(), operationID: "forget-thread")
 
         let transcript = TranscriptStore(dbQueue: db.dbQueue)
         XCTAssertTrue(try transcript.range(threadId: "thread-1", from: 1, to: 80).isEmpty)

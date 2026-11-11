@@ -76,7 +76,12 @@ extension MemoryStore {
                                    allDay: allDay, location: location, canonicalKey: key)
         if let existing {
             var node = existing
-            let existingStatus = NodeAttributes.from(existing.extra).status
+            let old = NodeAttributes.from(existing.extra)
+            attrs = old
+            attrs.startAt = start; attrs.endAt = end; attrs.allDay = allDay
+            attrs.location = location; attrs.canonicalKey = key
+            if existing.label != title || old.startAt != start || old.endAt != end || old.allDay != allDay || old.location != location { attrs.contentUpdatedAt = now }
+            let existingStatus = old.status
             if existingStatus == "cancelled" || existingStatus == "done" {
                 attrs.status = existingStatus   // don't resurrect a cancelled/done event
             }
@@ -85,6 +90,7 @@ extension MemoryStore {
             try upsert(node, checkpoint: checkpoint)
             return existing.id
         } else {
+            attrs.contentUpdatedAt = now
             let id = UUID().uuidString
             let node = Node(id: id, kind: NodeKind.event.rawValue, label: title, body: title, layer: .daily,
                             createdAt: now, updatedAt: now, lastSeenAt: now, salience: 3, decayRate: 0,
@@ -179,12 +185,14 @@ extension MemoryStore {
         let trimmed = newTitle?.trimmingCharacters(in: .whitespaces)
         let effTitle = (trimmed?.isEmpty == false) ? trimmed! : node.label
         let interval = effectiveEditInterval(for: node, newStart: newStart, newEnd: newEnd)
+        let old = a
         a.startAt = interval.start
         a.endAt = interval.end
         if let allDay { a.allDay = allDay }
         if let location { a.location = location.isEmpty ? nil : location }
         a.canonicalKey = MemoryText.eventCanonicalKey(title: effTitle, startAt: a.startAt ?? 0)
         let now = Date().timeIntervalSince1970
+        if node.label != effTitle || old.startAt != a.startAt || old.endAt != a.endAt || old.allDay != a.allDay || old.location != a.location { a.contentUpdatedAt = now }
         node.label = effTitle; node.body = effTitle
         node.updatedAt = now; node.lastSeenAt = now
         node.extra = a.toJSON(); node.dirty = true

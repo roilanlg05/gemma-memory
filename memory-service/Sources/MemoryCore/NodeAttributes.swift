@@ -13,6 +13,11 @@ public struct NodeAttributes: Codable, Sendable {
     public var endAt: Double?        // epoch seconds (UTC)
     public var allDay: Bool?
     public var location: String?
+    public var appleEventId: String?
+    public var appleOccurrenceAt: Double?
+    public var source: String?
+    public var contentUpdatedAt: Double?
+    public var calendarSourceType: String? // birthday|subscription|other
     public var canonicalKey: String? // cached dedup key recomputed from title+startAt on each event upsert; not authoritative if title/startAt change independently
 
     public init(status: String? = nil, horizon: String? = nil, date: String? = nil,
@@ -25,8 +30,14 @@ public struct NodeAttributes: Codable, Sendable {
 
     public func toJSON() -> String? {
         guard status != nil || horizon != nil || date != nil || startAt != nil || endAt != nil
-            || allDay != nil || location != nil || canonicalKey != nil else { return nil }
+            || allDay != nil || location != nil || canonicalKey != nil || appleEventId != nil
+            || appleOccurrenceAt != nil || source != nil || contentUpdatedAt != nil || calendarSourceType != nil else { return nil }
         return (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) }
+    }
+    public static func settingStatus(_ status: String, in extra: String?) -> String? {
+        var object = extra.flatMap { $0.data(using: .utf8) }.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        object["status"] = status
+        return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
     }
     public static func from(_ extra: String?) -> NodeAttributes {
         guard let s = extra, let d = s.data(using: .utf8),

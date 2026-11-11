@@ -752,8 +752,14 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     func reflectTopicsPhase() async -> ConsolidationPhaseResult {
         var tally = PhaseTally(.reflect)
         let allNodes = (try? store.allNodes()) ?? []
+        func informationalCalendarEvent(_ node: Node) -> Bool {
+            guard node.kind == NodeKind.event.rawValue else { return false }
+            let attributes = NodeAttributes.from(node.extra)
+            return ["birthday", "subscription"].contains(attributes.calendarSourceType ?? "")
+        }
         let topics = allNodes.filter {
-            $0.kind == NodeKind.event.rawValue || $0.kind == NodeKind.plan.rawValue || $0.kind == NodeKind.topic.rawValue
+            ($0.kind == NodeKind.event.rawValue || $0.kind == NodeKind.plan.rawValue || $0.kind == NodeKind.topic.rawValue)
+                && !informationalCalendarEvent($0)
         }
         guard !topics.isEmpty else { return tally.result }
 
@@ -762,7 +768,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
         for topic in topics.prefix(15) {
             let edges = (try? store.edges(from: topic.id)) ?? []
-            let neighbors = edges.compactMap { try? store.node(id: $0.dstId) }
+            let neighbors = edges.compactMap { try? store.node(id: $0.dstId) }.filter { !informationalCalendarEvent($0) }
             let memberText = ([topic] + neighbors).map { "\($0.kind): \($0.label) (\($0.body))" }.joined(separator: "\n")
 
             let prompt = """

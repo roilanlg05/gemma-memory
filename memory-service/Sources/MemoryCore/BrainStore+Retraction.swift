@@ -536,11 +536,26 @@ extension BrainStore {
             for table in ["node", "node_fts", "node_embedding", "node_tags", "edge", "transcript",
                           "transcript_embedding", "brain_evidence", "brain_evidence_operations",
                           "brain_claim", "brain_commit", "brain_projection", "brain_legacy_binding", "brain_supersession_disposition",
-                          "sleep_cycle"] {
+                          "sleep_cycle", "task_observation", "prospective_state", "prospective_delivery"] {
                 try db.execute(sql: "DELETE FROM \(table)")
             }
         } else {
+            // A withdrawn status must not silently resurrect an older pending task.
+            for evidenceID in closure.evidenceIDs {
+                let affected = try String.fetchAll(db, sql: "SELECT DISTINCT task_id FROM task_observation WHERE evidence_id=? AND disposition='applied'", arguments: [evidenceID])
+                for taskID in affected {
+                    let latest = try String.fetchOne(db, sql: "SELECT evidence_id FROM task_observation WHERE task_id=? AND disposition='applied' ORDER BY observed_at DESC, rowid DESC LIMIT 1", arguments: [taskID])
+                    if latest == evidenceID, var node = try Node.fetchOne(db, key: taskID), !closure.nodeIDs.contains(taskID) {
+                        node.extra = NodeAttributes.settingStatus("unknown", in: node.extra); node.dirty = true; try node.update(db)
+                    }
+                }
+                try db.execute(sql: "DELETE FROM task_observation WHERE evidence_id=?", arguments: [evidenceID])
+                try db.execute(sql: "UPDATE prospective_state SET resolution_evidence=NULL WHERE resolution_evidence=?", arguments: [evidenceID])
+            }
             for id in closure.nodeIDs {
+                try db.execute(sql: "DELETE FROM task_observation WHERE task_id=?", arguments: [id])
+                try db.execute(sql: "DELETE FROM prospective_state WHERE candidate_id=?", arguments: [id])
+                try db.execute(sql: "DELETE FROM prospective_delivery WHERE candidate_id=?", arguments: [id])
                 try db.execute(sql: "DELETE FROM node WHERE id=?", arguments: [id])
                 try db.execute(sql: "DELETE FROM node_fts WHERE node_id=?", arguments: [id])
                 try db.execute(sql: "DELETE FROM node_embedding WHERE node_id=?", arguments: [id])

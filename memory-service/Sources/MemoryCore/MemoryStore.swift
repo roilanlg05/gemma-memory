@@ -413,7 +413,27 @@ public final class MemoryStore: @unchecked Sendable {
                 );
                 """)
         }
+        m.registerMigration("v23-prospective") { db in
+            try db.execute(sql: """
+                CREATE TABLE task_observation (principal TEXT NOT NULL, operation TEXT NOT NULL, task_id TEXT NOT NULL, source_id TEXT NOT NULL, source_version INTEGER NOT NULL, observed_at DOUBLE NOT NULL, status TEXT NOT NULL, evidence_id TEXT NOT NULL, attribution TEXT NOT NULL, disposition TEXT NOT NULL, PRIMARY KEY(principal, operation));
+                CREATE TABLE prospective_state (principal TEXT NOT NULL, candidate_id TEXT NOT NULL, deferred_until DOUBLE, resolution_evidence TEXT, PRIMARY KEY(principal, candidate_id));
+                CREATE TABLE prospective_delivery (principal TEXT NOT NULL, candidate_id TEXT NOT NULL, delivery_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(principal, candidate_id, delivery_id));
+                """)
+        }
         return m
+    }
+
+    // Only fields that can change a prospective proposal contribute to its revision.
+    struct ProspectiveSourceFingerprint: Encodable {
+        let id: String, kind: String, label: String, body: String, origin: Origin
+        let status: String?, date: String?, sourceRef: String?, expiresAt: Double?
+        let deleted: Bool
+    }
+    static func prospectiveFingerprint(_ node: Node?) -> String? {
+        guard let node, [NodeKind.task.rawValue, NodeKind.followUp.rawValue, NodeKind.clarification.rawValue].contains(node.kind) else { return nil }
+        let attrs = NodeAttributes.from(node.extra)
+        let value = ProspectiveSourceFingerprint(id: node.id, kind: node.kind, label: node.label, body: node.body, origin: node.origin, status: attrs.status, date: attrs.date, sourceRef: node.sourceRef, expiresAt: node.ttlExpiresAt, deleted: node.deleted)
+        return (try? BrainStore.encode(value)).map(BrainStore.digest)
     }
 
     // MARK: CRUD
@@ -424,7 +444,53 @@ public final class MemoryStore: @unchecked Sendable {
     /// stored without the receipt that says so — which is what makes a replay a no-op instead of a
     /// second reinforcement.
     public func upsert(_ node: Node, checkpoint: ConsolidationCheckpoint? = nil) throws {
-        try dbQueue.write { db in
+        let savedNode = try dbQueue.write { db in
+            var node = node
+            let previousNode = try Node.fetchOne(db, key: node.id)
+            if let previousNode, previousNode.kind == NodeKind.task.rawValue {
+                node.kind = previousNode.kind
+                if previousNode.deleted { node.deleted = true }
+            }
+            // Merge event attributes under the write lock: ordinary writers may omit bridge keys.
+            if node.kind == NodeKind.event.rawValue, let previous = try Node.fetchOne(db, key: node.id), previous.kind == node.kind {
+                func object(_ value: String?) -> [String: Any] {
+                    guard let value, let data = value.data(using: .utf8) else { return [:] }
+                    return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+                }
+                let old = object(previous.extra); let incoming = object(node.extra)
+                var merged = old
+                for key in ["status", "horizon", "date", "startAt", "endAt", "allDay", "location", "canonicalKey"] { merged.removeValue(forKey: key) }
+                for (key, value) in incoming { merged[key] = value }
+                // Existing bridge identity cannot be rolled back by a stale ordinary node copy.
+                for key in ["appleEventId", "appleOccurrenceAt", "source", "calendarSourceType"] {
+                    if let value = old[key] { merged[key] = value }
+                }
+                // A content stamp belongs to this transaction, not a caller's stale node copy.
+                let before = NodeAttributes.from(previous.extra); let after = NodeAttributes.from(node.extra)
+                let changed = previous.label != node.label || before.startAt != after.startAt || before.endAt != after.endAt || before.allDay != after.allDay || before.location != after.location
+                if changed { merged["contentUpdatedAt"] = Date().timeIntervalSince1970 }
+                else if let stamp = old["contentUpdatedAt"] { merged["contentUpdatedAt"] = stamp }
+                else { merged.removeValue(forKey: "contentUpdatedAt") }
+                node.extra = (try? JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
+            }
+            if node.kind == NodeKind.task.rawValue, let previous = try Node.fetchOne(db, key: node.id), previous.kind == node.kind {
+                func taskObject(_ value: String?) -> [String: Any] {
+                    guard let value, let data = value.data(using: .utf8) else { return [:] }
+                    return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+                }
+                let old = taskObject(previous.extra)
+                var merged = old
+                for (key, value) in taskObject(node.extra) where key != "status" { merged[key] = value }
+                if let status = old["status"] { merged["status"] = status } else { merged.removeValue(forKey: "status") }
+                node.extra = merged.isEmpty ? nil : (try? JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
+            }
+            if node.kind == NodeKind.event.rawValue, try Node.fetchOne(db, key: node.id) == nil {
+                var object = node.extra.flatMap { $0.data(using: .utf8) }.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                if object["contentUpdatedAt"] == nil {
+                    object["contentUpdatedAt"] = Date().timeIntervalSince1970
+                    node.extra = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
+                }
+            }
             let managed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_projection WHERE node_id=? UNION ALL SELECT 1 FROM brain_legacy_binding WHERE node_id=?)", arguments: [node.id, node.id]) ?? false
             guard !managed else { throw BrainStoreError.denied }
             // Retracted content stays retracted: a stale client or backup cannot write the same
@@ -434,6 +500,7 @@ public final class MemoryStore: @unchecked Sendable {
                                               fingerprint: BrainStore.nodeFingerprint(node))) else {
                 throw BrainStoreError.denied
             }
+            if Self.prospectiveFingerprint(previousNode) != Self.prospectiveFingerprint(node) { try BrainStore.advanceRevision(db) }
             try node.save(db)
             try db.execute(sql: "DELETE FROM node_fts WHERE node_id = ?", arguments: [node.id])
             if node.deleted {
@@ -448,11 +515,12 @@ public final class MemoryStore: @unchecked Sendable {
                                       refused: 0, unresolved: 0, stage: nil, retryable: false,
                                       at: checkpoint.at)
             }
+            return node
         }
         // Auto-link to kind hub so the graph stays navigable from a single anchor per kind.
         // Skips hub-kind nodes themselves and free-form kinds outside the NodeKind enum.
         // Failures are swallowed: a missing hub link is not worth aborting an upsert.
-        if !node.deleted { try? linkToHub(nodeId: node.id, kindRaw: node.kind) }
+        if !savedNode.deleted { try? linkToHub(nodeId: savedNode.id, kindRaw: savedNode.kind) }
     }
     public func upsert(_ edge: Edge) throws { try dbQueue.write { try edge.save($0) } }
     public func node(id: String) throws -> Node? { try dbQueue.read { try Node.fetchOne($0, key: id) } }
@@ -544,6 +612,10 @@ public final class MemoryStore: @unchecked Sendable {
 
     public func softDelete(nodeId: String) throws {
         try dbQueue.write { db in
+            if var node = try Node.fetchOne(db, key: nodeId), !node.deleted {
+                let before = Self.prospectiveFingerprint(node); node.deleted = true
+                if before != Self.prospectiveFingerprint(node) { try BrainStore.advanceRevision(db) }
+            }
             try db.execute(sql: "UPDATE brain_projection SET suppressed=1 WHERE node_id=?", arguments: [nodeId])
             try db.execute(sql: "UPDATE node SET deleted=1, dirty=1, updatedAt=? WHERE id=?",
                            arguments: [Date().timeIntervalSince1970, nodeId])
@@ -606,19 +678,36 @@ public final class MemoryStore: @unchecked Sendable {
     }
     /// Pending actionable + conversational follow-ups (task/plan/follow_up nodes whose
     /// NodeAttributes.status is "pending" or unset), most recent first, capped.
+    private func followUpVisible(_ node: Node, owner: String?, now: Double, db: Database) throws -> Bool {
+        guard let owner else { return true }
+        let row = try Row.fetchOne(db, sql: "SELECT deferred_until, resolution_evidence FROM prospective_state WHERE principal=? AND candidate_id=?", arguments: [owner, node.id])
+        if let until: Double = row?["deferred_until"], until > now { return false }
+        if let evidence: String = row?["resolution_evidence"], try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_evidence WHERE id=?)", arguments: [evidence]) == true { return false }
+        return true
+    }
     public func pendingFollowUps(limit: Int = 5) throws -> [Node] {
-        let kinds: Set<String> = [NodeKind.task.rawValue, NodeKind.plan.rawValue, NodeKind.followUp.rawValue]
-        return try allNodes()
-            .filter { kinds.contains($0.kind) && (NodeAttributes.from($0.extra).status ?? "pending") == "pending" }
-            .sorted { $0.lastSeenAt > $1.lastSeenAt }
-            .prefix(limit).map { $0 }
+        try dbQueue.read { db in
+            let owner = try String.fetchOne(db, sql: "SELECT owner FROM brain_meta WHERE id=1")
+            let kinds: Set<String> = [NodeKind.task.rawValue, NodeKind.plan.rawValue, NodeKind.followUp.rawValue]
+            let nodes = try Node.filter(Column("deleted") == false).fetchAll(db)
+            let now = Date().timeIntervalSince1970
+            return try nodes.filter { node in
+                guard kinds.contains(node.kind), (NodeAttributes.from(node.extra).status ?? "pending") == "pending" else { return false }
+                return try followUpVisible(node, owner: owner, now: now, db: db)
+            }.sorted { $0.lastSeenAt > $1.lastSeenAt }.prefix(limit).map { $0 }
+        }
     }
     public func pendingClarifications(limit: Int = 5) throws -> [Node] {
-        let rows: [Node] = try dbQueue.read { db in
-            try Node.filter(Column("kind") == NodeKind.clarification.rawValue && Column("deleted") == false)
-                .order(Column("createdAt").desc).limit(limit).fetchAll(db)
+        try dbQueue.read { db in
+            let owner = try String.fetchOne(db, sql: "SELECT owner FROM brain_meta WHERE id=1")
+            let rows = try Node.filter(Column("kind") == NodeKind.clarification.rawValue && Column("deleted") == false)
+                .order(Column("createdAt").desc).fetchAll(db)
+            let now = Date().timeIntervalSince1970
+            return try rows.filter { node in
+                guard NodeAttributes.from(node.extra).status != "done" else { return false }
+                return try followUpVisible(node, owner: owner, now: now, db: db)
+            }.prefix(limit).map { $0 }
         }
-        return rows.filter { NodeAttributes.from($0.extra).status != "done" }
     }
 
     /// Pending tasks/plans whose absolute date (extra.date, yyyy-MM-dd) is today or past.
@@ -626,7 +715,7 @@ public final class MemoryStore: @unchecked Sendable {
         let kinds: Set<String> = [NodeKind.task.rawValue, NodeKind.plan.rawValue]
         return try allNodes().filter {
             kinds.contains($0.kind)
-            && NodeAttributes.from($0.extra).status != "done"
+            && ["pending", "in-progress", "blocked"].contains(NodeAttributes.from($0.extra).status ?? "pending")
             && (NodeAttributes.from($0.extra).date.map { $0 <= today } ?? false)
         }
     }
@@ -635,8 +724,16 @@ public final class MemoryStore: @unchecked Sendable {
         try dbQueue.read { try String.fetchAll($0, sql: "SELECT DISTINCT kind FROM node WHERE deleted=0") }
     }
     public func reassignKind(from: String, to: String) throws {
-        try dbQueue.write { try $0.execute(sql: "UPDATE node SET kind=?, dirty=1, updatedAt=? WHERE kind=? AND deleted=0",
-                                           arguments: [to, Date().timeIntervalSince1970, from]) }
+        guard from != NodeKind.task.rawValue, from != to else { return }
+        try dbQueue.write { db in
+            let rows = try Node.filter(Column("kind") == from && Column("deleted") == false).fetchAll(db)
+            let affectsProspective = rows.contains { node in
+                var changed = node; changed.kind = to
+                return Self.prospectiveFingerprint(node) != Self.prospectiveFingerprint(changed)
+            }
+            if affectsProspective { try BrainStore.advanceRevision(db) }
+            try db.execute(sql: "UPDATE node SET kind=?, dirty=1, updatedAt=? WHERE kind=? AND deleted=0", arguments: [to, Date().timeIntervalSince1970, from])
+        }
     }
     /// Delete `conversation`/`episode` nodes and their FTS rows, embeddings, and dangling edges.
     /// Shared by `purgeConversationNodes()` and the `v5-purge-conversation-nodes` migration.
