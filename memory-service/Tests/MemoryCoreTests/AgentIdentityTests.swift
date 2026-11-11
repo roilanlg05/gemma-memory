@@ -30,7 +30,7 @@ final class AgentIdentityTests: XCTestCase {
         return (db, brain, AgentIdentityService(brain: brain))
     }
     @discardableResult func source(_ brain: BrainStore, _ id: String, kind: BrainSourceKind = .userMessage, scope: BrainAccessScope = .user, text: String = "Choose this character explicitly") throws -> BrainEvidence {
-        try brain.recordEvidence(.init(id: id, sourceKind: kind, speakerID: kind == .toolObservation ? "tool:web" : "self:user", threadID: "t", observedAt: 1, recordedAt: 1, accessScope: scope, text: text), idempotencyKey: id)
+        try brain.recordEvidence(.init(id: id, sourceKind: kind, speakerID: kind == .toolObservation ? "tool:web" : "self:user", threadID: "t", observedAt: 1, recordedAt: 1, accessScope: scope, text: kind == .toolObservation ? SafeToolObservation(result: .succeeded, httpStatus: 200).rendered : text), idempotencyKey: id)
     }
     func testRestartPreservesNameCharacterAndHistoryIndependentOfProvider() throws {
         let (db, brain, service) = try setup()

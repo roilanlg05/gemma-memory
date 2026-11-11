@@ -215,7 +215,7 @@ extension BrainStore {
             } else if let original = try conversationOriginal(target, db: db) {
                 evidence = original
             } else { throw BrainStoreError.invalid }
-            guard canRead(evidence), authorization.threads.contains(evidence.threadID) else { throw BrainStoreError.denied }
+            guard canAccess(evidence), authorization.threads.contains(evidence.threadID) else { throw BrainStoreError.denied }
         case .claim:
             guard let payload = try String.fetchOne(db, sql: "SELECT payload FROM brain_claim WHERE id=?", arguments: [target]) else {
                 throw BrainStoreError.invalid

@@ -75,4 +75,13 @@ public final class BrainTurnService {
         let description = try sanitizer.sanitizedDescription(outcome.description)
         return try journal.outcome(outcome, sanitizedDescription: description)
     }
+    /// Host ingestion path for tool outcomes: accepts no raw body, headers, or parameters.
+    /// The observation is a report, not independent verification or action authorization.
+    @discardableResult
+    public func recordToolOutcome(id: String, status: BrainOutcomeStatus, recordedAt: Double,
+                                  evidenceIDs: [String], observation: BrainToolObservation) throws -> BrainOutcome {
+        try recordOutcome(.init(id: id, description: "", status: status, recordedAt: recordedAt,
+                                evidenceIDs: evidenceIDs, observation: observation))
+    }
+
 }

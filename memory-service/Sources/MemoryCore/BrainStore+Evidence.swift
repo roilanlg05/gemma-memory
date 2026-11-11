@@ -45,6 +45,7 @@ extension BrainStore {
               !evidence.threadID.isEmpty, !evidence.speakerID.isEmpty,
               evidence.observedAt.isFinite, evidence.recordedAt.isFinite,
               let text = evidence.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw BrainStoreError.invalid }
+        guard evidence.sourceKind != .toolObservation || SafeToolObservation.admits(text) else { throw BrainStoreError.invalid }
         if let span = evidence.span {
             let bytes = Array(text.utf8)
             guard span.start >= 0, span.end > span.start, span.end <= bytes.count,

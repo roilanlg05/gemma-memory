@@ -168,7 +168,7 @@ public final class ConversationStateStore {
             guard brain.authorization.subjects.contains(claim.subject), claim.validFrom <= brain.clock(),
                   !claim.evidenceIDs.isEmpty else { continue }
             let evidence = claim.evidenceIDs.compactMap { evidenceByID[$0] }
-            guard evidence.count == claim.evidenceIDs.count, evidence.allSatisfy({ brain.canRead($0) }),
+            guard evidence.count == claim.evidenceIDs.count, (try? brain.availableEvidence(claim.evidenceIDs, db: db)) != nil, evidence.allSatisfy({ brain.canRead($0) }),
                   BrainStore.admitsPreference(claim, sources: evidence, threadID: threadID) else { continue }
             visible.append(claim)
         }

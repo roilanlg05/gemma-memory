@@ -73,7 +73,10 @@ public final class BrainStore {
         try requirePrincipal()
         guard authorization.subjects.contains(subject), authorization.scopes.contains(scope) else { throw BrainStoreError.denied }
     }
-    func canRead(_ evidence: BrainEvidence) -> Bool {
+    func canAccess(_ evidence: BrainEvidence) -> Bool {
         authorization.scopes.contains(evidence.accessScope) && (evidence.accessScope != .thread || authorization.threads.contains(evidence.threadID))
+    }
+    func canRead(_ evidence: BrainEvidence) -> Bool {
+        canAccess(evidence) && (evidence.sourceKind != .toolObservation || evidence.text.map(SafeToolObservation.admits) == true)
     }
 }

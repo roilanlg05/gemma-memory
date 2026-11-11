@@ -25,7 +25,7 @@ final class AdaptiveConversationTests: XCTestCase {
     @discardableResult func source(_ brain: BrainStore, _ id: String, _ text: String, _ time: Double = 1,
                                   thread: String = "t", kind: BrainSourceKind = .userMessage, scope: BrainAccessScope = .user) throws -> BrainEvidence {
         let speaker = kind == .assistantMessage ? "self:agent" : kind == .toolObservation ? "tool:search" : "self:user"
-        let e = BrainEvidence(id: id, sourceKind: kind, speakerID: speaker, threadID: thread, observedAt: time, recordedAt: time, accessScope: scope, text: text)
+        let e = BrainEvidence(id: id, sourceKind: kind, speakerID: speaker, threadID: thread, observedAt: time, recordedAt: time, accessScope: scope, text: kind == .toolObservation ? SafeToolObservation(result: .succeeded, httpStatus: 200).rendered : text)
         return try brain.recordEvidence(e, idempotencyKey: id)
     }
     func request(_ query: String = "sigue", tokens: Int = 12000, thread: String = "t") throws -> BrainContextRequest {

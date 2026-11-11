@@ -385,6 +385,34 @@ public final class MemoryStore: @unchecked Sendable {
                 );
                 """)
         }
+        m.registerMigration("v22-procedure-versions") { db in
+            try db.execute(sql: """
+                CREATE TABLE brain_procedure_version (
+                    principal TEXT NOT NULL, id TEXT NOT NULL, version INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY(principal, id, version)
+                );
+                CREATE TABLE brain_procedure_attestation (
+                    principal TEXT NOT NULL, id TEXT NOT NULL, version INTEGER NOT NULL,
+                    environment TEXT NOT NULL, validated_at DOUBLE NOT NULL,
+                    PRIMARY KEY(principal, id, version, environment)
+                );
+                CREATE TABLE brain_procedure_attestation_ref (
+                    principal TEXT NOT NULL, id TEXT NOT NULL, version INTEGER NOT NULL,
+                    environment TEXT NOT NULL, evidence_id TEXT NOT NULL,
+                    PRIMARY KEY(principal, id, version, environment, evidence_id)
+                );
+                CREATE TABLE brain_procedure_sequence (
+                    principal TEXT NOT NULL, id TEXT NOT NULL, last_version INTEGER NOT NULL,
+                    PRIMARY KEY(principal, id)
+                );
+                CREATE TABLE brain_procedure_ref (
+                    principal TEXT NOT NULL, id TEXT NOT NULL, version INTEGER NOT NULL,
+                    evidence_id TEXT NOT NULL,
+                    PRIMARY KEY(principal, id, version, evidence_id)
+                );
+                """)
+        }
         return m
     }
 

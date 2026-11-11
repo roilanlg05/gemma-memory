@@ -163,7 +163,7 @@ final class BrainTurnStore {
         guard outcome.recordedAt.isFinite else { throw BrainStoreError.invalid }
         let digest = BrainStore.digest(try BrainStore.encode(outcome))
         let saved = BrainOutcome(id: outcome.id, description: sanitizedDescription, status: outcome.status,
-                                 recordedAt: outcome.recordedAt, evidenceIDs: outcome.evidenceIDs)
+                                 recordedAt: outcome.recordedAt, evidenceIDs: outcome.evidenceIDs, observation: outcome.observation)
         return try brain.store.dbQueue.write { db in
             try brain.checkOwner(db, bind: true)
             // Withdrawn operations remain denied even after their sources have been purged.
@@ -216,6 +216,25 @@ extension BrainStore {
             try db.execute(sql: "UPDATE brain_turn_operation SET withdrawn=1, request_hash=NULL, turn_id=NULL, result_id=NULL WHERE turn_id=?", arguments: [id])
             for table in ["brain_turn_ref", "brain_turn_claim"] { try db.execute(sql: "DELETE FROM \(table) WHERE turn_id=?", arguments: [id]) }
             try db.execute(sql: "DELETE FROM brain_turn WHERE id=?", arguments: [id])
+        }
+        for row in try Row.fetchAll(db, sql: "SELECT principal, id, version FROM brain_procedure_version") {
+            let principal: String = row["principal"], id: String = row["id"]
+            let version: Int = row["version"]
+            let refs = Set(try String.fetchAll(db, sql: "SELECT evidence_id FROM brain_procedure_ref WHERE principal=? AND id=? AND version=?", arguments: [principal, id, version]))
+            if closure.purgeEverything || !refs.isDisjoint(with: closure.evidenceIDs) {
+                try db.execute(sql: "DELETE FROM brain_procedure_attestation_ref WHERE principal=? AND id=? AND version=?", arguments: [principal, id, version])
+                try db.execute(sql: "DELETE FROM brain_procedure_attestation WHERE principal=? AND id=? AND version=?", arguments: [principal, id, version])
+                try db.execute(sql: "DELETE FROM brain_procedure_ref WHERE principal=? AND id=? AND version=?", arguments: [principal, id, version])
+                try db.execute(sql: "DELETE FROM brain_procedure_version WHERE principal=? AND id=? AND version=?", arguments: [principal, id, version])
+                continue
+            }
+            for approval in try Row.fetchAll(db, sql: "SELECT environment FROM brain_procedure_attestation WHERE principal=? AND id=? AND version=?", arguments: [principal, id, version]) {
+                let environment: String = approval["environment"]
+                let proof = Set(try String.fetchAll(db, sql: "SELECT evidence_id FROM brain_procedure_attestation_ref WHERE principal=? AND id=? AND version=? AND environment=?", arguments: [principal, id, version, environment]))
+                guard !proof.isDisjoint(with: closure.evidenceIDs) else { continue }
+                try db.execute(sql: "DELETE FROM brain_procedure_attestation_ref WHERE principal=? AND id=? AND version=? AND environment=?", arguments: [principal, id, version, environment])
+                try db.execute(sql: "DELETE FROM brain_procedure_attestation WHERE principal=? AND id=? AND version=? AND environment=?", arguments: [principal, id, version, environment])
+            }
         }
         for row in try Row.fetchAll(db, sql: "SELECT principal, operation_hash FROM brain_turn_outcome") {
             let principal: String = row["principal"], key: String = row["operation_hash"]

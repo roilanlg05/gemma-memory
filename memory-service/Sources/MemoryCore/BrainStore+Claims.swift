@@ -3,14 +3,36 @@ import GRDB
 import BrainContract
 
 extension BrainStore {
-    func availableEvidence(_ ids: [String], db: Database) throws -> [BrainEvidence] {
-        guard !ids.isEmpty, Set(ids).count == ids.count else { throw BrainStoreError.invalid }
-        return try ids.map { id in
+    /// Strict proof reads bound every ancestor. Generic reads retain legacy depth and fan-out,
+    /// while screening unsafe content and cycles; completed nodes are memoized. Erasure uses its
+    /// separate raw traversal so legacy unsafe observations can still be forgotten.
+    func availableEvidence(_ ids: [String], asOf: Double? = nil, db: Database) throws -> [BrainEvidence] {
+        guard !ids.isEmpty, Set(ids).count == ids.count, asOf?.isFinite ?? true else { throw BrainStoreError.invalid }
+        var visited = Set<String>()
+        var checked = Set<String>()
+        var steps = 0
+        func check(_ id: String, path: Set<String>, scope: BrainAccessScope?, thread: String?) throws -> BrainEvidence {
+            steps += 1
+            guard !path.contains(id), asOf == nil || (steps <= 512 && path.count < 16) else { throw BrainStoreError.invalid }
+            visited.insert(id)
+            guard asOf == nil || visited.count <= 128 else { throw BrainStoreError.invalid }
             let evidence = try loadEvidence(id, db: db)
-            guard canRead(evidence) else { throw BrainStoreError.denied }
-            guard !(try roots(of: evidence, db: db)).isEmpty else { throw BrainStoreError.invalid }
+            guard canRead(evidence),
+                  (asOf == nil || (authorization.threads.contains(evidence.threadID) && authorization.sourceSpeakers[evidence.sourceKind]?.contains(evidence.speakerID) == true)),
+                  scope.map({ $0 == evidence.accessScope }) ?? true,
+                  thread.map({ evidence.accessScope != .thread || $0 == evidence.threadID }) ?? true,
+                  asOf.map({ evidence.observedAt <= $0 && evidence.recordedAt <= $0 }) ?? true,
+                  evidence.observedAt.isFinite, evidence.recordedAt.isFinite,
+                  evidence.text?.isEmpty == false else { throw BrainStoreError.denied }
+            if asOf == nil && checked.contains(id) { return evidence }
+            let parents = evidence.parentEvidenceIDs ?? []
+            guard (asOf == nil || parents.count <= 32), Set(parents).count == parents.count,
+                  (evidence.sourceKind == .derived) == !parents.isEmpty else { throw BrainStoreError.invalid }
+            for parent in parents { _ = try check(parent, path: path.union([id]), scope: evidence.accessScope, thread: evidence.threadID) }
+            if asOf == nil { checked.insert(id) }
             return evidence
         }
+        return try ids.map { try check($0, path: [], scope: nil, thread: nil) }
     }
     public func commit(_ request: BrainCommitRequest) throws -> BrainCommitResult {
         try commit(request, transactionGuard: { _ in }, didCommit: { _, _ in })
@@ -163,7 +185,7 @@ extension BrainStore {
         for payload in payloads {
             let claim = try Self.decode(BrainClaim.self, payload)
             let sources = try claim.evidenceIDs.map { try loadEvidence($0, db: db) }
-            guard sources.allSatisfy({ $0.accessScope == scope && canRead($0) }), claim.validFrom <= asOf,
+            guard (try? availableEvidence(claim.evidenceIDs, db: db)) != nil, sources.allSatisfy({ $0.accessScope == scope && canRead($0) }), claim.validFrom <= asOf,
                   Self.admitsPreference(claim, sources: sources, threadID: threadID) else { continue }
             visible.append(claim)
         }

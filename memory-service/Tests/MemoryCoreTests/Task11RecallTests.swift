@@ -17,7 +17,7 @@ final class Task11RecallTests: XCTestCase {
                kind: BrainSourceKind = .userMessage) throws {
         let source = BrainEvidence(id: "source-" + id, sourceKind: kind,
             speakerID: kind == .toolObservation ? "tool:fixture" : "self:user",
-            threadID: thread, observedAt: time, recordedAt: time, accessScope: scope, text: text)
+            threadID: thread, observedAt: time, recordedAt: time, accessScope: scope, text: kind == .toolObservation ? SafeToolObservation(result: .succeeded, httpStatus: 200).rendered : text)
         let claim = BrainClaim(id: id, revision: 0, subject: subject, predicate: predicate, value: .string(value),
             modality: modality, status: .active, validFrom: time, validTo: validTo, recordedAt: time,
             evidenceIDs: [source.id], supersedesID: supersedes)
