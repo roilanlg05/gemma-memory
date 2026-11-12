@@ -60,6 +60,7 @@ public final class Services: @unchecked Sendable {
     public let scheduler: ConsolidationScheduler
     public let modelConfig: ModelConfigStore
     public let connectionServices: ConnectionServicesStore
+    let brain: BrainServices
     /// Tool-calling client used by the agentic gateway (`POST /v1/agent/turn`).
     public let agentClient: any AgentModelClient
 
@@ -86,6 +87,10 @@ public final class Services: @unchecked Sendable {
                                             defaultBaseURL: URL(string: config.modelURL)!.appendingPathComponent("v1"),
                                             defaultModel: config.modelName)
         self.modelClient = modelClient
+        let interactiveMemoryModel = RemoteModelClient(configStore: modelConfig,
+            defaultBaseURL: URL(string: config.modelURL)!.appendingPathComponent("v1"),
+            defaultModel: config.modelName, timeout: 2)
+        self.brain = BrainServices(store: store, transcript: transcript, embedder: embedder, modelClient: interactiveMemoryModel)
         let engine = MemoryConsolidationEngine(store: store, embedder: embedder,
                                                runtime: modelClient, transcriptStore: transcript)
         self.engine = engine
@@ -115,6 +120,7 @@ public final class Services: @unchecked Sendable {
         self.store = store
         self.transcript = transcript
         self.embedder = embedder
+        self.brain = BrainServices(store: store, transcript: transcript, embedder: embedder, modelClient: modelClient)
         self.retriever = MemoryRetriever(store: store, embedder: embedder)
         self.bearerToken = bearerToken
         self.modelClient = modelClient

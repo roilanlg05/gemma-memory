@@ -5,7 +5,7 @@ import NIOCore
 import MemoryCore
 
 /// `POST /v1/agent/turn` — runs one agentic turn (recall → model → tool execution → reply),
-/// appends both the user and assistant turns to the transcript, then arms consolidation.
+/// using the same admitted-turn lifecycle as direct callers.
 struct AgentHandlers {
     let services: Services
 
@@ -23,6 +23,7 @@ struct AgentHandlers {
         /// this turn. Optional — typed callers omit it; the voice gateway forwards the STT language.
         let language: String?
         let isPassive: Bool?
+        let clientOperationID: String?
     }
 
     @Sendable func turn(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
@@ -32,48 +33,25 @@ struct AgentHandlers {
         catch { return jsonError(.badRequest, "bad_request", "body unreadable") }
 
         guard let body = try? JSONDecoder().decode(TurnBody.self, from: Data(buf.readableBytesView)),
-              !body.text.trimmingCharacters(in: .whitespaces).isEmpty else {
+              !body.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return jsonError(.badRequest, "bad_request", "text required")
         }
 
         // A caller that omits threadId pools into one shared "gateway" transcript — fine for Phase 1a
         // (thin-device callers are expected to pass a stable id; episode-boundary logic is the caller's).
         let threadId = body.threadId ?? "gateway"
-
-        // Run the agentic loop (recall → model → tool calls → final reply).
-        let reply = await AgentLoop(client: services.agentClient).run(
-            text: body.text, threadId: threadId, services: services, language: body.language,
-            isPassive: body.isPassive ?? false
-        )
-
-        // Persist the turn to the transcript: user first, then assistant.
-        // `seq` is server-authoritative (assigned inside append, ignoring the client turnIndex).
-        // Best-effort: a persistence hiccup shouldn't fail the user's reply, but we log it for ops.
-        let now = Date().timeIntervalSince1970
-        // Don't persist failure placeholders (model-unreachable / incomplete) as assistant turns —
-        // they'd pollute future recall + consolidation. The user turn is still recorded.
-        // For passive turns: only persist if there was an actual intervention reply — pure
-        // ambient noise / IGNORE turns must NOT pollute the transcript at all.
-        let isPassiveTurn = body.isPassive ?? false
-        let passiveHasValue = isPassiveTurn && !reply.isEmpty && !AgentLoop.fallbackReplies.contains(reply)
-        let persistAssistant = !reply.isEmpty && !AgentLoop.fallbackReplies.contains(reply)
-        let persistUser = !isPassiveTurn || passiveHasValue  // skip ambient noise user turns
-        do {
-            if persistUser {
-                _ = try services.transcript.append(threadId: threadId, turnIndex: 0,
-                                                   role: "user", text: body.text, now: now)
-            }
-            if persistAssistant && persistUser {
-                _ = try services.transcript.append(threadId: threadId, turnIndex: 0,
-                                                   role: "assistant", text: reply, now: now + 0.001)
-            }
-        } catch {
-            ctx.logger.warning("agent/turn transcript append failed: \(error)")
+        guard BrainHandlers.validID(threadId), body.clientOperationID.map(BrainHandlers.validID) ?? true else {
+            return jsonError(.badRequest, "bad_request", "invalid thread or operation id")
         }
-
-        // Arm consolidation: same path/args as POST /v1/consolidation/turn-end (incl. timezone).
-        let tz = body.timezone.flatMap { TimeZone(identifier: $0) } ?? .current
-        await services.scheduler.armTurnEnd(threadId: threadId, timeZone: tz)
+        let reply: String
+        do {
+            reply = try await AgentLoop(client: services.agentClient).runAdmitted(text: body.text, threadID: threadId,
+                services: services, language: body.language, isPassive: body.isPassive ?? false,
+                timezone: body.timezone.flatMap(TimeZone.init(identifier:)) ?? .current,
+                operationID: body.clientOperationID)
+        } catch {
+            return BrainHandlers.failure(error)
+        }
 
         struct Out: Encodable { let reply: String }
         let data = try JSONEncoder().encode(Out(reply: reply))

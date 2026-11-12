@@ -1,5 +1,25 @@
 import Foundation
+import BrainContract
 import MemoryCore
+
+enum GatewayToolContext {
+    @TaskLocal static var timeZone: TimeZone = .current
+    @TaskLocal static var threadID: String? = nil
+    @TaskLocal static var turnID: String? = nil
+}
+
+private func exactMemoryTarget(_ text: String, prefixes: [String]) -> String? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let prefix = prefixes.first(where: trimmed.lowercased().hasPrefix) else { return nil }
+    let target = trimmed.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
+        .trimmingCharacters(in: CharacterSet(charactersIn: ".!"))
+    guard !target.isEmpty, target.utf8.count <= 512, !target.contains("\n") else { return nil }
+    return target
+}
+
+private func sameMemoryTarget(_ lhs: String, _ rhs: String) -> Bool {
+    lhs.compare(rhs, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+}
 
 // MARK: - ISO→epoch helper (mirrors app's ScheduleTime.epoch(fromISO:))
 
@@ -10,9 +30,7 @@ private func isoToEpoch(_ s: String) -> Double? {
     let t = s.trimmingCharacters(in: .whitespaces)
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
-    // `.current` = the container's TZ (set to America/Havana in compose). Per-request timezone
-    // threading is a deferred follow-up for multi-zone clients; today it must match nowContext's zone.
-    f.timeZone = .current
+    f.timeZone = GatewayToolContext.timeZone
     for fmt in ["yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd HH:mm", "yyyy-MM-dd'T'HH:mm:ss"] {
         f.dateFormat = fmt
         if let d = f.date(from: t) { return d.timeIntervalSince1970 }
@@ -26,21 +44,23 @@ private func isoToEpochEnd(_ s: String) -> Double? {
     let t = s.trimmingCharacters(in: .whitespaces)
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
-    f.timeZone = .current
+    f.timeZone = GatewayToolContext.timeZone
     for fmt in ["yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd HH:mm", "yyyy-MM-dd'T'HH:mm:ss"] {
         f.dateFormat = fmt
         if let d = f.date(from: t) { return d.timeIntervalSince1970 }
     }
     f.dateFormat = "yyyy-MM-dd"
     guard let d = f.date(from: t) else { return nil }
-    return d.timeIntervalSince1970 + 86399
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = GatewayToolContext.timeZone
+    return calendar.date(byAdding: .day, value: 1, to: d).map { $0.timeIntervalSince1970 - 1 }
 }
 
 /// Human-readable epoch → "EEE yyyy-MM-dd HH:mm" in local time.
 private func epochToHuman(_ e: Double) -> String {
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
-    f.timeZone = .current
+    f.timeZone = GatewayToolContext.timeZone
     f.dateFormat = "EEE yyyy-MM-dd HH:mm"
     return f.string(from: Date(timeIntervalSince1970: e))
 }
@@ -72,7 +92,7 @@ public struct CurrentTimeGatewayTool: GatewayTool {
     public func run(argsJSON: String, services: Services) async -> String {
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.timeZone = .current
+        fmt.timeZone = GatewayToolContext.timeZone
         fmt.dateFormat = "yyyy-MM-dd (EEEE) HH:mm"
         return "Current local date and time: \(fmt.string(from: Date()))."
     }
@@ -114,6 +134,25 @@ public struct SaveMemoryGatewayTool: GatewayTool {
         let kind = kindRaw.isEmpty ? "fact" : kindRaw
         let body = detail.flatMap { $0.isEmpty ? nil : $0 } ?? rawEntity
         let extra: String? = permanent ? #"{"permanent":true}"# : nil
+
+        if let thread = GatewayToolContext.threadID, let turn = GatewayToolContext.turnID {
+            guard kind != "self", !BrainIdentity.reservedSubjects.contains(rawEntity) else {
+                return "A user's name is learned from their own direct introduction. No name was saved by this tool."
+            }
+            do {
+                let source = try services.brain.turnService(threadID: thread).admittedUserEvidence(turnID: turn)
+                guard let text = source.text,
+                      let exact = exactMemoryTarget(text, prefixes: ["recuerda que ", "recuerda ", "remember that ", "remember "]),
+                      sameMemoryTarget(exact, body) else { return "No exact user request to save this fact was found." }
+                let brain = BrainStore(store: services.store, authorization: services.brain.grant(threadID: thread, write: true))
+                let claim = BrainClaim(id: UUID().uuidString, revision: 0, subject: BrainIdentity.userID, predicate: "fact.note",
+                    value: .string(exact), modality: .asserted, status: .active, validFrom: source.observedAt,
+                    recordedAt: source.recordedAt, evidenceIDs: [source.id])
+                let result = try brain.commit(.init(clientOperationID: UUID().uuidString, evidence: [], updates: [.init(claim: claim)],
+                                                    expectedRevision: brain.revision()))
+                return result.state == .committed ? "Saved: \(exact)" : "The memory was not saved because its revision changed."
+            } catch { return "The memory was not saved." }
+        }
 
         // Route: kind=="self" → upsertSelf (singleton); else → upsertMergingSemantic.
         if kind == "self" {
@@ -165,6 +204,28 @@ public struct ForgetGatewayTool: GatewayTool {
         let obj = Self.args(argsJSON)
         let query = ((obj["query"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return "nothing to forget" }
+        if let thread = GatewayToolContext.threadID, let turn = GatewayToolContext.turnID {
+            do {
+                let source = try services.brain.turnService(threadID: thread).admittedUserEvidence(turnID: turn)
+                guard let text = source.text,
+                      let exact = exactMemoryTarget(text, prefixes: ["olvida ", "borra de tu memoria ", "forget ", "remove from memory "]),
+                      sameMemoryTarget(exact, query) else { return "No exact user request to forget this memory was found." }
+                let brain = BrainStore(store: services.store, authorization: services.brain.grant(threadID: thread, forget: true))
+                let revision = try brain.revision()
+                let claims = try brain.claims(subject: BrainIdentity.userID, asOf: Date().timeIntervalSince1970, scope: .user,
+                                              knownAtRevision: revision)
+                let matches = claims.filter { claim in
+                    guard case .string(let value) = claim.value else { return false }
+                    return sameMemoryTarget(value, exact)
+                }
+                guard matches.count == 1, let claim = matches.first else {
+                    return "No single source-bound memory matched this request. Nothing was removed."
+                }
+                _ = try brain.ownerErasure().forget(scope: .init(kind: .claim, id: claim.id), expectedRevision: revision,
+                                                     operationID: "gateway-forget:" + turn + ":" + claim.id)
+                return "Forgot the selected memory."
+            } catch { return "The memory was not removed." }
+        }
         do {
             let removed = try services.store.forgetByLabel(query)
             return "Forgot \(removed) item(s)."
@@ -197,28 +258,37 @@ public struct LoadMessagesGatewayTool: GatewayTool {
     public func run(argsJSON: String, services: Services) async -> String {
         let obj = Self.args(argsJSON)
         let chatId = ((obj["chat_id"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let from = (obj["from"] as? Int)
-            ?? (obj["from"] as? Double).map(Int.init)
-            ?? (obj["from"] as? String).flatMap { Int($0) }
-            ?? 0
-        let to = (obj["to"] as? Int)
-            ?? (obj["to"] as? Double).map(Int.init)
-            ?? (obj["to"] as? String).flatMap { Int($0) }
-        guard !chatId.isEmpty, from > 0 else { return "need chat_id and from" }
+        func sequence(_ key: String) -> Int? {
+            (obj[key] as? Int) ?? (obj[key] as? Double).flatMap(Int.init(exactly:))
+                ?? (obj[key] as? String).flatMap(Int.init)
+        }
+        guard !chatId.isEmpty, let from = sequence("from"), from > 0, from <= Int.max - 79,
+              obj["to"] == nil || sequence("to") != nil else { return "need valid chat_id and message sequence" }
+        let to = sequence("to")
+        if let current = GatewayToolContext.threadID, chatId != current {
+            return "No authorized originals in the requested thread."
+        }
         // Cap the DB query at 80 rows (mirrors /v1/transcript/range so the gateway can't issue an
         // unbounded fetch when the model passes a large `to`).
         let toRaw = to ?? from
+        guard toRaw >= from else { return "need a nondecreasing message range" }
         let cappedTo = min(toRaw, from + 79)
         let truncated = toRaw > cappedTo
         do {
-            let rows = try services.transcript.range(threadId: chatId, from: from, to: cappedTo)
+            var rows = try services.transcript.range(threadId: chatId, from: from, to: cappedTo)
+            if GatewayToolContext.threadID != nil {
+                let brain = BrainStore(store: services.store, authorization: services.brain.grant(threadID: chatId))
+                let originalRows = Set(try ConversationStateStore(brain: brain).snapshot(threadID: chatId).sources.compactMap(\.transcriptID))
+                rows = rows.filter { originalRows.contains($0.id) }
+            }
             guard !rows.isEmpty else {
                 return "no messages found for chat \(chatId) range \(from)-\(cappedTo)"
             }
             let lines = rows.map { "\($0.role == "assistant" ? "Gemma" : "User"): \($0.text)" }
             let body = lines.joined(separator: "\n")
-            let result = truncated ? body + "\n…(truncated — narrow the range for more)" : body
-            return String(result.prefix(4000))
+            let marker = "\n…(partial transcript — narrow the range for more)"
+            if truncated || body.count > 4000 { return String(body.prefix(4000 - marker.count)) + marker }
+            return body
         } catch { return "no messages found for chat \(chatId)" }
     }
 }
@@ -232,7 +302,10 @@ public struct ListTopicsGatewayTool: GatewayTool {
     public init() {}
 
     public func run(argsJSON: String, services: Services) async -> String {
-        let tags = (try? services.store.distinctTags()) ?? []
+        let tags: [String]
+        if let thread = GatewayToolContext.threadID {
+            tags = (try? services.retriever.gatewayLegacyTopics(threadID: thread)) ?? []
+        } else { tags = (try? services.store.distinctTags()) ?? [] }
         guard !tags.isEmpty else { return "no topics yet" }
         return String(("Topics: " + tags.joined(separator: ", ")).prefix(2000))
     }
@@ -256,6 +329,15 @@ public struct RecallByTopicGatewayTool: GatewayTool {
     public func run(argsJSON: String, services: Services) async -> String {
         let topic = ((Self.args(argsJSON)["topic"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !topic.isEmpty else { return "need a topic" }
+        if let thread = GatewayToolContext.threadID {
+            guard let tags = try? services.retriever.gatewayLegacyTopics(threadID: thread),
+                  let tag = tags.first(where: { $0.caseInsensitiveCompare(topic) == .orderedSame }),
+                  let ids = try? services.store.nodesWithTag(tag),
+                  let nodes = try? services.retriever.gatewayLegacyNodes(ids: Array(ids.prefix(100)), threadID: thread),
+                  !nodes.isEmpty else { return "No authorized legacy notes matched that topic." }
+            let notes = nodes.map { "- [\($0.kind)] \($0.label): \($0.body.isEmpty ? $0.label : $0.body)" }
+            return String(("Unverified legacy notes about \(tag) (context only):\n" + notes.joined(separator: "\n")).prefix(4000))
+        }
         // Resolve the canonical tag first so we can echo it ("About <tag>:") like the app — this
         // grounds the model when the resolved tag differs from what it asked (e.g. "finanzas"→"finance").
         guard let tag = MemoryQueries.resolveTag(topic, store: services.store, embedder: services.embedder) else {
@@ -287,6 +369,10 @@ public struct WhyGatewayTool: GatewayTool {
     public func run(argsJSON: String, services: Services) async -> String {
         let claim = ((Self.args(argsJSON)["claim"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !claim.isEmpty else { return "need a claim" }
+        if let thread = GatewayToolContext.threadID {
+            let matches = (try? services.retriever.gatewayLegacyContext(query: claim, threadID: thread)) ?? ""
+            return matches.isEmpty ? "No verified provenance for that claim in the current context." : matches
+        }
         let result = MemoryQueries.why(claim, store: services.store, embedder: services.embedder)
         guard let ins = result.insight else { return "I can't trace that to a specific memory" }
         guard !result.sources.isEmpty else { return "I believe \"\(ins.body)\" but have no recorded sources" }

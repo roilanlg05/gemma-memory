@@ -81,7 +81,7 @@ public struct BrainContextBundle: Codable, Equatable, Sendable {
     public func exactCitationSourceReferences(includingRenderedContext: Bool,
                                               forwardedRecentUnitIDs: Set<String>) -> [BrainEvidence] {
         sourceReferences.filter { source in
-            guard let uses = sourceUses?[source.id] else { return false }
+            guard source.sourceKind != .toolObservation, let uses = sourceUses?[source.id] else { return false }
             let rendered = includingRenderedContext && (uses.contains(.renderedQuote) || uses.contains(.renderedDetail))
             let recent = forwardedRecentUnitIDs.contains(source.id) && uses.contains(.recentWhole)
             return rendered || recent

@@ -57,6 +57,49 @@ final class BrainTurnStore {
     func read(_ id: String) throws -> BrainTurnRecord {
         try brain.store.dbQueue.read { try load(id, db: $0) }
     }
+    func owningThread(turnID: String, nativeOnly: Bool) throws -> String {
+        guard brain.authorization.principal == brain.authorization.owner,
+              brain.authorization.owner == ConsolidationEvidenceAdapter.ownerID else { throw BrainStoreError.denied }
+        try brain.requireAccess(subject: BrainIdentity.userID, scope: .user)
+        return try brain.store.dbQueue.read { db in
+            try brain.checkOwner(db, bind: false)
+            guard let thread = try String.fetchOne(db, sql: "SELECT thread_id FROM brain_turn WHERE id=? AND principal=?",
+                arguments: [turnID, brain.authorization.principal]) else { throw BrainStoreError.denied }
+            if nativeOnly, try operation("gateway-admission", key: Self.key(turnID), db: db) != nil {
+                throw BrainStoreError.denied
+            }
+            return thread
+        }
+    }
+    func validatedName(turnID: String, candidate: String) throws -> Bool {
+        try brain.store.dbQueue.read { db in
+            let turn = try load(turnID, db: db)
+            guard let row = try TranscriptRow.fetchOne(db, key: turn.transcriptID) else { return false }
+            if case .success(let support) = SelfAssertionValidator.validate(label: candidate, sources: [row],
+                permittedScopes: brain.authorization.scopes, evidenceScope: turn.source.accessScope) {
+                return support.evidenceID == turn.source.id
+            }
+            return false
+        }
+    }
+
+    func requireNoMutationAttempt(turnID: String) throws {
+        let key = try Self.key(turnID)
+        try brain.store.dbQueue.read { db in
+            _ = try load(turnID, db: db)
+            guard try operation("gateway-mutation", key: key, db: db) == nil else { throw BrainStoreError.conflict }
+        }
+    }
+
+    func reserveMutationAttempt(turnID: String) throws {
+        let key = try Self.key(turnID)
+        try brain.store.dbQueue.write { db in
+            _ = try load(turnID, db: db)
+            guard brain.authorization.principal == brain.authorization.owner, brain.authorization.mayCommitClaims else { throw BrainStoreError.denied }
+            guard try operation("gateway-mutation", key: key, db: db) == nil else { throw BrainStoreError.conflict }
+            try insertOperation("gateway-mutation", key: key, digest: key, turnID: turnID, resultID: nil, db: db)
+        }
+    }
     static func append(thread: String, role: String, text: String, timestamp: Double, turnIndex: Int? = nil, db: Database) throws -> TranscriptRow {
         try db.execute(sql: "INSERT INTO transcript_sequence(threadId, lastSeq) VALUES (?, 1) ON CONFLICT(threadId) DO UPDATE SET lastSeq=lastSeq+1", arguments: [thread])
         guard let seq = try Int.fetchOne(db, sql: "SELECT lastSeq FROM transcript_sequence WHERE threadId=?", arguments: [thread]), seq > 0 else { throw BrainStoreError.invalid }
@@ -65,22 +108,41 @@ final class BrainTurnStore {
         try row.insert(db)
         return row
     }
-    func capture(_ request: BrainTurnRequest) throws -> String {
+    private struct GatewayFingerprint: Encodable {
+        let threadID: String
+        let text: String
+        let metadata: BrainGatewayAdmission
+    }
+
+    func capture(_ request: BrainTurnRequest, observedAt: Double? = nil, gateway: BrainGatewayAdmission? = nil) throws -> String {
+        try captureAdmitted(request, observedAt: observedAt, gateway: gateway).id
+    }
+
+    func captureAdmitted(_ request: BrainTurnRequest, observedAt: Double?, gateway: BrainGatewayAdmission?) throws -> (id: String, new: Bool) {
         try requireUser(thread: request.threadID)
         guard request.message.speakerID == "self:user" else { throw BrainStoreError.denied }
         guard request.schemaVersion == 1, !request.message.id.isEmpty, request.message.observedAt.isFinite,
               !request.message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw BrainStoreError.invalid }
         let key = try Self.key(request.clientOperationID)
         // Wire evidence IDs never grant access, but are included in the conflict fingerprint.
-        let digest = BrainStore.digest(try BrainStore.encode(request))
+        let encoded: String
+        if let gateway {
+            // Context budgeting and tool definitions can evolve between identical operation retries.
+            encoded = try BrainStore.encode(GatewayFingerprint(threadID: request.threadID, text: request.message.text, metadata: gateway))
+        } else { encoded = try BrainStore.encode(request) }
+        let digest = BrainStore.digest(encoded)
         return try brain.store.dbQueue.write { db in
             try brain.checkOwner(db, bind: true)
             if let old = try operation("begin", key: key, db: db) {
                 guard (old["request_hash"] as String?) == digest, let id: String = old["turn_id"] else { throw BrainStoreError.conflict }
+                guard (try operation("gateway-admission", key: Self.key(id), db: db) != nil) == (gateway != nil) else {
+                    throw BrainStoreError.conflict
+                }
                 _ = try load(id, db: db)
-                return id
+                return (id, false)
             }
-            let row = try Self.append(thread: request.threadID, role: "user", text: request.message.text, timestamp: request.message.observedAt, db: db)
+            let row = try Self.append(thread: request.threadID, role: "user", text: request.message.text,
+                                      timestamp: observedAt ?? request.message.observedAt, db: db)
             guard let evidence = ConsolidationEvidenceAdapter.evidence(for: row) else { throw BrainStoreError.invalid }
             try brain.insertEvidence(evidence, db: db)
             let id = UUID().uuidString
@@ -88,7 +150,11 @@ final class BrainTurnStore {
                            arguments: [id, brain.authorization.principal, request.threadID, evidence.id, row.id])
             try db.execute(sql: "INSERT INTO brain_turn_ref VALUES (?, ?, ?)", arguments: [id, evidence.id, row.id])
             try insertOperation("begin", key: key, digest: digest, turnID: id, resultID: nil, db: db)
-            return id
+            if gateway != nil {
+                let marker = try Self.key(id)
+                try insertOperation("gateway-admission", key: marker, digest: marker, turnID: id, resultID: nil, db: db)
+            }
+            return (id, true)
         }
     }
     func stage(_ batch: BrainTurnExtractionBatch, turnID: String) throws -> [BrainClaimUpdate] {
@@ -107,12 +173,13 @@ final class BrainTurnStore {
             return batch.updates
         }
     }
-    func commit(_ updates: [BrainClaimUpdate], turnID: String) throws -> BrainCommitResult {
-        for _ in 0..<3 {
+    func commit(_ updates: [BrainClaimUpdate], turnID: String, expectedRevision: Int64? = nil) throws -> BrainCommitResult {
+        for _ in 0..<(expectedRevision == nil ? 3 : 1) {
             let turn = try read(turnID)
             guard turn.updates == updates else { throw BrainStoreError.denied }
             if let receipt = turn.receipt { return receipt }
-            let request = try BrainCommitRequest(clientOperationID: "turn:" + turnID, evidence: [], updates: updates, expectedRevision: brain.revision())
+            let revision = try expectedRevision ?? brain.revision()
+            let request = try BrainCommitRequest(clientOperationID: "turn:" + turnID, evidence: [], updates: updates, expectedRevision: revision)
             let result = try brain.commit(request, validatedTurnSource: turn.source, transactionGuard: { db in
                 let current = try self.load(turnID, db: db)
                 guard current.updates == updates, current.source == turn.source else { throw BrainStoreError.denied }

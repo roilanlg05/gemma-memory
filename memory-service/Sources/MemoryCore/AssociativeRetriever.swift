@@ -136,6 +136,7 @@ public final class AssociativeRetriever {
         let currentStates = Set(latestStates)
         let eligible = all.filter {
             guard $0.text != nil, !BrainStore.requiresTurnSource($0.claim.predicate), cue.allows($0.claim.validFrom) else { return false }
+            if $0.claim.subject == BrainIdentity.userID && $0.claim.predicate == ConsolidationIdentityClaim.namePredicate { return false }
             switch RecallClaimPredicate(rawValue: $0.claim.predicate) {
             case .link, .label, .detail: return false
             case .state: return currentStates.contains($0.claim.id)

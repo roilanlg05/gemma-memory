@@ -59,6 +59,43 @@ public final class BrainStore {
     public func revision() throws -> Int64 {
         try store.dbQueue.read { db in try checkOwner(db, bind: false); return try Self.revision(db) }
     }
+
+    /// Derive the owner-wide semantic lane from stored user-scope sources. The current-thread
+    /// store remains separate and is still the only authority for recent rows and exact originals.
+    public func ownerSharedRecall(threadID: String) throws -> BrainStore {
+        guard authorization.principal == authorization.owner, authorization.owner == ConsolidationEvidenceAdapter.ownerID,
+              authorization.threads.contains(threadID), authorization.scopes.contains(.user) else { throw BrainStoreError.denied }
+        let grant = try store.dbQueue.read { db in
+            try checkOwner(db, bind: false)
+            let subjects = Set(try String.fetchAll(db, sql: "SELECT DISTINCT subject FROM brain_claim"))
+                .union(BrainIdentity.reservedSubjects)
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT DISTINCT json_extract(payload, '$.threadID') AS thread,
+                    json_extract(payload, '$.sourceKind') AS kind, json_extract(payload, '$.speakerID') AS speaker
+                FROM brain_evidence WHERE json_extract(payload, '$.accessScope')='user'
+                """)
+            var threads: Set<String> = [threadID]
+            var speakers = [BrainSourceKind: Set<String>]()
+            for row in rows {
+                guard let thread: String = row["thread"], let raw: String = row["kind"], let speaker: String = row["speaker"],
+                      let kind = BrainSourceKind(rawValue: raw) else { continue }
+                threads.insert(thread)
+                speakers[kind, default: []].insert(speaker)
+            }
+            return BrainAuthorization(principal: authorization.principal, owner: authorization.owner,
+                subjects: subjects, scopes: [.user], threads: threads, sourceSpeakers: speakers)
+        }
+        return BrainStore(store: store, authorization: grant, clock: clock)
+    }
+
+    func isOwnerSharedRecall(for current: BrainStore, threadID: String) -> Bool {
+        store === current.store && authorization.principal == current.authorization.principal
+            && authorization.owner == current.authorization.owner && authorization.principal == authorization.owner
+            && authorization.owner == ConsolidationEvidenceAdapter.ownerID && authorization.scopes == [.user]
+            && current.authorization.threads.contains(threadID) && current.authorization.scopes.contains(.user)
+            && authorization.threads.contains(threadID) && !authorization.mayCommitClaims && !authorization.mayForget
+            && !authorization.mayReviseIdentity && !authorization.mayProject && !authorization.allowDelegated
+    }
     static func revision(_ db: Database) throws -> Int64 {
         try Int64.fetchOne(db, sql: "SELECT revision FROM brain_meta WHERE id=1") ?? 0
     }

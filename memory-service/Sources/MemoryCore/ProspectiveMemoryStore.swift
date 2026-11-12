@@ -52,7 +52,7 @@ public final class ProspectiveMemoryStore {
             return try nodes.filter { node in
                 guard eligible(node) else { return false }
                 let row = try Row.fetchOne(db, sql: "SELECT deferred_until, resolution_evidence FROM prospective_state WHERE principal=? AND candidate_id=?", arguments: [brain.authorization.principal, node.id])
-                if let evidence: String = row?["resolution_evidence"], (try? brain.availableEvidence([evidence], db: db)) != nil { return false }
+                if let evidence: String = row?["resolution_evidence"], try resolutionIsLive(evidence, db: db) { return false }
                 if let until: Double = row?["deferred_until"], until > brain.clock() { return false }
                 return true
             }.map { node in
@@ -65,18 +65,19 @@ public final class ProspectiveMemoryStore {
     public func revalidate(_ candidate: BrainProspectiveCandidate, scope: BrainAccessScope, revision: Int64) throws -> Bool {
         try candidates(scope: scope, revision: revision).contains { $0.id == candidate.id && $0.sourceRevision == candidate.sourceRevision }
     }
-    public func deferFollowUp(id: String, until: Double) throws {
+    public func deferFollowUp(id: String, until: Double, expectedRevision: Int64? = nil) throws {
         guard brain.authorization.principal == brain.authorization.owner, until.isFinite, brain.authorization.mayCommitClaims, brain.authorization.subjects.contains("self:user") else { throw BrainStoreError.invalid }
         try brain.store.dbQueue.write { db in
             try brain.checkOwner(db, bind: true)
             guard let node = try Node.fetchOne(db, key: id), eligible(node), brain.authorization.scopes.contains(.user) else { throw BrainStoreError.denied }
             let previous = try Double.fetchOne(db, sql: "SELECT deferred_until FROM prospective_state WHERE principal=? AND candidate_id=?", arguments: [brain.authorization.principal, id])
             if previous == until { return }
+            if let expectedRevision, try BrainStore.revision(db) != expectedRevision { throw BrainStoreError.conflict }
             try BrainStore.advanceRevision(db)
             try db.execute(sql: "INSERT INTO prospective_state(principal,candidate_id,deferred_until) VALUES (?,?,?) ON CONFLICT(principal,candidate_id) DO UPDATE SET deferred_until=excluded.deferred_until", arguments: [brain.authorization.principal, id, until])
         }
     }
-    public func resolveCandidate(id: String, evidenceID: String) throws {
+    public func resolveCandidate(id: String, evidenceID: String, expectedRevision: Int64? = nil) throws {
         try brain.store.dbQueue.write { db in
             try brain.checkOwner(db, bind: true)
             guard brain.authorization.principal == brain.authorization.owner, brain.authorization.subjects.contains("self:user"), let node = try Node.fetchOne(db, key: id), eligible(node), node.kind != NodeKind.task.rawValue else { throw BrainStoreError.denied }
@@ -84,6 +85,7 @@ public final class ProspectiveMemoryStore {
             guard evidence.sourceKind == .userMessage, evidence.speakerID == "self:user", brain.authorization.mayCommitClaims, resolutionAuthority.approves(candidateID: id, evidence: evidence) else { throw BrainStoreError.denied }
             let previous = try String.fetchOne(db, sql: "SELECT resolution_evidence FROM prospective_state WHERE principal=? AND candidate_id=?", arguments: [brain.authorization.principal, id])
             if previous == evidenceID { return }
+            if let expectedRevision, try BrainStore.revision(db) != expectedRevision { throw BrainStoreError.conflict }
             try BrainStore.advanceRevision(db)
             try db.execute(sql: "INSERT INTO prospective_state(principal,candidate_id,resolution_evidence) VALUES (?,?,?) ON CONFLICT(principal,candidate_id) DO UPDATE SET resolution_evidence=excluded.resolution_evidence", arguments: [brain.authorization.principal, id, evidenceID])
         }
@@ -96,17 +98,44 @@ public final class ProspectiveMemoryStore {
         guard let snapshot = candidate.sourceRevision else { throw BrainStoreError.invalid }
         try recordDelivery(id: candidate.id, expectedSnapshot: snapshot, deliveryID: deliveryID, state: state)
     }
-    private func recordDelivery(id: String, expectedSnapshot: String?, deliveryID: String, state: ProspectiveDeliveryState) throws {
+
+    /// An owner can acknowledge an issued receipt, but this path cannot create a delivery.
+    public func acknowledgeDelivery(id: String, deliveryID: String) throws {
+        try recordDelivery(id: id, expectedSnapshot: nil, deliveryID: deliveryID, state: .read, requireExisting: true)
+    }
+
+    private func resolutionIsLive(_ id: String, db: Database) throws -> Bool {
+        let evidence: BrainEvidence
+        do { evidence = try brain.loadEvidence(id, db: db) }
+        catch BrainStoreError.invalid { return false }
+        guard evidence.sourceKind == .userMessage, evidence.speakerID == BrainIdentity.userID,
+              evidence.accessScope == .user || evidence.accessScope == .thread,
+              evidence.text?.isEmpty == false, (evidence.parentEvidenceIDs ?? []).isEmpty,
+              try !BrainStore.isExcluded(db, kind: .evidence, id: id,
+                                         fingerprint: BrainStore.evidenceFingerprint(BrainStore.encode(evidence))) else { return false }
+        if id.hasPrefix("transcript:") {
+            let rows = try TranscriptRow.fetchAll(db, sql: "SELECT * FROM transcript WHERE threadId=? AND createdAt=?",
+                                                  arguments: [evidence.threadID, evidence.observedAt])
+            return rows.contains { ConsolidationEvidenceAdapter.evidence(for: $0, scope: evidence.accessScope) == evidence }
+        }
+        // The owner-level resolution state remains meaningful even when its proof is thread-only.
+        // No source ID or source content is exposed by this check.
+        return true
+    }
+
+    private func recordDelivery(id: String, expectedSnapshot: String?, deliveryID: String, state: ProspectiveDeliveryState,
+                                requireExisting: Bool = false) throws {
         guard brain.authorization.principal == brain.authorization.owner, !deliveryID.isEmpty, brain.authorization.scopes.contains(.user), brain.authorization.subjects.contains("self:user"), brain.authorization.mayCommitClaims else { throw BrainStoreError.denied }
         try brain.store.dbQueue.write { db in
             try brain.checkOwner(db, bind: true)
             let prior = try String.fetchOne(db, sql: "SELECT state FROM prospective_delivery WHERE principal=? AND candidate_id=? AND delivery_id=?", arguments: [brain.authorization.principal, id, deliveryID])
             if prior == nil {
+                guard !requireExisting else { throw BrainStoreError.conflict }
                 guard let node = try Node.fetchOne(db, key: id), eligible(node), node.ttlExpiresAt.map({ $0 > brain.clock() }) ?? true else { throw BrainStoreError.conflict }
                 if let expectedSnapshot, try proof(node, db: db).snapshot != expectedSnapshot { throw BrainStoreError.conflict }
                 let stateRow = try Row.fetchOne(db, sql: "SELECT deferred_until,resolution_evidence FROM prospective_state WHERE principal=? AND candidate_id=?", arguments: [brain.authorization.principal,id])
                 if let until: Double = stateRow?["deferred_until"], until > brain.clock() { throw BrainStoreError.conflict }
-                if let evidence: String = stateRow?["resolution_evidence"], (try? brain.availableEvidence([evidence], db: db)) != nil { throw BrainStoreError.conflict }
+                if let evidence: String = stateRow?["resolution_evidence"], try resolutionIsLive(evidence, db: db) { throw BrainStoreError.conflict }
             }
             if let prior {
                 if prior == state.rawValue { return }

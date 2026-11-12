@@ -1,4 +1,5 @@
 import Foundation
+import BrainContract
 import GRDB
 
 /// Hybrid associative recall: vector (semantic) + FTS (keyword) + recency + 1-hop graph
@@ -62,6 +63,80 @@ public final class MemoryRetriever: @unchecked Sendable {
             result.append(n)
         }
         return result
+    }
+
+    /// Compatibility for the existing owner-only save API. Legacy facts carry neither exact
+    /// citation nor identity authority, and explicit scope/provenance cannot be widened here.
+    public func gatewayLegacyContext(query: String, threadID: String, maximumBytes: Int = 768) throws -> String {
+        let nodes = try store.searchFTS(query: String(query.prefix(512)), limit: 12) + store.coreMemories(limit: 6)
+        let heading = "Relevant unverified legacy memories (context only, no identity or exact citation):"
+        guard maximumBytes > heading.utf8.count else { return "" }
+        var lines = [String]()
+        var bytes = heading.utf8.count
+        for node in try gatewayLegacyNodes(ids: nodes.map(\.id), threadID: threadID) {
+            let line = "- [\(node.kind)] \(node.label): \(node.body)"
+            guard line.utf8.count < maximumBytes - bytes else { continue }
+            lines.append(line)
+            bytes += 1 + line.utf8.count
+        }
+        return lines.isEmpty ? "" : ([heading] + lines).joined(separator: "\n")
+    }
+
+    public func gatewayLegacyNodes(ids: [String], threadID: String) throws -> [Node] {
+        try store.dbQueue.read { db in
+            var included = Set<String>()
+            return try ids.compactMap { id in
+                guard included.insert(id).inserted else { return nil }
+                return try Self.eligibleLegacyNode(id: id, threadID: threadID, db: db)
+            }
+        }
+    }
+
+    public func gatewayLegacyTopics(threadID: String) throws -> [String] {
+        try store.dbQueue.read { db in
+            let rows = try Row.fetchAll(db, sql: "SELECT node_id, tag FROM node_tags ORDER BY tag, node_id LIMIT 2000")
+            var eligible: [String: Bool] = [:]
+            var tags = Set<String>()
+            for row in rows {
+                let id: String = row["node_id"]
+                let isEligible = try eligible[id] ?? (Self.eligibleLegacyNode(id: id, threadID: threadID, db: db) != nil)
+                eligible[id] = isEligible
+                if isEligible { tags.insert(row["tag"] as String) }
+            }
+            return tags.sorted()
+        }
+    }
+
+    private static func eligibleLegacyNode(id: String, threadID: String, db: Database) throws -> Node? {
+        let eligibleKinds = [NodeKind.preference, .fact, .person, .place].map(\.rawValue)
+        guard let node = try Node.fetchOne(db, key: id), !node.deleted,
+              node.origin == .explicit, node.sourceRef == nil, eligibleKinds.contains(node.kind),
+              !BrainIdentity.reservedSubjects.contains(node.id),
+              try String.fetchOne(db, sql: "SELECT node_id FROM brain_projection WHERE node_id=?", arguments: [id]) == nil,
+              try String.fetchOne(db, sql: "SELECT node_id FROM brain_legacy_binding WHERE node_id=? AND retired=1", arguments: [id]) == nil,
+              Self.legacyScopeAdmits(node.extra, threadID: threadID),
+              MemoryStore.mergeConflicts(in: node).allSatisfy({ $0.sourceRef == nil && Self.legacyScopeAdmits($0.extra, threadID: threadID) }) else { return nil }
+        return node
+    }
+
+    private static func legacyScopeAdmits(_ extra: String?, threadID: String) -> Bool {
+        guard let extra, !extra.isEmpty else { return true }
+        guard let attrs = (try? JSONSerialization.jsonObject(with: Data(extra.utf8))) as? [String: Any] else { return false }
+        func values(_ keys: [String]) -> Set<String>? {
+            var result = Set<String>()
+            for key in keys where attrs[key] != nil {
+                guard let value = attrs[key] as? String, !value.isEmpty else { return nil }
+                result.insert(value)
+            }
+            return result
+        }
+        guard let scopes = values(["scope", "accessScope", "access_scope"]),
+              let threads = values(["threadID", "threadId", "thread_id", "chatId", "chat_id"]),
+              let owners = values(["ownerID", "ownerId", "owner"]),
+              let subjects = values(["subjectID", "subjectId", "subject"]) else { return false }
+        return scopes.allSatisfy { $0 == "user" || ($0 == "thread" && threads == [threadID]) }
+            && threads.allSatisfy { $0 == threadID } && owners.allSatisfy { $0 == ConsolidationEvidenceAdapter.ownerID }
+            && subjects.allSatisfy { $0 == BrainIdentity.userID }
     }
 
     /// Vector lane for the brain's scoped recall. The caller supplies claims with live,

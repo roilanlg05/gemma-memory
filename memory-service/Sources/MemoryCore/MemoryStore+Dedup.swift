@@ -84,9 +84,18 @@ extension MemoryStore {
         }
         let subjects = ["subjectId", "subjectID", "subject"]
         let owners = ["ownerId", "ownerID", "owner"]
+        let accessScopes = ["scope", "accessScope", "access_scope"]
+        let threads = ["threadID", "threadId", "thread_id", "chatId", "chat_id"]
         let es = scope(existing, keys: subjects), cs = scope(candidate, keys: subjects)
         let eo = scope(existing, keys: owners), co = scope(candidate, keys: owners)
         guard es.valid, cs.valid, eo.valid, co.valid, es.values == cs.values, eo.values == co.values else { return false }
+        let ea = scope(existing, keys: accessScopes), ca = scope(candidate, keys: accessScopes)
+        let et = scope(existing, keys: threads), ct = scope(candidate, keys: threads)
+        guard ea.valid, ca.valid, ea.values == ca.values else { return false }
+        // Legacy summaries use threadId as a provenance locator and keep unordered revisions
+        // as conflicts. A declared access scope still fences those summaries like other records.
+        let unscopedSummaries = ea.values.isEmpty && existing.kind == NodeKind.summary.rawValue && candidate.kind == NodeKind.summary.rawValue
+        if !unscopedSummaries, (!et.valid || !ct.valid || et.values != ct.values) { return false }
         // Shared ownership is not proof that two identity nodes describe the same subject.
         if existing.id != candidate.id, existing.layer == .identity || candidate.layer == .identity,
            es.values.isEmpty { return false }

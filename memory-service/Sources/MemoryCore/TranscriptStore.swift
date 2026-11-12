@@ -27,6 +27,13 @@ public final class TranscriptStore: @unchecked Sendable {
     private let dbQueue: DatabaseQueue
     public init(dbQueue: DatabaseQueue) { self.dbQueue = dbQueue }
 
+    /// Persist a delivered intervention without admitting its ambient input as a user turn.
+    public func appendAssistantNotice(threadID: String, text: String, now: Double) throws {
+        try dbQueue.write { db in
+            _ = try BrainTurnStore.append(thread: threadID, role: "assistant", text: text, timestamp: now, db: db)
+        }
+    }
+
     @discardableResult
     public func append(threadId: String, turnIndex: Int, role: String, text: String,
                        now: Double = Date().timeIntervalSince1970) throws -> String {

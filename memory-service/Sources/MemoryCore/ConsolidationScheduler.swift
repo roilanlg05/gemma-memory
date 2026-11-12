@@ -1,4 +1,5 @@
 import Foundation
+import BrainContract
 
 /// Abstraction over the engine so the scheduler is testable with a spy.
 public protocol ConsolidationRunning: AnyObject, Sendable {
@@ -50,6 +51,8 @@ public final class ConsolidationScheduler {
     /// The run that currently owns the engine — in flight, or cancelled and still winding down.
     private var current: Run?
     private var nextRunID = 0
+    private var exposedJobs: [String: BrainConsolidationJob] = [:]
+    private var exposedOrder: [String] = []
 
     public init(runner: ConsolidationRunning, isReady: @escaping () -> Bool, hasPendingCycle: @escaping () -> Bool,
                 isUserBusy: @escaping () -> Bool = { false },
@@ -109,7 +112,22 @@ public final class ConsolidationScheduler {
         return cycleId
     }
 
-    private func launch(light: Bool) {
+    /// Returns a bounded process-local run receipt, not a claim that model phases succeeded.
+    public func startBrainJob(kind: BrainConsolidationKind, timeZone: TimeZone) -> BrainConsolidationJob? {
+        guard isReady(), current == nil, !isUserBusy() else { return nil }
+        lastTimeZone = timeZone
+        let id = UUID().uuidString
+        let job = BrainConsolidationJob(jobID: id, kind: kind, state: .running)
+        exposedJobs[id] = job
+        exposedOrder.append(id)
+        if exposedOrder.count > 32 { exposedJobs[exposedOrder.removeFirst()] = nil }
+        launch(light: kind == .reflection, exposedID: id)
+        return job
+    }
+
+    public func brainJob(id: String) -> BrainConsolidationJob? { exposedJobs[id] }
+
+    private func launch(light: Bool, exposedID: String? = nil) {
         guard isReady(), !isUserBusy() else { return }
         // A live run owns the engine; a cancelled one is only winding down and may be replaced.
         if let current, !current.cancel.get() { return }
@@ -127,18 +145,21 @@ public final class ConsolidationScheduler {
             // asked to stop; we wait for it to actually be done.
             await predecessor?.task.value
             if flag.get() {
-                await MainActor.run { self?.finish(runID: id, light: light) }
+                await MainActor.run { self?.finish(runID: id, light: light, exposedID: exposedID, cancelled: true) }
                 return
             }
             if light { await runner.runLight(isCancelled: isCancelled, timeZone: tz) }
             else { await runner.runCycle(isCancelled: isCancelled, timeZone: tz) }
-            await MainActor.run { self?.finish(runID: id, light: light) }
+            await MainActor.run { self?.finish(runID: id, light: light, exposedID: exposedID, cancelled: flag.get()) }
         }
         current = Run(id: id, task: task, cancel: flag)
     }
 
     /// Release the engine, unless a replacement run has already taken ownership.
-    private func finish(runID: Int, light: Bool) {
+    private func finish(runID: Int, light: Bool, exposedID: String?, cancelled: Bool) {
+        if let exposedID, let job = exposedJobs[exposedID] {
+            exposedJobs[exposedID] = .init(jobID: exposedID, kind: job.kind, state: cancelled ? .cancelled : .finished)
+        }
         guard current?.id == runID else { return }
         current = nil
         if state != .idle { state = .done(light ? "reflecting" : "sleeping") }

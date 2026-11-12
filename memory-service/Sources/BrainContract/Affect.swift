@@ -103,7 +103,7 @@ public struct BrainInteractionState: Codable, Equatable, Sendable {
     }
 }
 
-public struct BrainAffectiveContext: Equatable, Sendable {
+public struct BrainAffectiveContext: Codable, Equatable, Sendable {
     public let hypotheses: [BrainAffectHypothesis]
     public let interaction: BrainInteractionState?
     public let advice: BrainConversationAdvicePreference?

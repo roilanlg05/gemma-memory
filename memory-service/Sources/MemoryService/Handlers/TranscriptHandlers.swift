@@ -60,10 +60,11 @@ struct TranscriptHandlers {
     @Sendable func range(_ req: Request, _ ctx: BasicRequestContext) async throws -> Response {
         let q = req.uri.queryParameters
         guard let chatId = q["chat_id"].map(String.init),
-              let from = q["from"].flatMap({ Int(String($0)) }) else {
+              let from = q["from"].flatMap({ Int(String($0)) }), from > 0, from <= Int.max - 79 else {
             return jsonError(.badRequest, "bad_request", "chat_id and from required")
         }
         let toRaw = q["to"].flatMap { Int(String($0)) } ?? from
+        guard toRaw >= from else { return jsonError(.badRequest, "bad_request", "invalid message range") }
         let cappedTo = min(toRaw, from + 79)        // max 80 messages
         let truncated = toRaw > cappedTo
         let rows = (try? services.transcript.range(threadId: chatId, from: from, to: cappedTo)) ?? []

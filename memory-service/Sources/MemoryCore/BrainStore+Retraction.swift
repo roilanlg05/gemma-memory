@@ -38,6 +38,28 @@ struct BrainRetractionClosure {
 }
 
 extension BrainStore {
+    /// Expand only the explicitly authorized owner's erasure capability to affected durable
+    /// subjects and threads. This handle never grants reads to the generation pipeline.
+    public func ownerErasure() throws -> BrainRetractionService {
+        guard authorization.mayForget, authorization.principal == authorization.owner,
+              authorization.owner == ConsolidationEvidenceAdapter.ownerID else { throw BrainStoreError.denied }
+        let grant = try store.dbQueue.read { db in
+            try checkOwner(db, bind: false)
+            let subjects = Set(try String.fetchAll(db, sql: "SELECT DISTINCT subject FROM brain_claim"))
+                .union(authorization.subjects)
+            let transcriptThreads = try String.fetchAll(db, sql: "SELECT DISTINCT threadId FROM transcript")
+            let evidenceThreads = try String.fetchAll(db, sql: """
+                SELECT DISTINCT json_extract(payload, '$.threadID') FROM brain_evidence
+                WHERE json_valid(payload) AND json_type(payload, '$.threadID')='text'
+                """)
+            let threads = Set(transcriptThreads + evidenceThreads).union(authorization.threads)
+            return BrainAuthorization(principal: authorization.principal, owner: authorization.owner,
+                subjects: subjects, scopes: [.user, .thread, .agent, .shared], threads: threads,
+                sourceSpeakers: [:], mayForget: true)
+        }
+        return BrainRetractionService(brain: BrainStore(store: store, authorization: grant, clock: clock))
+    }
+
     /// Content similarity is a backstop for derived rows that carry no provenance link (most
     /// consolidation output has a nil `sourceRef`). A short fragment is not distinctive enough to
     /// attribute to the withdrawn source, so only normalized texts of at least this length take

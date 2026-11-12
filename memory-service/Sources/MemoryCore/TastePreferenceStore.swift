@@ -8,8 +8,53 @@ final class TastePreferenceStore {
 
     init(brain: BrainStore) { self.brain = brain }
 
-    private static func record(_ claim: BrainClaim) throws -> BrainTasteRecord {
+    static func record(_ claim: BrainClaim) throws -> BrainTasteRecord {
         try BrainStore.decode(BrainTasteRecord.self, BrainStore.encode(claim.value))
+    }
+
+    private struct Stance: Hashable {
+        let kind: BrainTasteKind
+        let target: String
+        let domain: String?
+        let context: String?
+        let criterion: String?
+        let alternatives: Set<String>
+
+        init(_ record: BrainTasteRecord) {
+            kind = record.kind
+            target = TastePreferenceStore.key(record.target)
+            domain = record.domain.map(TastePreferenceStore.key)
+            context = record.context.map(TastePreferenceStore.key)
+            criterion = record.criterion.map(TastePreferenceStore.key)
+            alternatives = Set((record.alternatives ?? []).map(TastePreferenceStore.key))
+        }
+    }
+
+    static func sameStance(_ first: BrainTasteRecord, _ second: BrainTasteRecord) -> Bool {
+        Stance(first) == Stance(second)
+    }
+
+    /// Earlier versions could create multiple claims for the same enduring stance. Apply every
+    /// surviving, authorized correction edge before selecting the active representative, so a
+    /// subsequent correction cannot bring an old duplicate back into learning or the profile.
+    static func effectiveClaims(_ active: [BrainClaim], history: [BrainClaim]) -> [BrainClaim] {
+        let enduring = history.compactMap { claim -> (BrainClaim, Stance)? in
+            guard claim.predicate == predicate, claim.status == .active, claim.validTo == nil,
+                  let record = try? record(claim), record.isEnduringTaste else { return nil }
+            return (claim, Stance(record))
+        }
+        let stances = Dictionary(uniqueKeysWithValues: enduring.map { ($0.0.id, $0.1) })
+        var replacedBefore = [Stance: Int64]()
+        for (claim, _) in enduring {
+            guard let previous = claim.supersedesID, let stance = stances[previous] else { continue }
+            replacedBefore[stance] = max(replacedBefore[stance] ?? 0, claim.revision)
+        }
+        var seen = Set<Stance>()
+        let newestFirst = active.reversed().filter { claim in
+            guard let stance = stances[claim.id] else { return true }
+            return claim.revision >= (replacedBefore[stance] ?? 0) && seen.insert(stance).inserted
+        }
+        return Array(newestFirst.reversed())
     }
 
     private static func profileRecord(_ taste: BrainTasteRecord, claim: BrainClaim) -> BrainTasteRecord {
@@ -96,7 +141,7 @@ final class TastePreferenceStore {
             let revision = try BrainStore.revision(db)
             let claims = try brain.claims(subject: subject, asOf: now, scope: .user, knownAtRevision: revision,
                                           threadID: context?.threadID, includingExpiredPredicate: Self.predicate, db: db)
-            var tastes = [BrainTasteRecord]()
+            var records = [BrainTasteRecord]()
             var intent: (record: BrainTasteRecord, claim: BrainClaim, sequence: Int)?
             for claim in claims where claim.predicate == Self.predicate {
                 guard let taste = try? Self.record(claim), taste.domain.map(Self.key) == domainKey,
@@ -119,12 +164,12 @@ final class TastePreferenceStore {
                         intent = (taste, claim, sequence)
                     }
                 } else if claim.validTo.map({ now < $0 }) ?? true {
-                    tastes.append(Self.profileRecord(taste, claim: claim))
+                    records.append(Self.profileRecord(taste, claim: claim))
                 }
             }
             var missing = [BrainTasteInformationGap]()
-            if !tastes.contains(where: { $0.provenance == .explicit && $0.kind != .comparativePreference }) { missing.append(.taste) }
-            if !tastes.contains(where: { $0.provenance == .explicit && $0.kind == .comparativePreference }) { missing.append(.comparativePreference) }
+            if !records.contains(where: { $0.provenance == .explicit && $0.kind != .comparativePreference }) { missing.append(.taste) }
+            if !records.contains(where: { $0.provenance == .explicit && $0.kind == .comparativePreference }) { missing.append(.comparativePreference) }
             // An expired newest request leaves no current intent. Earlier requests stay historical.
             let currentIntent: [BrainTasteRecord]
             if let intent, let expiry = intent.claim.validTo, now < expiry {
@@ -132,7 +177,7 @@ final class TastePreferenceStore {
             } else {
                 currentIntent = []
             }
-            return .init(subjectID: subject, revision: revision, records: tastes,
+            return .init(subjectID: subject, revision: revision, records: records,
                          currentIntent: currentIntent, missingInformation: missing)
         }
     }

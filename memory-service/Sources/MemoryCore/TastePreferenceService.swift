@@ -21,6 +21,32 @@ public final class TastePreferenceService {
         return .init(claim: claim, expectedRevision: previous?.revision)
     }
 
+    /// A direct enduring correction replaces the newest representative in the same typed taste
+    /// slot. Distinct prior stances remain ambiguous. The turn commit validates the exact revision.
+    public static func correction(_ record: BrainTasteRecord, candidates: [BrainClaim]) throws -> BrainClaimUpdate {
+        let draft = try update(record)
+        let matches = candidates.filter { previous in
+            previous.validTo == nil && previous.validFrom <= record.recordedAt
+                && (try? TastePreferenceStore.validateCorrection(draft.claim, previous: previous)) != nil
+        }
+        guard let prior = matches.max(by: { ($0.validFrom, $0.revision, $0.id) < ($1.validFrom, $1.revision, $1.id) }),
+              let stance = try? TastePreferenceStore.record(prior),
+              matches.allSatisfy({ candidate in
+                  guard let record = try? TastePreferenceStore.record(candidate) else { return false }
+                  return TastePreferenceStore.sameStance(record, stance)
+              }) else { return draft }
+        return try update(record, superseding: prior)
+    }
+
+    public static func repeatsEnduringStance(_ record: BrainTasteRecord, candidates: [BrainClaim]) -> Bool {
+        guard record.isEnduringTaste else { return false }
+        return candidates.contains { prior in
+            guard prior.validTo == nil, let priorTaste = try? TastePreferenceStore.record(prior),
+                  priorTaste.isEnduringTaste, priorTaste.intensity == record.intensity else { return false }
+            return TastePreferenceStore.sameStance(record, priorTaste)
+        }
+    }
+
     public func profile(subject: String, domain: String, context: BrainTasteContext?, now: Double) throws -> BrainTasteProfile {
         try store.profile(subject: subject, domain: domain, context: context, now: now)
     }

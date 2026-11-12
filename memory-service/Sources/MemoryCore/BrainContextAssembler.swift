@@ -56,7 +56,12 @@ public final class BrainContextAssembler {
         }
         var vector: [Float]?
         if let recallOptions {
-            guard let recall, recall.brain === store.brain else { throw BrainStoreError.denied }
+            guard let recall else { throw BrainStoreError.denied }
+            if recall.brain !== store.brain {
+                guard recall.brain.isOwnerSharedRecall(for: store.brain, threadID: request.threadID),
+                      recallOptions.scope == .user, recallOptions.quoteEvidenceIDs.isEmpty,
+                      recallOptions.detailEvidenceIDs.isEmpty else { throw BrainStoreError.denied }
+            }
             guard recallOptions.asOf.isFinite else { throw BrainStoreError.invalid }
             if recallOptions.finalizedCue == nil {
                 vector = try await recall.queryVector(request.query, threadID: request.threadID, scope: recallOptions.scope)
@@ -200,7 +205,8 @@ public final class BrainContextAssembler {
         return input()
     }
     private static func admitsLegacySelection(_ claim: BrainClaim) -> Bool {
-        !BrainStore.requiresTurnSource(claim.predicate) && RecallClaimPredicate(rawValue: claim.predicate) == nil
+        !(claim.subject == BrainIdentity.userID && claim.predicate == ConsolidationIdentityClaim.namePredicate)
+            && !BrainStore.requiresTurnSource(claim.predicate) && RecallClaimPredicate(rawValue: claim.predicate) == nil
     }
 
     private func assemble(_ snapshot: ConversationSnapshot, request: BrainContextRequest, selection: ConversationSelection,
@@ -286,7 +292,10 @@ public final class BrainContextAssembler {
             released.truncations.removeAll { $0 == reserved }
             return released
         }
-        let groups = ConversationCompactor.groups(snapshot.sources)
+        let timeline = Dictionary(uniqueKeysWithValues: snapshot.sources.enumerated().map { ($0.element.evidence.id, $0.offset) })
+        let groups = ConversationCompactor.groups(snapshot.sources).sorted {
+            (timeline[$0.last?.evidence.id ?? ""] ?? -1) < (timeline[$1.last?.evidence.id ?? ""] ?? -1)
+        }
         func recentUnits(_ group: [ConversationSource], cap: Int? = nil) -> [BrainMessageUnit] {
             group.map { source in
                 let original = source.evidence.text ?? ""
@@ -359,6 +368,9 @@ public final class BrainContextAssembler {
                                 includedUTF8Bytes: 0,
                                 reason: DisclosureReason.agentIdentityOmittedBudget.rawValue)])
             }
+        }
+        if let name = snapshot.confirmedUserName {
+            try add(block: "Confirmed user name: \(name.value)", ids: [name.evidenceID], renderedUse: .derivedSupport)
         }
         func admitOriginal(_ original: SelectedOriginal) throws {
             let reason = original.reason
@@ -475,6 +487,7 @@ public final class BrainContextAssembler {
             try add(block: "[optional conversation guidance]\n" + guidance.joined(separator: " "),
                     ids: interaction.evidenceIDs, renderedUse: .derivedSupport)
         }
+        draft.units.sort { (timeline[$0.id] ?? -1) < (timeline[$1.id] ?? -1) }
         let estimate = try estimatedInput(draft, request: request, revision: snapshot.revision)
         guard estimate <= capacity(request.budget) else { throw BrainContextAssemblyError.insufficientBudget }
         return bundle(draft, request: request, revision: snapshot.revision, estimate: estimate)

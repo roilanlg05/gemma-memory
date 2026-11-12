@@ -1,4 +1,5 @@
 import Foundation
+import BrainContract
 import MemoryCore
 
 public enum AgentPrompt {
@@ -18,6 +19,7 @@ public enum AgentPrompt {
     ## MEMORY & IDENTITY
 
     * `self` in memory represents the USER, never Gemma.
+    * Use a name for the user only when they directly introduced or confirmed it. A current confirmed name takes precedence over historical excerpts and old names. Speak without a name when none is grounded. Do not use prior assistant guesses, third-party mentions, or an unverified profile as confirmation.
     * Treat memories as context, not unquestionable facts. Recognize uncertainty and outdated information.
     * Before asking personal details, inspect context and use `recall_by_topic` when relevant. Never ask for reliably known information.
     * Use `recall_by_topic` for memories, `why(claim)` for provenance, `list_topics` for discovery, and `load_messages` when details are missing.
@@ -107,23 +109,28 @@ public enum AgentPrompt {
     /// (from the STT-detected language code). Empty when `code` is nil/blank. Rides the per-turn
     /// tail — never the static system prefix — so the prompt-prefix cache is unaffected.
     public static func languageDirective(_ code: String?) -> String {
-        guard let trimmed = code?.lowercased().trimmingCharacters(in: .whitespaces), !trimmed.isEmpty
-        else { return "" }
+        guard let trimmed = normalizedLanguage(code) else { return "" }
         // Match on the primary subtag ("en-US" → "en"); fall back to the raw code if unmapped.
         let primary = trimmed.split(separator: "-").first.map(String.init) ?? trimmed
         let name = languageNames[primary] ?? primary
         return "Reply in \(name)."
     }
 
+    static func normalizedLanguage(_ code: String?) -> String? {
+        guard let value = code?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines),
+              value.range(of: #"\A[a-z]{2,3}(?:-[a-z0-9]{2,8}){0,3}\z"#, options: .regularExpression) != nil else { return nil }
+        return value
+    }
+
     // MARK: - Per-turn context
 
     /// Current date/time line — ported VERBATIM from Agent.nowContext(_:).
-    public static func nowContext(_ date: Date = Date()) -> String {
+    public static func nowContext(_ date: Date = Date(), timezone: TimeZone = .current) -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         // `.current` = the container's TZ (compose sets America/Havana). MUST match the schedule
         // tools' zone (GatewayTools.isoToEpoch) so the model's clock and date-math agree.
-        f.timeZone = .current
+        f.timeZone = timezone
         f.dateFormat = "yyyy-MM-dd (EEEE) HH:mm"
         return "[Reference datetime: \(f.string(from: date)) local. Internal reference ONLY for resolving relative dates like today, tomorrow, morning, or afternoon. NEVER mention, greet with, or recite the time or date to the user unless they explicitly asked for it.]"
     }
@@ -151,8 +158,24 @@ public enum AgentPrompt {
                 }
             }
         }
-        let recall = services.retriever.injectionBlock(for: nodes)
+        let recall = services.retriever.injectionBlock(for: nodes.filter { $0.kind != NodeKind.selfUser.rawValue })
         return [now, history, recall].filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
+    static func renderContext(_ bundle: BrainContextBundle, excluding evidenceIDs: Set<String>) -> String {
+        let recent = bundle.recentMessageUnits.filter { evidenceIDs.isDisjoint(with: $0.evidenceIDs) }
+        let exact = Set(bundle.exactCitationSourceReferences(includingRenderedContext: true,
+            forwardedRecentUnitIDs: Set(recent.map(\.id))).map(\.id))
+        let lines = recent.map { unit in
+            let speaker = unit.speakerID == BrainIdentity.agentID ? "Gemma"
+                : (unit.speakerID == BrainIdentity.userID ? "User" : "Tool observation")
+            let prefix = bundle.sourceUses?[unit.id]?.contains(.recentPrefix) == true ? " (partial)" : ""
+            let source = exact.contains(unit.id) ? " [source=\(unit.id)]" : ""
+            return "\(speaker)\(prefix)\(source): \(unit.text)"
+        }
+        let conversation = lines.isEmpty ? "" : "Recent conversation (this chat, oldest first):\n" + lines.joined(separator: "\n")
+        let citations = exact.isEmpty ? "" : "Complete originals eligible for exact citation: " + exact.sorted().joined(separator: ", ")
+        return [bundle.renderedContext, conversation, citations].filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
     /// The thread's recent turns, oldest-first, rendered for the prompt (empty if none).

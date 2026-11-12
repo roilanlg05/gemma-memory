@@ -191,9 +191,10 @@ extension BrainStore {
         }
         let superseded = Set(visible.compactMap(\.supersedesID)).union(
             try Self.disposedPredecessors(visible, asOf: asOf, knownAtRevision: known, db: db))
-        return visible.filter { claim in
+        let active = visible.filter { claim in
             claim.status == .active && !superseded.contains(claim.id)
                 && (claim.predicate == includingExpiredPredicate || (claim.validTo.map { asOf < $0 } ?? true))
         }
+        return TastePreferenceStore.effectiveClaims(active, history: visible)
     }
 }

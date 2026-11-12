@@ -83,7 +83,9 @@ final class MemoryIntegrityTests: XCTestCase {
         let scopes = [
             (#"{"subjectId":"self:user"}"#, #"{"subjectId":"self:agent"}"#),
             (#"{"ownerID":"synthetic:one"}"#, #"{"ownerID":"synthetic:two"}"#),
-            (#"{"subjectId":"self:user"}"#, "{}")
+            (#"{"subjectId":"self:user"}"#, "{}"),
+            (#"{"scope":"thread","threadId":"one"}"#, "{}"),
+            (#"{"scope":"thread","threadId":"one"}"#, #"{"accessScope":"thread","threadID":"two"}"#)
         ]
         for semantic in [false, true] {
             for (a, b) in scopes {

@@ -63,16 +63,20 @@ extension BrainStore {
     /// store can refuse a racing write instead of silently clobbering it.
     func commitAssertedIdentity(value: String, evidence: BrainEvidence) throws -> BrainCommitResult? {
         let asOf = max(evidence.observedAt, clock())
-        let active = try claims(subject: selfUserID, asOf: asOf, scope: evidence.accessScope)
-            .filter { $0.predicate == ConsolidationIdentityClaim.namePredicate }
-        if active.contains(where: { $0.value == .string(value) }) { return nil }
+        let (active, revision) = try store.dbQueue.read { db in
+            try checkOwner(db, bind: false)
+            let active = try claims(subject: selfUserID, asOf: asOf, scope: evidence.accessScope, db: db)
+                .filter { $0.predicate == ConsolidationIdentityClaim.namePredicate }
+            return (active, try Self.revision(db))
+        }
+        if active.contains(where: { $0.value == .string(value) || $0.validFrom > evidence.observedAt }) { return nil }
         let previous = active.last
         let claim = ConsolidationIdentityClaim.claim(value: value, evidence: evidence, superseding: previous)
         let request = try BrainCommitRequest(
             clientOperationID: ConsolidationIdentityClaim.operationID(evidenceID: evidence.id, value: value),
             evidence: [evidence],
             updates: [BrainClaimUpdate(claim: claim, expectedRevision: previous?.revision)],
-            expectedRevision: try revision())
+            expectedRevision: revision)
         return try commit(request)
     }
 }

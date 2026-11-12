@@ -34,6 +34,7 @@ public struct ConversationSnapshot: Sendable {
     public let claims: [BrainClaim]
     let memoryEvidence: [BrainEvidence]
     let claimEvidenceIDs: [String: [String]]
+    let confirmedUserName: ConfirmedConversationName?
     /// The agent's own identity, read in the same transaction as the conversation and confined to
     /// this thread. Absent when the grant does not hold the agent subject or scope.
     let identity: BrainIdentity?
@@ -41,6 +42,11 @@ public struct ConversationSnapshot: Sendable {
     /// What a retraction could take from that identity. Revalidation compares this rather than the
     /// whole identity, which would also compare a growing experience projection.
     let identityDependencies: AgentIdentityDependencies?
+}
+
+struct ConfirmedConversationName: Equatable, Sendable {
+    let value: String
+    let evidenceID: String
 }
 
 /// Source snapshots and derived segments share the brain's owner, revision and erasure boundary.
@@ -73,10 +79,11 @@ public final class ConversationStateStore {
         try requireThread(threadID, db: db)
         let revision = try BrainStore.revision(db)
         let rows = try TranscriptRow.fetchAll(db, sql: "SELECT * FROM transcript WHERE threadId=? ORDER BY seq", arguments: [threadID])
+        let groups = try transcriptGroups(rows, threadID: threadID, db: db)
         var sources = rows.compactMap { row -> ConversationSource? in
             let scope: BrainAccessScope = brain.authorization.scopes.contains(.user) ? .user : .thread
-            guard let evidence = ConsolidationEvidenceAdapter.evidence(for: row, scope: scope) else { return nil }
-            return ConversationSource(evidence: evidence, transcriptID: row.id, groupID: ConversationWindow.groupID(for: row))
+            guard let evidence = ConsolidationEvidenceAdapter.evidence(for: row, scope: scope), let group = groups[row.id] else { return nil }
+            return ConversationSource(evidence: evidence, transcriptID: row.id, groupID: group)
         }
         let rawPayloads = try String.fetchAll(db, sql: "SELECT payload FROM brain_evidence ORDER BY id")
         let allEvidence = try rawPayloads.map { try BrainStore.decode(BrainEvidence.self, $0) }
@@ -122,7 +129,12 @@ public final class ConversationStateStore {
             if lhs.evidence.sourceKind != rhs.evidence.sourceKind { return lhs.evidence.sourceKind.rawValue < rhs.evidence.sourceKind.rawValue }
             return lhs.evidence.id < rhs.evidence.id
         }
-        var assigned = Set<String>(), groupNames = Set<String>()
+        let assistantGroups = Set(sources.filter { $0.evidence.sourceKind == .assistantMessage }.map(\.groupID))
+        var assigned = Set(sources.filter {
+            $0.evidence.sourceKind == .toolObservation && $0.evidence.speakerID == BrainTurnStore.gatewayToolSpeaker
+                && $0.groupID.hasPrefix("turn:") && assistantGroups.contains($0.groupID)
+        }.map { $0.evidence.id })
+        var groupNames = Set<String>()
         for group in unitGroups {
             guard !group.id.isEmpty, groupNames.insert(group.id).inserted,
                   !group.evidenceIDs.isEmpty, Set(group.evidenceIDs).count == group.evidenceIDs.count,
@@ -185,6 +197,8 @@ public final class ConversationStateStore {
             claimEvidenceIDs[claim.id] = claimRoots.sorted()
         }
         let memoryEvidence = rootIDs.sorted().compactMap { evidenceByID[$0] }.filter { brain.canRead($0) }
+        let nameClaims = claims.filter { $0.subject == BrainIdentity.userID && $0.predicate == ConsolidationIdentityClaim.namePredicate }
+        let confirmedName = try confirmedUserName(from: nameClaims, evidence: evidenceByID, db: db)
         // The agent's identity is read here, inside the same transaction, so that it is covered by
         // the post-await revalidation below: an identity source withdrawn while a model was running
         // must make assembly conflict rather than letting withdrawn personalisation reach a prompt.
@@ -204,8 +218,47 @@ public final class ConversationStateStore {
         }
         return .init(threadID: threadID, revision: revision, sources: sources, segments: segments,
                      claims: claims, memoryEvidence: memoryEvidence, claimEvidenceIDs: claimEvidenceIDs,
+                     confirmedUserName: confirmedName,
                      identity: identity, identityEvidence: identityEvidence,
                      identityDependencies: identityDependencies)
+    }
+
+    private func transcriptGroups(_ rows: [TranscriptRow], threadID: String, db: Database) throws -> [String: String] {
+        let links = try Row.fetchAll(db, sql: """
+            SELECT r.transcript_id, t.id FROM brain_turn_ref r JOIN brain_turn t ON t.id=r.turn_id
+            WHERE t.principal=? AND t.thread_id=? AND (r.evidence_id=t.source_id OR r.evidence_id=t.assistant_id)
+            """, arguments: [brain.authorization.principal, threadID])
+        let canonical = Dictionary(links.map { ($0["transcript_id"] as String, "turn:" + ($0["id"] as String)) },
+                                   uniquingKeysWith: { first, _ in first })
+        var groups = canonical
+        for (index, row) in rows.enumerated() where groups[row.id] == nil {
+            let ownGroup = "transcript-group:" + BrainStore.digest(row.id)
+            if index > 0, row.role == "assistant" {
+                let prior = rows[index - 1]
+                // Legacy clients reuse indices across restarts (the old voice gateway used 0
+                // for every exchange). Only adjacent user/reply pairs are safely grouped.
+                if canonical[prior.id] == nil, prior.role == "user", prior.turnIndex == row.turnIndex {
+                    groups[row.id] = groups[prior.id] ?? ownGroup
+                    continue
+                }
+            }
+            groups[row.id] = ownGroup
+        }
+        return groups
+    }
+
+    private func confirmedUserName(from claims: [BrainClaim], evidence: [String: BrainEvidence], db: Database) throws -> ConfirmedConversationName? {
+        guard claims.count == 1, let claim = claims.first, claim.modality == .asserted, claim.contradictsIDs.isEmpty,
+              case .string(let name) = claim.value, !name.isEmpty, name.count <= 64,
+              name.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) && !CharacterSet.newlines.contains($0) }),
+              claim.evidenceIDs.count == 1, let id = claim.evidenceIDs.first,
+              let source = evidence[id], source.sourceKind == .userMessage, source.speakerID == BrainIdentity.userID else { return nil }
+        let rows = try TranscriptRow.fetchAll(db, sql: "SELECT * FROM transcript WHERE threadId=? AND createdAt=? AND role='user'",
+                                               arguments: [source.threadID, source.observedAt])
+            .filter { ConsolidationEvidenceAdapter.evidence(for: $0, scope: source.accessScope) == source }
+        guard case .success = SelfAssertionValidator.validate(label: name, sources: rows,
+            permittedScopes: brain.authorization.scopes, evidenceScope: source.accessScope) else { return nil }
+        return .init(value: name, evidenceID: id)
     }
     /// Revalidate after EVERY model await, including model failures before fallback. The result
     /// is built inside the same transaction that checks revision and original source bytes.
@@ -223,6 +276,7 @@ public final class ConversationStateStore {
     private static func requireSameSources(_ old: ConversationSnapshot, _ current: ConversationSnapshot) throws {
         guard old.revision == current.revision, old.sources == current.sources,
               old.claims == current.claims, old.memoryEvidence == current.memoryEvidence,
+              old.confirmedUserName == current.confirmedUserName,
               old.identityDependencies == current.identityDependencies else { throw BrainStoreError.conflict }
     }
     func save(_ candidate: ConversationStateCandidate, sources: [ConversationSource], snapshot original: ConversationSnapshot) throws {

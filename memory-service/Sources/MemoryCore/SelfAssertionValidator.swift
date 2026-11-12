@@ -107,6 +107,26 @@ public enum SelfAssertionValidator {
         "mentira", "sarcasm", "sarcasmo", "ironia", "ironía",
     ]
 
+    /// Accept only an entire, unqualified introduction for immediate admission. Longer or
+    /// ambiguous statements may still be evaluated by the existing source-bound validator.
+    static func directName(in text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = fold(trimmed)
+        guard !disavowalMarkers.contains(where: normalized.contains),
+              let prefix = namingPrefixes.first(where: normalized.hasPrefix) else { return nil }
+        let raw = String(trimmed.dropFirst(prefix.count))
+        let name = raw.last.map { ".!".contains($0) } == true ? String(raw.dropLast()) : raw
+        let words = name.split(separator: " ")
+        let qualifiers: Set<String> = ["and", "or", "but", "because", "y", "o", "pero", "aunque", "porque",
+                                       "said", "says", "dijo", "dice", "segun", "si", "if", "would", "seria"]
+        guard (1...4).contains(words.count), name.count <= 64,
+              name.range(of: #"\A[\p{L}][\p{L}\p{M}'’ -]*[\p{L}\p{M}]\z|\A[\p{L}]\z"#,
+                         options: .regularExpression) != nil,
+              words.allSatisfy({ !qualifiers.contains(fold(String($0))) }),
+              !reservedLabels.contains(MemoryText.dedupKey(name)), !MemoryText.isJunkLabel(name) else { return nil }
+        return name
+    }
+
     /// Validate a proposed identity statement against the turns it supposedly came from.
     ///
     /// - Parameters:
