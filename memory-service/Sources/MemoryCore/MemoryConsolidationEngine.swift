@@ -188,6 +188,13 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         return embedder
     }
 
+    // Legacy fixtures preserve their historical text choices. The named store embeds the
+    // exact retained source text itself so a later rebuild produces the same input.
+    private func legacyEmbedding(_ text: String) -> [Float]? {
+        guard let embedder, embedder.indexVersion == nil else { return nil }
+        return (try? embedder.embedForIndex(text))?.values
+    }
+
     /// Store a node through the store's dedup path, checkpointing the write in the same transaction
     /// when the caller supplies one.
     ///
@@ -342,7 +349,13 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                     case .failure(let problem): tally.note(problem)
                     case .success(let result):
                         if let evId = result.id {
-                            if let emb = (try? embedder?.embed(evLabel)) ?? nil { try? store.setEmbedding(nodeId: evId, emb) }
+                            if let embedder, (try? store.canUseEmbeddingIndex(embedder.indexVersion)) == true,
+                               let saved = try? store.node(id: evId) {
+                                let sourceText = MemoryStore.nodeEmbeddingText(saved)
+                                if let emb = try? embedder.embedForIndex(embedder.indexVersion == nil ? evLabel : sourceText) {
+                                    try? store.setEmbedding(nodeId: evId, emb, sourceText: sourceText)
+                                }
+                            }
                             tally.committed += 1
                         } else {
                             // Blocked by a conflict: the outcome is a question to the user, not an
@@ -432,7 +445,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             decayRate: Decay.defaultDecayRate(for: layer), confidence: .probable, mentionCount: 1,
                             ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                             dirty: true, deleted: false, extra: attrs.toJSON())
-            let emb = (try? embedder?.embed(label)) ?? nil
+            let emb = legacyEmbedding(label)
             switch persistMerging("entity", node, embedding: emb,
                                   checkpoint: itemCheckpoint(.nrem, item: itemKey)) {
             case .failure(let problem): tally.note(problem)
@@ -531,7 +544,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                         ttlExpiresAt: nil, sourceRef: threadId, origin: .extracted, serverId: nil,
                         dirty: true, deleted: false, extra: extraJSON)
         let conceptText = ([topic] + out.concepts).joined(separator: " ")
-        let emb = (try? embedder?.embed(conceptText)) ?? nil
+        let emb = legacyEmbedding(conceptText)
         switch persistMerging("summary", node, embedding: emb,
                               checkpoint: itemCheckpoint(.summarize, item: itemKey)) {
         case .failure(let problem): tally.note(problem)
@@ -649,7 +662,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                             body: text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3,
                             decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
                             ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
-            let fEmb = (try? embedder?.embed(node.label)) ?? nil
+            let fEmb = legacyEmbedding(node.label)
             // The checkpoint rides with the node, which is the part a replay would reinforce. The
             // links below are derived from it and are reported as failures of the unit, which keeps
             // the unit's turns un-consolidated, so a later cycle re-derives them under a new job.
@@ -712,7 +725,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             if let selfN = try? store.selfNode(), MemoryText.dedupKey(selfN.label) == key { return selfN }
             // 0.25 is intentionally looser than upsertMergingSemantic's 0.2 dedup default: linking
             // an edge endpoint tolerates more drift than merging two nodes into one.
-            if let emb = (try? embedder?.embed(label)) ?? nil,
+            if let embedder, (try? store.canUseEmbeddingIndex(embedder.indexVersion)) == true,
+               let emb = try? embedder.embedForIndex(label),
                let hit = (try? store.nearest(to: emb, k: 1))?.first, hit.distance <= 0.25 {
                 return try? store.node(id: hit.id)
             }
@@ -800,7 +814,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                                 body: text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 4,
                                 decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
                                 ttlExpiresAt: nil, sourceRef: topic.id, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: nil)
-                let emb = (try? embedder?.embed(node.label)) ?? nil
+                let emb = legacyEmbedding(node.label)
                 let saved = persistMerging("topic_insight", node, embedding: emb, tightThreshold: 0.15)
                 guard case .success(let canonicalID) = saved else {
                     if case .failure(let problem) = saved { tally.note(problem) }
@@ -828,7 +842,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                                 body: text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3,
                                 decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
                                 ttlExpiresAt: nil, sourceRef: topic.id, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
-                let emb = (try? embedder?.embed(node.label)) ?? nil
+                let emb = legacyEmbedding(node.label)
                 let saved = persistMerging("implicit_task", node, embedding: emb, tightThreshold: 0.15)
                 guard case .success(let canonicalID) = saved else {
                     if case .failure(let problem) = saved { tally.note(problem) }
@@ -911,7 +925,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                                 salience: 3, decayRate: Decay.defaultDecayRate(for: layer), confidence: conf,
                                 mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil, origin: .extracted, serverId: nil,
                                 dirty: true, deleted: false, extra: nil)
-                let insEmb = (try? embedder?.embed(node.label)) ?? nil
+                let insEmb = legacyEmbedding(node.label)
                 let saved = persistMerging("insight", node, embedding: insEmb, tightThreshold: 0.15)
                 guard case .success(let canonicalID) = saved else {
                     if case .failure(let problem) = saved { tally.note(problem) }
@@ -997,15 +1011,18 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
     func embedMissingPhase() async -> ConsolidationPhaseResult {
         var tally = PhaseTally(.embeddings)
-        guard let embedder else { return tally.result }
-        let embedded = Set(((try? store.allEmbeddings()) ?? []).map { $0.id })
-        let nodes = ((try? store.allNodes()) ?? []).filter {
-            Self.clusterableKinds.contains($0.kind) && !embedded.contains($0.id)
+        guard let embedder, (try? store.canUseEmbeddingIndex(embedder.indexVersion)) == true else { return tally.result }
+        let version = embedder.indexVersion
+        let embedded = Set(((try? store.allEmbeddings(version: version)) ?? []).map { $0.id })
+        let nodes = ((try? store.allNodes(includeHubs: false)) ?? []).filter {
+            !$0.id.hasPrefix("hub:") && !embedded.contains($0.id) &&
+                (version != nil || Self.clusterableKinds.contains($0.kind))
         }
         for n in nodes {
-            let text = n.body.isEmpty ? n.label : n.label + " " + n.body
-            guard let v = try? embedder.embed(text) else { continue }
-            switch persist("embedding", { try store.setEmbedding(nodeId: n.id, v) }) {
+            let sourceText = MemoryStore.nodeEmbeddingText(n)
+            let text = version == nil && !n.body.isEmpty ? n.label + " " + n.body : sourceText
+            guard let v = try? embedder.embedForIndex(text) else { continue }
+            switch persist("embedding", { try store.setEmbedding(nodeId: n.id, v, sourceText: sourceText) }) {
             case .failure(let problem): tally.note(problem)
             case .success: tally.committed += 1
             }
@@ -1022,11 +1039,13 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
     func clusterPhase() async -> ConsolidationPhaseResult {
         var tally = PhaseTally(.cluster)
+        let version = embedder?.indexVersion
+        guard (try? store.canUseEmbeddingIndex(version)) == true else { return tally.result }
         let nodes = (try? store.allNodes()) ?? []
         // Exclude structural kind-hubs (id "hub:<kind>") regardless of their `kind` — even if a hub
         // were ever mis-kinded into a clusterable kind, it must never be clustered/reflected over.
         let clusterableIds = Set(nodes.filter { Self.clusterableKinds.contains($0.kind) && !$0.id.hasPrefix("hub:") }.map { $0.id })
-        let embs = ((try? store.allEmbeddings()) ?? []).filter { clusterableIds.contains($0.id) }
+        let embs = ((try? store.allEmbeddings(version: version)) ?? []).filter { clusterableIds.contains($0.id) }
         if case .failure(let problem) = persist("clear_clusters", { try store.clearClusters() }) {
             tally.note(problem); return tally.result
         }
@@ -1067,18 +1086,19 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         var tally = PhaseTally(.tag)
         let clusters = (try? store.clusterNodes()) ?? []
         guard !clusters.isEmpty else { return tally.result }
-        var vocab: [(tag: String, vec: [Float])] = []
+        var vocab: [(tag: String, embedding: IndexEmbedding)] = []
         for tag in (try? store.distinctTags()) ?? [] {
-            if let v = (try? embedder?.embed(tag)) ?? nil { vocab.append((tag, v)) }
+            if let embedding = try? embedder?.embedForIndex(tag) { vocab.append((tag, embedding)) }
         }
         func canonical(_ raw: String) -> String? {
             let tag = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             guard !tag.isEmpty else { return nil }
             if let existing = vocab.first(where: { $0.tag == tag }) { return existing.tag }   // exact reuse
-            if let v = (try? embedder?.embed(tag)) ?? nil {
-                if let hit = vocab.min(by: { MemoryStore.cosineDistance($0.vec, v) < MemoryStore.cosineDistance($1.vec, v) }),
-                   MemoryStore.cosineDistance(hit.vec, v) <= 0.15 { return hit.tag }           // synonym collapse
-                vocab.append((tag, v))                                                         // new canonical
+            if let embedding = try? embedder?.embedForIndex(tag) {
+                let hits = vocab.lazy.filter { $0.embedding.version == embedding.version }
+                    .map { ($0.tag, MemoryStore.cosineDistance($0.embedding.values, embedding.values)) }
+                if let hit = hits.min(by: { $0.1 < $1.1 }), hit.1 <= 0.15 { return hit.0 }
+                vocab.append((tag, embedding))
             }
             return tag
         }

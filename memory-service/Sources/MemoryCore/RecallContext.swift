@@ -40,7 +40,7 @@ struct RecallContextContent {
     let blocks: [Block]
 
     static func build(retriever: AssociativeRetriever, request: BrainContextRequest, current: ConversationSnapshot,
-                      options: RecallContextOptions, gate: RecallOpportunityGate, vector: [Float]?, db: Database) throws -> Self? {
+                      options: RecallContextOptions, gate: RecallOpportunityGate, vector: IndexEmbedding?, db: Database) throws -> Self? {
         guard options.acceptsPrepared(brain: retriever.brain, request: request) else { return nil }
         let graph = try GraphMemoryQuery(brain: retriever.brain).snapshot(threadID: request.threadID,
             scope: options.scope, asOf: options.asOf, db: db)

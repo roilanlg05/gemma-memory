@@ -420,6 +420,9 @@ public final class MemoryStore: @unchecked Sendable {
                 CREATE TABLE prospective_delivery (principal TEXT NOT NULL, candidate_id TEXT NOT NULL, delivery_id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(principal, candidate_id, delivery_id));
                 """)
         }
+        m.registerMigration("v24-embedding-index") { db in
+            try Self.createEmbeddingIndexSchema(db)
+        }
         return m
     }
 
@@ -444,84 +447,101 @@ public final class MemoryStore: @unchecked Sendable {
     /// stored without the receipt that says so — which is what makes a replay a no-op instead of a
     /// second reinforcement.
     public func upsert(_ node: Node, checkpoint: ConsolidationCheckpoint? = nil) throws {
+        try upsert(node, checkpoint: checkpoint, embeddingRevision: nil)
+    }
+
+    func upsert(_ node: Node, checkpoint: ConsolidationCheckpoint?, embeddingRevision: Int64?) throws {
         let savedNode = try dbQueue.write { db in
-            var node = node
-            let previousNode = try Node.fetchOne(db, key: node.id)
-            if let previousNode, previousNode.kind == NodeKind.task.rawValue {
-                node.kind = previousNode.kind
-                if previousNode.deleted { node.deleted = true }
-            }
-            // Merge event attributes under the write lock: ordinary writers may omit bridge keys.
-            if node.kind == NodeKind.event.rawValue, let previous = try Node.fetchOne(db, key: node.id), previous.kind == node.kind {
-                func object(_ value: String?) -> [String: Any] {
-                    guard let value, let data = value.data(using: .utf8) else { return [:] }
-                    return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-                }
-                let old = object(previous.extra); let incoming = object(node.extra)
-                var merged = old
-                for key in ["status", "horizon", "date", "startAt", "endAt", "allDay", "location", "canonicalKey"] { merged.removeValue(forKey: key) }
-                for (key, value) in incoming { merged[key] = value }
-                // Existing bridge identity cannot be rolled back by a stale ordinary node copy.
-                for key in ["appleEventId", "appleOccurrenceAt", "source", "calendarSourceType"] {
-                    if let value = old[key] { merged[key] = value }
-                }
-                // A content stamp belongs to this transaction, not a caller's stale node copy.
-                let before = NodeAttributes.from(previous.extra); let after = NodeAttributes.from(node.extra)
-                let changed = previous.label != node.label || before.startAt != after.startAt || before.endAt != after.endAt || before.allDay != after.allDay || before.location != after.location
-                if changed { merged["contentUpdatedAt"] = Date().timeIntervalSince1970 }
-                else if let stamp = old["contentUpdatedAt"] { merged["contentUpdatedAt"] = stamp }
-                else { merged.removeValue(forKey: "contentUpdatedAt") }
-                node.extra = (try? JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
-            }
-            if node.kind == NodeKind.task.rawValue, let previous = try Node.fetchOne(db, key: node.id), previous.kind == node.kind {
-                func taskObject(_ value: String?) -> [String: Any] {
-                    guard let value, let data = value.data(using: .utf8) else { return [:] }
-                    return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-                }
-                let old = taskObject(previous.extra)
-                var merged = old
-                for (key, value) in taskObject(node.extra) where key != "status" { merged[key] = value }
-                if let status = old["status"] { merged["status"] = status } else { merged.removeValue(forKey: "status") }
-                node.extra = merged.isEmpty ? nil : (try? JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
-            }
-            if node.kind == NodeKind.event.rawValue, try Node.fetchOne(db, key: node.id) == nil {
-                var object = node.extra.flatMap { $0.data(using: .utf8) }.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
-                if object["contentUpdatedAt"] == nil {
-                    object["contentUpdatedAt"] = Date().timeIntervalSince1970
-                    node.extra = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
-                }
-            }
-            let managed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_projection WHERE node_id=? UNION ALL SELECT 1 FROM brain_legacy_binding WHERE node_id=?)", arguments: [node.id, node.id]) ?? false
-            guard !managed else { throw BrainStoreError.denied }
-            // Retracted content stays retracted: a stale client or backup cannot write the same
-            // body back under the same id. A different body under that id is a new record, so the
-            // deterministic ids (self:user, hub:*) stay writable after a retraction.
-            guard !(try BrainStore.isExcluded(db, kind: .node, id: node.id,
-                                              fingerprint: BrainStore.nodeFingerprint(node))) else {
-                throw BrainStoreError.denied
-            }
-            if Self.prospectiveFingerprint(previousNode) != Self.prospectiveFingerprint(node) { try BrainStore.advanceRevision(db) }
-            try node.save(db)
-            try db.execute(sql: "DELETE FROM node_fts WHERE node_id = ?", arguments: [node.id])
-            if node.deleted {
-                try db.execute(sql: "DELETE FROM node_embedding WHERE node_id = ?", arguments: [node.id])
-            } else {
-                try db.execute(sql: "INSERT INTO node_fts(node_id, label, body) VALUES (?, ?, ?)",
-                               arguments: [node.id, node.label, node.body])
-            }
-            if let checkpoint {
-                try Self.writeReceipt(db, jobID: checkpoint.jobID, operationID: checkpoint.operationID,
-                                      phase: checkpoint.phase, outcome: .committed, committed: 1,
-                                      refused: 0, unresolved: 0, stage: nil, retryable: false,
-                                      at: checkpoint.at)
-            }
-            return node
+            try Self.requireEmbeddingRevision(embeddingRevision, db: db)
+            return try Self.writeNode(node, checkpoint: checkpoint, db: db)
         }
         // Auto-link to kind hub so the graph stays navigable from a single anchor per kind.
         // Skips hub-kind nodes themselves and free-form kinds outside the NodeKind enum.
         // Failures are swallowed: a missing hub link is not worth aborting an upsert.
         if !savedNode.deleted { try? linkToHub(nodeId: savedNode.id, kindRaw: savedNode.kind) }
     }
+    static func requireEmbeddingRevision(_ embeddingRevision: Int64?, db: Database) throws {
+        if let embeddingRevision,
+           try Int64.fetchOne(db, sql: "SELECT revision FROM embedding_index_pointer WHERE id = 1") != embeddingRevision {
+            throw EmbeddingIndexError.staleRevision
+        }
+    }
+
+    @discardableResult
+    static func writeNode(_ node: Node, checkpoint: ConsolidationCheckpoint? = nil, db: Database) throws -> Node {
+        var node = node
+        let previousNode = try Node.fetchOne(db, key: node.id)
+        if let previousNode, previousNode.kind == NodeKind.task.rawValue {
+            node.kind = previousNode.kind
+            if previousNode.deleted { node.deleted = true }
+        }
+        // Merge event attributes under the write lock: ordinary writers may omit bridge keys.
+        if node.kind == NodeKind.event.rawValue, let previous = try Node.fetchOne(db, key: node.id), previous.kind == node.kind {
+            func object(_ value: String?) -> [String: Any] {
+                guard let value, let data = value.data(using: .utf8) else { return [:] }
+                return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            }
+            let old = object(previous.extra); let incoming = object(node.extra)
+            var merged = old
+            for key in ["status", "horizon", "date", "startAt", "endAt", "allDay", "location", "canonicalKey"] { merged.removeValue(forKey: key) }
+            for (key, value) in incoming { merged[key] = value }
+            // Existing bridge identity cannot be rolled back by a stale ordinary node copy.
+            for key in ["appleEventId", "appleOccurrenceAt", "source", "calendarSourceType"] {
+                if let value = old[key] { merged[key] = value }
+            }
+            // A content stamp belongs to this transaction, not a caller's stale node copy.
+            let before = NodeAttributes.from(previous.extra); let after = NodeAttributes.from(node.extra)
+            let changed = previous.label != node.label || before.startAt != after.startAt || before.endAt != after.endAt || before.allDay != after.allDay || before.location != after.location
+            if changed { merged["contentUpdatedAt"] = Date().timeIntervalSince1970 }
+            else if let stamp = old["contentUpdatedAt"] { merged["contentUpdatedAt"] = stamp }
+            else { merged.removeValue(forKey: "contentUpdatedAt") }
+            node.extra = (try? JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
+        }
+        if node.kind == NodeKind.task.rawValue, let previous = try Node.fetchOne(db, key: node.id), previous.kind == node.kind {
+            func taskObject(_ value: String?) -> [String: Any] {
+                guard let value, let data = value.data(using: .utf8) else { return [:] }
+                return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            }
+            let old = taskObject(previous.extra)
+            var merged = old
+            for (key, value) in taskObject(node.extra) where key != "status" { merged[key] = value }
+            if let status = old["status"] { merged["status"] = status } else { merged.removeValue(forKey: "status") }
+            node.extra = merged.isEmpty ? nil : (try? JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
+        }
+        if node.kind == NodeKind.event.rawValue, try Node.fetchOne(db, key: node.id) == nil {
+            var object = node.extra.flatMap { $0.data(using: .utf8) }.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            if object["contentUpdatedAt"] == nil {
+                object["contentUpdatedAt"] = Date().timeIntervalSince1970
+                node.extra = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
+            }
+        }
+        let managed = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM brain_projection WHERE node_id=? UNION ALL SELECT 1 FROM brain_legacy_binding WHERE node_id=?)", arguments: [node.id, node.id]) ?? false
+        guard !managed else { throw BrainStoreError.denied }
+        // Retracted content stays retracted: a stale client or backup cannot write the same
+        // body back under the same id. A different body under that id is a new record, so the
+        // deterministic ids (self:user, hub:*) stay writable after a retraction.
+        guard !(try BrainStore.isExcluded(db, kind: .node, id: node.id,
+                                          fingerprint: BrainStore.nodeFingerprint(node))) else {
+            throw BrainStoreError.denied
+        }
+        if Self.prospectiveFingerprint(previousNode) != Self.prospectiveFingerprint(node) { try BrainStore.advanceRevision(db) }
+        try node.save(db)
+        try db.execute(sql: "DELETE FROM node_fts WHERE node_id = ?", arguments: [node.id])
+        if node.deleted {
+            try db.execute(sql: "DELETE FROM node_embedding WHERE node_id = ?", arguments: [node.id])
+        } else {
+            try db.execute(sql: "INSERT INTO node_fts(node_id, label, body) VALUES (?, ?, ?)",
+                           arguments: [node.id, node.label, node.body])
+        }
+        if let checkpoint {
+            try Self.writeReceipt(db, jobID: checkpoint.jobID, operationID: checkpoint.operationID,
+                                  phase: checkpoint.phase, outcome: .committed, committed: 1,
+                                  refused: 0, unresolved: 0, stage: nil, retryable: false,
+                                  at: checkpoint.at)
+        }
+        return node
+    }
+
     public func upsert(_ edge: Edge) throws { try dbQueue.write { try edge.save($0) } }
     public func node(id: String) throws -> Node? { try dbQueue.read { try Node.fetchOne($0, key: id) } }
     /// Returns live, non-structural nodes by default. Pass `includeHubs: true` for the graph view
@@ -611,18 +631,21 @@ public final class MemoryStore: @unchecked Sendable {
     }
 
     public func softDelete(nodeId: String) throws {
-        try dbQueue.write { db in
-            if var node = try Node.fetchOne(db, key: nodeId), !node.deleted {
-                let before = Self.prospectiveFingerprint(node); node.deleted = true
-                if before != Self.prospectiveFingerprint(node) { try BrainStore.advanceRevision(db) }
-            }
-            try db.execute(sql: "UPDATE brain_projection SET suppressed=1 WHERE node_id=?", arguments: [nodeId])
-            try db.execute(sql: "UPDATE node SET deleted=1, dirty=1, updatedAt=? WHERE id=?",
-                           arguments: [Date().timeIntervalSince1970, nodeId])
-            try db.execute(sql: "DELETE FROM node_fts WHERE node_id=?", arguments: [nodeId])
-            try db.execute(sql: "DELETE FROM node_embedding WHERE node_id=?", arguments: [nodeId])
-        }
+        try dbQueue.write { db in try Self.softDelete(nodeId: nodeId, db: db) }
     }
+
+    static func softDelete(nodeId: String, db: Database) throws {
+        if var node = try Node.fetchOne(db, key: nodeId), !node.deleted {
+            let before = Self.prospectiveFingerprint(node); node.deleted = true
+            if before != Self.prospectiveFingerprint(node) { try BrainStore.advanceRevision(db) }
+        }
+        try db.execute(sql: "UPDATE brain_projection SET suppressed=1 WHERE node_id=?", arguments: [nodeId])
+        try db.execute(sql: "UPDATE node SET deleted=1, dirty=1, updatedAt=? WHERE id=?",
+                       arguments: [Date().timeIntervalSince1970, nodeId])
+        try db.execute(sql: "DELETE FROM node_fts WHERE node_id=?", arguments: [nodeId])
+        try db.execute(sql: "DELETE FROM node_embedding WHERE node_id=?", arguments: [nodeId])
+    }
+
     public func searchFTS(query: String, limit: Int) throws -> [Node] {
         try dbQueue.read { db in
             let pattern = FTS5Pattern(matchingAnyTokenIn: query)

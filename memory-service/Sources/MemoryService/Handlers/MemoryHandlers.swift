@@ -72,11 +72,9 @@ struct MemoryHandlers {
         )
 
         // Compute embedding (best-effort — RemoteEmbedder may be unreachable in some envs).
-        let embedding: [Float]? = try? services.embedder.embed(body.label)
-
         let id: String
         do {
-            id = try services.store.upsertMergingSemantic(candidate, embedding: embedding,
+            id = try services.store.upsertMergingSemantic(candidate, embedding: nil,
                                                           embedder: services.embedder)
         } catch {
             return jsonError(.internalServerError, "save_failed", "\(error)")
@@ -131,9 +129,9 @@ struct MemoryHandlers {
         // the client can render "always-on identity facts" separately from query-relevant recall.
         // Embed the query ONCE and reuse it for both node retrieval and recent-turn selection
         // (avoids a second embedder HTTP round-trip).
-        let qv = try? services.embedder.embed(body.query)
+        let qv = services.retriever.queryEmbedding(for: body.query)
         let retrieved: [Node]
-        do { retrieved = try services.retriever.retrieve(query: body.query, k: limit, queryVector: qv) }
+        do { retrieved = try services.retriever.retrieve(query: body.query, k: limit, queryEmbedding: qv) }
         catch { return jsonError(.internalServerError, "recall_failed", "\(error)") }
 
         // Short-Term Memory: Surface recent turns from past chats ONLY when semantically relevant

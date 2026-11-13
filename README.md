@@ -49,9 +49,24 @@ All via environment in `docker-compose.yml`:
 | `MEMORY_BEARER_TOKEN` | _(required)_ | Shared secret for `Authorization: Bearer …` on every `/v1/*` route. |
 | `MEMORY_DB_PATH` | `/data/memory.sqlite` | SQLite file inside the container; mounted via `./docker-data/memory`. |
 | `EMBEDDER_URL` | `http://embedder:8000` | Internal compose DNS. |
+| `EMBED_MODEL` | `BAAI/bge-m3` | Model identifier shared by the sidecar and memory service. |
+| `EMBED_MODEL_REVISION` | `5617a9f61b028005a4858fdac845db406aefb181` | Immutable model commit. Set it explicitly when changing models. |
+| `EMBED_DIM` | `1024` | Expected vector dimension in the memory service. |
 | `MODEL_URL` | `http://host.docker.internal:8080` | The Mac running `mlx_vlm.server`. On Linux hosts, add `extra_hosts: ["host.docker.internal:host-gateway"]` (already set in compose). When the model is on a different machine, change to its Tailscale IP. |
 | `IDLE_MS` | `180000` | Sleep consolidation idle trigger. |
 | `POST_TURN_MS` | `15000` | Post-turn reflection arm. |
+
+### Rebuilding the semantic index
+
+On an existing database, unversioned vectors remain in their original space. The service uses text search until its configured model matches an active version. For a model change, keep the running service on its current embedder and start a separate sidecar for the new version. Run the index commands with access to the same database and the target sidecar. Set `EMBEDDER_URL`, `EMBED_MODEL`, `EMBED_MODEL_REVISION`, and `EMBED_DIM` for that target in the command environment.
+
+```sh
+memory-service embedding-index status
+memory-service embedding-index rebuild
+memory-service embedding-index activate <activation-revision-from-status>
+```
+
+Rebuild leaves the active index available. Activation checks that the staged sources still match the database and that the activation revision has not changed. If the source set changed, retry during a period with fewer writes. After activation, point the running service at the new embedder with the same version settings. The service falls back to text search if the sidecar reports a different identity or is unavailable.
 
 ## HTTP API (prefix `/v1`, bearer auth)
 

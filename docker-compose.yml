@@ -4,6 +4,9 @@ services:
       context: ./embedder
     expose:
       - "8000"
+    environment:
+      - EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-m3}
+      - EMBED_MODEL_REVISION
     volumes:
       - embedder-models:/models
     healthcheck:
@@ -21,7 +24,10 @@ services:
     environment:
       - MEMORY_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
       - MEMORY_DB_PATH=/data/memory.sqlite
-      - EMBEDDER_URL=http://embedder:8000
+      - EMBEDDER_URL=${EMBEDDER_URL:-http://embedder:8000}
+      - EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-m3}
+      - EMBED_MODEL_REVISION
+      - EMBED_DIM
       - MODEL_URL=${MODEL_URL:-http://host.docker.internal:8080}
       # Container clock for the agent's nowContext + schedule ISO↔epoch + consolidation timing.
       # Single-user deployment is in Cuba; override TZ in .env for a different zone.

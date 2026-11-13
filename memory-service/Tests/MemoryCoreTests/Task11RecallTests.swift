@@ -81,6 +81,35 @@ final class Task11RecallTests: XCTestCase {
 }
 
 extension Task11RecallTests {
+    func testScopedSemanticRecallRequiresMatchingActiveModelAndAuthorizedClaims() async throws {
+        let brain = try fixture(project: true)
+        let store = brain.store
+        let active = EmbeddingIndexVersion(modelID: "fixture/scoped", dimension: 16, revision: "r1")
+        let other = EmbeddingIndexVersion(modelID: "fixture/other", dimension: 16, revision: "r1")
+        try store.bootstrapEmbeddingIndex(version: active)
+        try claim("public", "episode:casey", "recall.episode", "Casey visited Reykjavik.", "Casey visited Reykjavik.", 5,
+                  brain: brain)
+        try claim("private", "episode:recent", "recall.episode", "Secret destination.", "Secret destination.", 6,
+                  brain: brain, thread: "side", scope: .thread)
+        let vector: [Float] = [1] + Array(repeating: 0, count: 15)
+        let projected = try XCTUnwrap(try store.node(id: "brain-claim:public"))
+        try store.setEmbedding(nodeId: projected.id, vector, version: active,
+                               sourceText: MemoryStore.nodeEmbeddingText(projected))
+        try store.setEmbedding(nodeId: projected.id, vector)
+
+        let matching = AssociativeRetriever(brain: brain, embedder: Task11FixedEmbedder(vector: vector, indexVersion: active))
+        let match = try await matching.retrieve(query: "destination", threadID: "fresh", scope: .user, asOf: now,
+                                                budget: .init(), strategy: .vectorOnly)
+        XCTAssertEqual(match.candidates.map(\.episodeID), ["episode:casey"])
+        let mismatching = AssociativeRetriever(brain: brain, embedder: Task11FixedEmbedder(vector: vector, indexVersion: other))
+        let mismatch = try await mismatching.retrieve(query: "destination", threadID: "fresh", scope: .user, asOf: now,
+                                                      budget: .init(), strategy: .vectorOnly)
+        XCTAssertTrue(mismatch.candidates.isEmpty)
+        let lexical = try await mismatching.retrieve(query: "Reykjavik", threadID: "fresh", scope: .user, asOf: now,
+                                                     budget: .init())
+        XCTAssertEqual(lexical.candidates.map(\.episodeID), ["episode:casey"])
+    }
+
     func testBridgeFixtureComparesHybridVectorOnlyAndExistingOneHop() async throws {
         let brain = try bridgeFixture(project: true)
         let store = brain.store
@@ -123,6 +152,7 @@ extension Task11RecallTests {
 
 private struct Task11FixedEmbedder: Embedder {
     let vector: [Float]
+    var indexVersion: EmbeddingIndexVersion? = nil
     var dimension: Int { vector.count }
     func embed(_ text: String) throws -> [Float] { vector }
 }

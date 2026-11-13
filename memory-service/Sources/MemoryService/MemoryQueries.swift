@@ -21,11 +21,11 @@ public enum MemoryQueries {
 
         // 2. Embedding nearest-neighbour with cosine distance ≤ 0.2 (strong semantic overlap).
         // O(|vocab|) embed calls — fine at personal-memory scale (tens of tags).
-        guard let tv = try? embedder?.embed(topic) else { return nil }
+        guard let tv = try? embedder?.embedForIndex(topic) else { return nil }
         var best: (tag: String, dist: Double)?
         for t in vocab {
-            guard let v = try? embedder?.embed(t) else { continue }
-            let d = MemoryStore.cosineDistance(tv, v)
+            guard let v = try? embedder?.embedForIndex(t), v.version == tv.version else { continue }
+            let d = MemoryStore.cosineDistance(tv.values, v.values)
             if best == nil || d < best!.dist { best = (t, d) }
         }
         if let b = best, b.dist <= 0.2 { return b.tag }
@@ -69,7 +69,9 @@ public enum MemoryQueries {
             .first { $0.kind == insightKind }
 
         // Semantic fallback (wider net: k:20 ranks ALL kinds, most won't be insights).
-        if insight == nil, let cv = try? embedder?.embed(claim) {
+        if insight == nil, let embedder,
+           (try? store.canUseEmbeddingIndex(embedder.indexVersion)) == true,
+           let cv = try? embedder.embedForIndex(claim) {
             let hits = (try? store.nearest(to: cv, k: 20)) ?? []
             for h in hits where h.distance <= 0.35 {
                 if let n = try? store.node(id: h.id), n.kind == insightKind, !n.deleted {

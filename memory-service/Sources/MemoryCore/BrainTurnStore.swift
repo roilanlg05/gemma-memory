@@ -203,12 +203,17 @@ final class BrainTurnStore {
             return try brain.loadEvidence(id, db: db).text ?? ""
         }
     }
-    func assistant(turnID: String, operationID: String, text: String, timestamp: Double) throws -> BrainEvidence {
+    func assistant(turnID: String, operationID: String, text: String, timestamp: Double,
+                   expectedErasureRevision: Int64? = nil) throws -> BrainEvidence {
         let key = try Self.key(operationID)
         guard timestamp.isFinite, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw BrainStoreError.invalid }
         let digest = BrainStore.digest(try BrainStore.encode([turnID, text]))
         return try brain.store.dbQueue.write { db in
             let turn = try load(turnID, db: db)
+            if let expectedErasureRevision {
+                let current = try Int64.fetchOne(db, sql: "SELECT MAX(revision) FROM brain_exclusion") ?? 0
+                guard expectedErasureRevision == current else { throw BrainStoreError.conflict }
+            }
             guard brain.authorization.sourceSpeakers[.assistantMessage]?.contains("self:agent") == true else { throw BrainStoreError.denied }
             if let old = try operation("assistant", key: key, db: db) {
                 guard (old["request_hash"] as String?) == digest, let evidenceID: String = old["result_id"] else { throw BrainStoreError.conflict }

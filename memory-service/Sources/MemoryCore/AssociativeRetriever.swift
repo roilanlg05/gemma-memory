@@ -31,7 +31,7 @@ public final class RecallQueryPrefetch: @unchecked Sendable {
 
     private struct Entry {
         let key: Key
-        let vector: [Float]
+        let vector: IndexEmbedding
         let expiry: ContinuousClock.Instant
     }
 
@@ -42,7 +42,7 @@ public final class RecallQueryPrefetch: @unchecked Sendable {
 
     public init() {}
 
-    fileprivate func take(_ key: Key) -> [Float]? {
+    fileprivate func take(_ key: Key) -> IndexEmbedding? {
         lock.withLock {
             entries.removeAll { $0.expiry <= clock.now }
             guard let index = entries.firstIndex(where: { $0.key == key }) else { return nil }
@@ -50,7 +50,7 @@ public final class RecallQueryPrefetch: @unchecked Sendable {
         }
     }
 
-    fileprivate func store(_ vector: [Float], for key: Key) {
+    fileprivate func store(_ vector: IndexEmbedding, for key: Key) {
         lock.withLock {
             let now = clock.now
             entries.removeAll { $0.expiry <= now || $0.key == key }
@@ -157,17 +157,19 @@ public final class AssociativeRetriever {
     }
 
     func queryVector(_ query: String, threadID: String, scope: BrainAccessScope,
-                     strategy: BrainRecallStrategy = .hybrid, operationID: String? = nil) async throws -> [Float]? {
+                     strategy: BrainRecallStrategy = .hybrid, operationID: String? = nil) async throws -> IndexEmbedding? {
         try brain.requirePrincipal()
         guard brain.authorization.threads.contains(threadID), brain.authorization.scopes.contains(scope) else {
             throw BrainStoreError.denied
         }
-        guard strategy != .direct, let semantic, !RecallCue(query).terms.isEmpty else { return nil }
+        guard strategy != .direct, let semantic, !RecallCue(query).terms.isEmpty,
+              (try? semantic.canUseIndex(in: brain.store)) == true else { return nil }
         _ = try brain.revision()
         let input = String(query.prefix(4096))
         guard let queryPrefetch, let operationID, scope == .user else { return await semantic.vector(for: input) }
         let key = RecallQueryPrefetch.Key(threadID: threadID, operationID: operationID, digest: BrainStore.digest(query))
-        if queryPrefetch.mode == .consume, let vector = queryPrefetch.cache.take(key) { return vector }
+        if queryPrefetch.mode == .consume, let vector = queryPrefetch.cache.take(key),
+           vector.version == semantic.version { return vector }
         let vector = await semantic.vector(for: input)
         try Task.checkCancellation()
         if queryPrefetch.mode == .prepare, let vector { queryPrefetch.cache.store(vector, for: key) }
@@ -176,7 +178,7 @@ public final class AssociativeRetriever {
 
     func retrieve(query: String, threadID: String, scope: BrainAccessScope, asOf: Double,
                   budget: BrainRecallBudget, strategy: BrainRecallStrategy = .hybrid,
-                  vector: [Float]? = nil, db: Database) throws -> BrainRecallResult {
+                  vector: IndexEmbedding? = nil, db: Database) throws -> BrainRecallResult {
         let snapshot = try GraphMemoryQuery(brain: brain).snapshot(threadID: threadID, scope: scope, asOf: asOf, db: db)
         return try rank(query: query, asOf: asOf, budget: budget, strategy: strategy, vector: vector, snapshot: snapshot, db: db)
     }
@@ -187,7 +189,7 @@ public final class AssociativeRetriever {
     }
 
     func rank(query: String, asOf: Double, budget: BrainRecallBudget, strategy: BrainRecallStrategy,
-              vector: [Float]?, snapshot: GraphRecallSnapshot, db: Database) throws -> BrainRecallResult {
+              vector: IndexEmbedding?, snapshot: GraphRecallSnapshot, db: Database) throws -> BrainRecallResult {
         let cue = RecallCue(query)
         guard !cue.terms.isEmpty || cue.year != nil, budget.maximumCandidates > 0 else {
             return .init(candidates: [], visitedSubjects: 0)
@@ -308,15 +310,21 @@ private final class RecallSemanticLane: @unchecked Sendable {
         deadline = UInt64(min(500, max(1, deadlineMilliseconds))) * 1_000_000
     }
 
-    func vector(for query: String) async -> [Float]? {
+    var version: EmbeddingIndexVersion? { embedder.indexVersion }
+
+    func canUseIndex(in store: MemoryStore) throws -> Bool {
+        try store.canUseEmbeddingIndex(version)
+    }
+
+    func vector(for query: String) async -> IndexEmbedding? {
         guard lock.withLock({
             guard !inFlight else { return false }
             inFlight = true
             return true
         }) else { return nil }
-        let (stream, output) = AsyncStream<[Float]>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let (stream, output) = AsyncStream<IndexEmbedding>.makeStream(bufferingPolicy: .bufferingNewest(1))
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let vector = try? embedder.embed(query)
+            let vector = try? embedder.embedForIndex(query)
             lock.withLock { inFlight = false }
             if let vector { output.yield(vector) }
             output.finish()

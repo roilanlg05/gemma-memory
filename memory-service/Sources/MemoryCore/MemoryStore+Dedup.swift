@@ -186,6 +186,12 @@ extension MemoryStore {
     /// Fetches a generous candidate set (k=64) and filters AFTER, so a duplicate ranked beyond top-8
     /// isn't silently missed.
     public func findSemanticDuplicate(kind: String, embedding: [Float], threshold: Double, candidate: Node? = nil) throws -> Node? {
+        try findSemanticDuplicate(kind: kind, embedding: IndexEmbedding(values: embedding, version: nil),
+                                  threshold: threshold, candidate: candidate)
+    }
+
+    private func findSemanticDuplicate(kind: String, embedding: IndexEmbedding,
+                                       threshold: Double, candidate: Node?) throws -> Node? {
         let isAtomic = Self.atomicKinds.contains(kind)
         let managed = try dbQueue.read { try Self.managedNodeIDs($0) }
         // Managed vectors must not crowd eligible legacy candidates out of the top 64.
@@ -207,28 +213,54 @@ extension MemoryStore {
     public func upsertMergingSemantic(_ candidate: Node, embedding: [Float]?, embedder: Embedder?,
                                       threshold: Double = 0.2,
                                       checkpoint: ConsolidationCheckpoint? = nil) throws -> String {
-        // Fix 2: accept either a precomputed embedding OR an embedder — if no embedding was
-        // passed but we have an embedder, compute one from the candidate label.
-        var embedding = embedding
-        if embedding == nil, let embedder { embedding = try? embedder.embed(candidate.label) }
+        let candidateText = Self.nodeEmbeddingText(candidate)
+        let version = embedder?.indexVersion
+        let queryEmbedding: IndexEmbedding?
+        if let version {
+            // The old precomputed argument has no model identity. Obtain named vectors directly
+            // from the compatible embedder and the same source text used by a rebuild.
+            queryEmbedding = (try? canUseEmbeddingIndex(version)) == true ? try? embedder?.embedForIndex(candidateText) : nil
+        } else if let embedding {
+            queryEmbedding = .init(values: embedding, version: nil)
+        } else {
+            queryEmbedding = try? embedder?.embedForIndex(candidate.label)
+        }
 
         var existing = try sameIDTarget(for: candidate)
-        if existing == nil, let embedding { existing = try findSemanticDuplicate(kind: candidate.kind, embedding: embedding, threshold: threshold, candidate: candidate) }
+        var embeddingRevision: Int64?
+        if existing == nil, let queryEmbedding {
+            if let version = queryEmbedding.version {
+                if let state = try? embeddingIndexState(), state.version == version {
+                    existing = try? findSemanticDuplicate(kind: candidate.kind, embedding: queryEmbedding,
+                                                          threshold: threshold, candidate: candidate)
+                    if existing != nil { embeddingRevision = state.revision }
+                }
+            } else {
+                existing = try? findSemanticDuplicate(kind: candidate.kind, embedding: queryEmbedding,
+                                                      threshold: threshold, candidate: candidate)
+            }
+        }
         if existing == nil { existing = try findDuplicate(kind: candidate.kind, label: candidate.label, candidate: candidate) }
 
-        if let existing {
-            let merged = mergeReinforced(existing: existing, candidate: candidate)
-            try upsert(merged, checkpoint: checkpoint)
-            // Fix 3: don't leave a merged node embedding-less. Re-setting a vector for the same
-            // cluster is harmless, so always store the embedding on merge when we have one —
-            // this lets future semantic dedup find a node first seen via string-only match.
-            if let embedding { try setEmbedding(nodeId: merged.id, embedding) }
-            return merged.id
-        } else {
-            try upsert(candidate, checkpoint: checkpoint)
-            if let embedding { try setEmbedding(nodeId: candidate.id, embedding) }
-            return candidate.id
+        let retained = existing.map { mergeReinforced(existing: $0, candidate: candidate) } ?? candidate
+        do {
+            try upsert(retained, checkpoint: checkpoint, embeddingRevision: embeddingRevision)
+        } catch EmbeddingIndexError.staleRevision {
+            return try upsertMerging(candidate, checkpoint: checkpoint)
         }
+        if let queryEmbedding {
+            let retainedText = Self.nodeEmbeddingText(retained)
+            let retainedEmbedding: IndexEmbedding?
+            if queryEmbedding.version == nil || retainedText.utf8.elementsEqual(candidateText.utf8) {
+                retainedEmbedding = queryEmbedding
+            } else {
+                retainedEmbedding = try? embedder?.embedForIndex(retainedText)
+            }
+            if let retainedEmbedding {
+                try? setEmbedding(nodeId: retained.id, retainedEmbedding, sourceText: retainedText)
+            }
+        }
+        return retained.id
     }
 
     /// Salience may increase with repetition; authority and identity never do.
@@ -316,6 +348,15 @@ extension MemoryStore {
     }
 
     private func compressKind(_ kind: String, embedder: Embedder?, threshold: Double) throws -> Int {
+        let version = embedder?.indexVersion
+        let revision: Int64?
+        if let version {
+            let state = try embeddingIndexState()
+            guard state.version == version else { return 0 }
+            revision = state.revision
+        } else {
+            revision = nil
+        }
         let nodes = try allNodes()
             .filter { $0.kind == kind && !$0.deleted }
             .sorted { ($0.salience, Double($0.mentionCount)) > ($1.salience, Double($1.mentionCount)) }
@@ -323,39 +364,48 @@ extension MemoryStore {
         var merged = 0
         let t = Date().timeIntervalSince1970
         for n in nodes {
-            guard let emb = try embeddingFor(nodeId: n.id, label: n.label, embedder: embedder) else { continue }
+            let sourceText = Self.nodeEmbeddingText(n)
+            let stored = try storedEmbedding(nodeID: n.id, version: version)
+            let fresh = stored == nil ? try? embedder?.embedForIndex(version == nil ? n.label : sourceText) : nil
+            guard let emb = stored ?? fresh.flatMap({ $0.version == version ? $0.values : nil }) else { continue }
             if let hit = kept.first(where: {
                 Self.cosineDistance($0.emb, emb) <= threshold && isSameSubject(existing: $0.node, candidate: n)
                     && isSameOccurrence(existing: $0.node, candidate: n)
             }) {
-                if let canonical = try node(id: hit.node.id) {
-                    var canon = mergeReinforced(existing: canonical, candidate: n)
-                    canon.mentionCount = canonical.mentionCount + n.mentionCount
-                    canon.salience = max(canonical.salience, n.salience)
-                    try upsert(canon)
+                do {
+                    let didMerge = try dbQueue.write { db in
+                        try Self.requireEmbeddingRevision(revision, db: db)
+                        guard let canonical = try Node.fetchOne(db, key: hit.node.id), !canonical.deleted,
+                              let duplicate = try Node.fetchOne(db, key: n.id), !duplicate.deleted,
+                              Self.nodeEmbeddingText(canonical).utf8.elementsEqual(Self.nodeEmbeddingText(hit.node).utf8),
+                              Self.nodeEmbeddingText(duplicate).utf8.elementsEqual(sourceText.utf8),
+                              isSameSubject(existing: canonical, candidate: duplicate),
+                              isSameOccurrence(existing: canonical, candidate: duplicate),
+                              try !Self.managedNodeIDs(db).contains(duplicate.id)
+                        else { return false }
+                        var canon = mergeReinforced(existing: canonical, candidate: duplicate)
+                        canon.mentionCount = canonical.mentionCount + duplicate.mentionCount
+                        canon.salience = max(canonical.salience, duplicate.salience)
+                        try Self.writeNode(canon, db: db)
+                        try Self.softDelete(nodeId: duplicate.id, db: db)
+                        try Edge(id: UUID().uuidString, srcId: duplicate.id, dstId: canonical.id, relation: .sameAs,
+                                 weight: 1, confidence: .probable, createdAt: t, updatedAt: t,
+                                 dirty: true, deleted: false, extra: nil).save(db)
+                        return true
+                    }
+                    if didMerge {
+                        try? linkToHub(nodeId: hit.node.id, kindRaw: hit.node.kind)
+                        merged += 1
+                    }
+                } catch EmbeddingIndexError.staleRevision {
+                    return merged
                 }
-                try softDelete(nodeId: n.id)
-                try upsert(Edge(id: UUID().uuidString, srcId: n.id, dstId: hit.node.id, relation: .sameAs,
-                                weight: 1, confidence: .probable, createdAt: t, updatedAt: t,
-                                dirty: true, deleted: false, extra: nil))
-                merged += 1
             } else {
-                try setEmbedding(nodeId: n.id, emb)
+                try? setEmbedding(nodeId: n.id, IndexEmbedding(values: emb, version: version), sourceText: sourceText)
                 kept.append((n, emb))
             }
         }
         return merged
-    }
-
-    /// Stored embedding for a node, else freshly embedded from its label, else nil.
-    private func embeddingFor(nodeId: String, label: String, embedder: Embedder?) throws -> [Float]? {
-        let stored: Data? = try dbQueue.read { db -> Data? in
-            guard let row = try Row.fetchOne(db, sql: "SELECT embedding FROM node_embedding WHERE node_id = ?",
-                                             arguments: [nodeId]) else { return nil }
-            return row["embedding"] as Data
-        }
-        if let stored { return Self.blobToFloats(stored) }
-        return try embedder?.embed(label)
     }
 
     /// Upsert the singleton self/user identity node (fixed id "self:user"). Always exactly one.
@@ -386,7 +436,13 @@ extension MemoryStore {
                                dirty: true, deleted: false, extra: nil)
             try upsert(newNode)
         }
-        if let embedder, let emb = try? embedder.embed(label) { try? setEmbedding(nodeId: id, emb) }
+        if let embedder, (try? canUseEmbeddingIndex(embedder.indexVersion)) == true,
+           let saved = try node(id: id) {
+            let sourceText = Self.nodeEmbeddingText(saved)
+            if let emb = try? embedder.embedForIndex(embedder.indexVersion == nil ? label : sourceText) {
+                try? setEmbedding(nodeId: id, emb, sourceText: sourceText)
+            }
+        }
         return id
     }
 

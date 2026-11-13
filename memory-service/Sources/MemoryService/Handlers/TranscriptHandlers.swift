@@ -33,8 +33,9 @@ struct TranscriptHandlers {
         let id = try services.transcript.append(threadId: body.threadId, turnIndex: body.turnIndex,
                                                role: body.role, text: body.text,
                                                now: Date().timeIntervalSince1970)
-        if let vec = try? services.embedder.embed(body.text) {
-            try? services.store.setTranscriptEmbedding(turnId: id, vec)
+        if (try? services.store.canUseEmbeddingIndex(services.embedder.indexVersion)) == true,
+           let vec = try? services.embedder.embedForIndex(body.text) {
+            try? services.store.setTranscriptEmbedding(turnId: id, vec, sourceText: body.text)
         }
         return Response(status: .ok, headers: [.contentType: "application/json"],
                         body: ResponseBody(byteBuffer: ByteBuffer(string: "{}")))

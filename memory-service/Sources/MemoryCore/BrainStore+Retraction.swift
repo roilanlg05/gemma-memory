@@ -555,8 +555,10 @@ extension BrainStore {
         if closure.purgeEverything {
             // Personal-memory artifacts only. Encrypted connection-service credentials, service
             // and model configuration are not memory and are never erased by a memory scope.
+            try db.execute(sql: "UPDATE embedding_index_pointer SET source_revision = source_revision + 1")
             for table in ["node", "node_fts", "node_embedding", "node_tags", "edge", "transcript",
-                          "transcript_embedding", "brain_evidence", "brain_evidence_operations",
+                          "transcript_embedding", "indexed_node_embedding", "indexed_transcript_embedding",
+                          "brain_evidence", "brain_evidence_operations",
                           "brain_claim", "brain_commit", "brain_projection", "brain_legacy_binding", "brain_supersession_disposition",
                           "sleep_cycle", "task_observation", "prospective_state", "prospective_delivery"] {
                 try db.execute(sql: "DELETE FROM \(table)")

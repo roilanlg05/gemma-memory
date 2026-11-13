@@ -145,8 +145,7 @@ public enum AgentPrompt {
         // Recent turns of THIS thread — multi-turn context so the agent doesn't lose the
         // conversation across turns (the gateway was previously stateless per turn).
         let history = conversationBlock(threadId: threadId, services: services)
-        let qv = try? services.embedder.embed(query)
-        var nodes = (try? services.retriever.retrieve(query: query, queryVector: qv)) ?? []
+        var nodes = (try? services.retriever.retrieve(query: query)) ?? []
         // Graph expansion: automatically include family members and close person nodes connected to self:user
         if let selfNode = try? services.store.selfNode(),
            let edges = try? services.store.edges(from: selfNode.id) {

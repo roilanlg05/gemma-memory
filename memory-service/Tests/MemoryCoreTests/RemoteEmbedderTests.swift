@@ -57,6 +57,32 @@ final class RemoteEmbedderTests: XCTestCase {
             // expected
         }
     }
+
+    func test_versioned_embedder_requires_exact_response_identity_and_shape() async throws {
+        let expected = EmbeddingIndexVersion(modelID: "test/a", dimension: 3, revision: "one")
+        let embedder = RemoteEmbedder(baseURL: URL(string: "http://embedder:8000")!, dimension: 3,
+                                      indexVersion: expected, session: makeSession())
+        let cases: [(String, Bool)] = [
+            (#"{"version":{"modelID":"test/a","dimension":3,"revision":"one"},"vectors":[[1,0,0]]}"#, true),
+            (#"{"version":{"modelID":"test/b","dimension":3,"revision":"one"},"vectors":[[1,0,0]]}"#, false),
+            (#"{"version":{"modelID":"test/a","dimension":3,"revision":"two"},"vectors":[[1,0,0]]}"#, false),
+            (#"{"vectors":[[1,0,0]]}"#, false),
+            (#"{"version":{"modelID":"test/a","dimension":3,"revision":"one"},"vectors":[[1,0]]}"#, false),
+            (#"{"version":{"modelID":"test/a","dimension":3,"revision":"one"},"vectors":[]}"#, false)
+        ]
+        for (body, shouldSucceed) in cases {
+            StubProtocol.stub = { req in
+                (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(body.utf8))
+            }
+            do {
+                let vectors = try await embedder.embed(["hello"])
+                XCTAssertTrue(shouldSucceed, "Unexpectedly accepted \(body)")
+                XCTAssertEqual(vectors, [[1, 0, 0]])
+            } catch {
+                XCTAssertFalse(shouldSucceed, "Unexpected error \(error)")
+            }
+        }
+    }
 }
 
 private extension Data {

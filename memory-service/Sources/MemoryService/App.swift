@@ -7,20 +7,25 @@ public struct AppConfig: Sendable {
     public var bearerToken: String
     public var dbPath: String
     public var embedderURL: String
+    public var embeddingVersion: EmbeddingIndexVersion
     public var modelURL: String
     public var modelName: String
     public var port: Int
 
     public init(bearerToken: String, dbPath: String, embedderURL: String, modelURL: String,
                 modelName: String = "unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit",
-                port: Int = 8081) {
+                port: Int = 8081, embeddingVersion: EmbeddingIndexVersion = AppConfig.defaultEmbeddingVersion) {
         self.bearerToken = bearerToken
         self.dbPath = dbPath
         self.embedderURL = embedderURL
+        self.embeddingVersion = embeddingVersion
         self.modelURL = modelURL
         self.modelName = modelName
         self.port = port
     }
+
+    public static let defaultEmbeddingVersion = EmbeddingIndexVersion(modelID: "BAAI/bge-m3", dimension: 1024,
+        revision: "5617a9f61b028005a4858fdac845db406aefb181")
 
     public static func testDefaults() -> AppConfig {
         AppConfig(bearerToken: "test-token", dbPath: ":memory:",
@@ -29,10 +34,17 @@ public struct AppConfig: Sendable {
                   port: 0)
     }
 
-    public static func fromEnvironment() -> AppConfig {
+    public static func fromEnvironment() throws -> AppConfig {
         let env = ProcessInfo.processInfo.environment
         guard let token = env["MEMORY_BEARER_TOKEN"] else {
-            fatalError("MEMORY_BEARER_TOKEN must be set")
+            throw ConfigurationError.missingBearerToken
+        }
+        let modelID = env["EMBED_MODEL"] ?? defaultEmbeddingVersion.modelID
+        let revision = env["EMBED_MODEL_REVISION"] ?? (modelID == defaultEmbeddingVersion.modelID ? defaultEmbeddingVersion.revision : "")
+        let rawDimension = env["EMBED_DIM"] ?? (modelID == defaultEmbeddingVersion.modelID ? String(defaultEmbeddingVersion.dimension) : "")
+        guard !modelID.isEmpty, revision.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil,
+              let dimension = Int(rawDimension), (1...65_536).contains(dimension) else {
+            throw ConfigurationError.invalidEmbeddingVersion
         }
         return AppConfig(
             bearerToken: token,
@@ -40,8 +52,28 @@ public struct AppConfig: Sendable {
             embedderURL: env["EMBEDDER_URL"] ?? "http://embedder:8000",
             modelURL: env["MODEL_URL"] ?? "http://host.docker.internal:8080",
             modelName: env["MODEL_NAME"] ?? "unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit",
-            port: Int(env["MEMORY_PORT"] ?? "8081") ?? 8081
+            port: Int(env["MEMORY_PORT"] ?? "8081") ?? 8081,
+            embeddingVersion: .init(modelID: modelID, dimension: dimension, revision: revision)
         )
+    }
+
+    enum ConfigurationError: Error, CustomStringConvertible {
+        case missingBearerToken, invalidEmbeddingVersion, invalidEmbedderURL
+
+        var description: String {
+            switch self {
+            case .missingBearerToken: "Set MEMORY_BEARER_TOKEN."
+            case .invalidEmbeddingVersion: "Set EMBED_MODEL, the full EMBED_MODEL_REVISION commit hash, and EMBED_DIM."
+            case .invalidEmbedderURL: "Set EMBEDDER_URL to an HTTP or HTTPS endpoint."
+            }
+        }
+    }
+
+    func makeEmbedder() throws -> RemoteEmbedder {
+        guard let url = URL(string: embedderURL), ["http", "https"].contains(url.scheme), url.host != nil else {
+            throw ConfigurationError.invalidEmbedderURL
+        }
+        return RemoteEmbedder(baseURL: url, dimension: embeddingVersion.dimension, indexVersion: embeddingVersion)
     }
 }
 
@@ -68,12 +100,13 @@ public final class Services: @unchecked Sendable {
     public init(config: AppConfig) throws {
         let store = try MemoryStore(path: config.dbPath, embeddingDim: 1024)
         self.store = store
+        let embedder = try config.makeEmbedder()
+        try store.bootstrapEmbeddingIndex(version: config.embeddingVersion)
         // Ensure kind hubs + backfill belongsToHub edges on every startup (idempotent).
         // Keeps the graph navigable even after a restart against an older DB.
         try store.ensureKindHubs()
         let transcript = TranscriptStore(dbQueue: store.dbQueue)
         self.transcript = transcript
-        let embedder = RemoteEmbedder(baseURL: URL(string: config.embedderURL)!)
         self.embedder = embedder
         self.retriever = MemoryRetriever(store: store, embedder: embedder)
         self.bearerToken = config.bearerToken
@@ -104,7 +137,8 @@ public final class Services: @unchecked Sendable {
         // The agent gateway reuses the same model config (cloud/local) as consolidation.
         self.agentClient = ToolCallingClient(
             configStore: modelConfig,
-            defaultBaseURL: URL(string: config.modelURL)!.appendingPathComponent("v1")
+            defaultBaseURL: URL(string: config.modelURL)!.appendingPathComponent("v1"),
+            defaultModel: config.modelName
         )
     }
 

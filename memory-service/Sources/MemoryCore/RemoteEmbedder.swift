@@ -13,6 +13,7 @@ import FoundationNetworking
 /// satisfy the protocol and delegates to the batched one.
 public final class RemoteEmbedder: Embedder, @unchecked Sendable {
     public let dimension: Int
+    public let indexVersion: EmbeddingIndexVersion?
     private let baseURL: URL
     private let session: URLSession
     private let timeout: TimeInterval
@@ -24,10 +25,12 @@ public final class RemoteEmbedder: Embedder, @unchecked Sendable {
     ///   - timeout: per-request timeout; the sidecar can be slow on cold start.
     public init(baseURL: URL,
                 dimension: Int = 1024,
+                indexVersion: EmbeddingIndexVersion? = nil,
                 session: URLSession = .shared,
                 timeout: TimeInterval = 30) {
         self.baseURL = baseURL
         self.dimension = dimension
+        self.indexVersion = indexVersion
         self.session = session
         self.timeout = timeout
     }
@@ -45,6 +48,15 @@ public final class RemoteEmbedder: Embedder, @unchecked Sendable {
             throw EmbedderError.remoteFailed(status: (response as? HTTPURLResponse)?.statusCode ?? -1)
         }
         let payload = try JSONDecoder().decode(EmbedResponse.self, from: data)
+        if let indexVersion {
+            guard payload.version == indexVersion, indexVersion.dimension == dimension else {
+                throw EmbedderError.versionMismatch
+            }
+            guard payload.vectors.count == texts.count,
+                  payload.vectors.allSatisfy({ $0.count == dimension && $0.allSatisfy(\.isFinite) }) else {
+                throw EmbedderError.invalidVectors
+            }
+        }
         return payload.vectors
     }
 
@@ -76,7 +88,12 @@ public final class RemoteEmbedder: Embedder, @unchecked Sendable {
     public enum EmbedderError: Error, Equatable {
         case remoteFailed(status: Int)
         case emptyResponse
+        case versionMismatch
+        case invalidVectors
     }
     private struct EmbedRequest: Encodable { let texts: [String] }
-    private struct EmbedResponse: Decodable { let vectors: [[Float]] }
+    private struct EmbedResponse: Decodable {
+        let vectors: [[Float]]
+        let version: EmbeddingIndexVersion?
+    }
 }

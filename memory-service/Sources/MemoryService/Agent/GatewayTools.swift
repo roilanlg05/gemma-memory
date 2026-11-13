@@ -173,9 +173,8 @@ public struct SaveMemoryGatewayTool: GatewayTool {
             sourceRef: nil, origin: .explicit, serverId: nil,
             dirty: true, deleted: false, extra: extra
         )
-        let embedding: [Float]? = try? services.embedder.embed(rawEntity)
         do {
-            let savedId = try services.store.upsertMergingSemantic(candidate, embedding: embedding, embedder: services.embedder)
+            let savedId = try services.store.upsertMergingSemantic(candidate, embedding: nil, embedder: services.embedder)
             if let selfNode = try? services.store.selfNode() {
                 let rel: Relation = (kind == NodeKind.preference.rawValue) ? .likes : .relatedTo
                 let edge = Edge(id: UUID().uuidString, srcId: selfNode.id, dstId: savedId, relation: rel,
@@ -613,6 +612,8 @@ public enum GatewayToolRegistry {
         CancelEventsGatewayTool(),
         UpdateEventGatewayTool(),
     ]
+
+    static let toolNames = gatewayTools.map { type(of: $0).name }
 
     /// OpenAI-style tool specs for all tools (pass directly to the model's `tools` array).
     /// Derived from `gatewayTools` (single source of truth) so the two can never diverge.

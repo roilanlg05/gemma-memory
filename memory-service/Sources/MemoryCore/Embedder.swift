@@ -5,7 +5,29 @@ import Foundation
 /// `FakeEmbedder` here keeps unit tests deterministic and dependency-free.
 public protocol Embedder: Sendable {
     var dimension: Int { get }
+    var indexVersion: EmbeddingIndexVersion? { get }
     func embed(_ text: String) throws -> [Float]
+}
+
+public extension Embedder {
+    var indexVersion: EmbeddingIndexVersion? { nil }
+
+    func embedForIndex(_ text: String) throws -> IndexEmbedding {
+        let version = indexVersion
+        let values = try embed(text)
+        try MemoryStore.validateEmbedding(values, dimension: version?.dimension ?? dimension)
+        return IndexEmbedding(values: values, version: version)
+    }
+}
+
+public struct IndexEmbedding: Sendable {
+    public let values: [Float]
+    public let version: EmbeddingIndexVersion?
+
+    public init(values: [Float], version: EmbeddingIndexVersion?) {
+        self.values = values
+        self.version = version
+    }
 }
 
 public enum MemoryError: Error { case embedderUnavailable }

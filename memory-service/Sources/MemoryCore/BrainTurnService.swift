@@ -127,8 +127,10 @@ public final class BrainTurnService {
     }
 
     @discardableResult
-    public func recordAssistant(turnID: String, operationID: String, text: String) throws -> BrainEvidence {
-        try journal.assistant(turnID: turnID, operationID: operationID, text: text, timestamp: clock())
+    public func recordAssistant(turnID: String, operationID: String, text: String,
+                                expectedErasureRevision: Int64? = nil) throws -> BrainEvidence {
+        try journal.assistant(turnID: turnID, operationID: operationID, text: text, timestamp: clock(),
+                              expectedErasureRevision: expectedErasureRevision)
     }
 
     /// Returns the sanitized receipt, not the original tool body. With the default sanitizer its

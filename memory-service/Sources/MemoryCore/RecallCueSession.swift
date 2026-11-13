@@ -39,7 +39,7 @@ public struct RecallFinalization: Sendable {
     fileprivate let scope: BrainAccessScope
     fileprivate let queryDigest: String
     fileprivate let lease: RecallAdmission
-    let vector: [Float]?
+    let vector: IndexEmbedding?
 
     func matches(brain: BrainStore, connectionID: String, turnID: String, threadID: String, scope: BrainAccessScope, query: String) -> Bool {
         self.connectionID == connectionID && self.turnID == turnID && self.threadID == threadID && self.scope == scope
@@ -55,7 +55,7 @@ public actor RecallCueSession {
         let token: UUID
         let turnID: String
         let digest: String
-        var vector: [Float]?
+        var vector: IndexEmbedding?
     }
 
     private let retriever: AssociativeRetriever
@@ -104,7 +104,7 @@ public actor RecallCueSession {
             return nil
         }
         let digest = BrainStore.digest(final.text)
-        var vector: [Float]?
+        var vector: IndexEmbedding?
         let token: UUID
         if let handle {
             guard let pending, pending.token == handle.token, pending.turnID == final.turnID else { return nil }
@@ -174,7 +174,7 @@ public actor RecallCueSession {
         if retired.count > 32 { retired.removeFirst() }
     }
 
-    private func rank(_ query: String, asOf: Double, budget: BrainRecallBudget, vector: [Float]?) throws -> BrainRecallResult {
+    private func rank(_ query: String, asOf: Double, budget: BrainRecallBudget, vector: IndexEmbedding?) throws -> BrainRecallResult {
         try retriever.brain.store.dbQueue.read { db in
             try retriever.retrieve(query: query, threadID: threadID, scope: scope, asOf: asOf, budget: budget, vector: vector, db: db)
         }

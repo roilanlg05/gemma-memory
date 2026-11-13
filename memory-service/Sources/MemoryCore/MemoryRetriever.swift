@@ -18,14 +18,24 @@ public final class MemoryRetriever: @unchecked Sendable {
     /// Retrieve up to `k` relevant nodes for a query.
     public func retrieve(query: String, k: Int = 8, now: Double = Date().timeIntervalSince1970,
                          queryVector: [Float]? = nil) throws -> [Node] {
+        let embedding = queryVector.map { IndexEmbedding(values: $0, version: nil) } ?? queryEmbedding(for: query)
+        return try retrieve(query: query, k: k, now: now, queryEmbedding: embedding)
+    }
+
+    public func queryEmbedding(for query: String) -> IndexEmbedding? {
+        guard let embedder, (try? store.canUseEmbeddingIndex(embedder.indexVersion)) == true else { return nil }
+        return try? embedder.embedForIndex(query)
+    }
+
+    public func retrieve(query: String, k: Int = 8, now: Double = Date().timeIntervalSince1970,
+                         queryEmbedding: IndexEmbedding?) throws -> [Node] {
+        guard k > 0 else { return [] }
         var pool: [String: Node] = [:]
         var sim: [String: Double] = [:]
 
-        // 1. Vector (semantic) — reuse a precomputed query vector when provided (avoids a second
-        // embedder round-trip when the caller already embedded the query).
-        let qv = queryVector ?? (embedder.flatMap { try? $0.embed(query) })
-        if let qv {
-            for hit in (try? store.nearest(to: qv, k: k * 2)) ?? [] {
+        // 1. Semantic lane shares the query embedding with transcript recall.
+        if let queryEmbedding {
+            for hit in (try? store.nearest(to: queryEmbedding, k: k * 2)) ?? [] {
                 if let n = try store.node(id: hit.id), !n.deleted {
                     pool[n.id] = n
                     sim[n.id] = 1.0 / (1.0 + hit.distance)
@@ -141,13 +151,28 @@ public final class MemoryRetriever: @unchecked Sendable {
 
     /// Vector lane for the brain's scoped recall. The caller supplies claims with live,
     /// authorized roots from the same transaction, so a legacy vector never grants access.
-    static func sourceBoundVectorScores(_ vector: [Float], supported: Set<String>, db: Database) throws -> [String: Double] {
+    static func sourceBoundVectorScores(_ query: IndexEmbedding, supported: Set<String>, db: Database) throws -> [String: Double] {
+        let vector = query.values
         guard !vector.isEmpty, vector.allSatisfy(\.isFinite) else { return [:] }
+        let table: String
+        let indexFilter: String
+        let arguments: StatementArguments
+        if let version = query.version {
+            guard vector.count == version.dimension,
+                  let indexID = try MemoryStore.activeEmbeddingIndexID(version, db: db) else { return [:] }
+            table = "indexed_node_embedding"
+            indexFilter = " AND e.index_id = ?"
+            arguments = [indexID]
+        } else {
+            table = "node_embedding"
+            indexFilter = ""
+            arguments = []
+        }
         let rows = try Row.fetchCursor(db, sql: """
             SELECT p.claim_id, e.embedding FROM brain_projection p
             JOIN node n ON n.id=p.node_id AND n.deleted=0
-            JOIN node_embedding e ON e.node_id=p.node_id WHERE p.suppressed=0
-            """)
+            JOIN \(table) e ON e.node_id=p.node_id WHERE p.suppressed=0\(indexFilter)
+            """, arguments: arguments)
         var scores = [String: Double]()
         while let row = try rows.next() {
             let id: String = row["claim_id"]

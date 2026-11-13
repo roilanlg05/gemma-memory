@@ -55,7 +55,7 @@ public final class BrainContextAssembler {
                 selection = .init()
             }
         }
-        var vector: [Float]?
+        var vector: IndexEmbedding?
         if let recallOptions {
             guard let recall else { throw BrainStoreError.denied }
             if recall.brain !== store.brain {

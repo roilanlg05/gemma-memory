@@ -80,9 +80,8 @@ final class BrainServices: @unchecked Sendable {
                 do {
                     return try await brain.context(context, startup: first, excluding: source.id,
                                                    prefetchMode: gateway == nil ? .consume : nil)
-                } catch BrainContextAssemblyError.insufficientBudget where gateway == nil {
-                    // The native caller still needs its receipt to complete the admitted turn.
-                    // Its local recent window can supply context within the provider's budget.
+                } catch BrainContextAssemblyError.insufficientBudget {
+                    // An unavailable context bundle must not prevent durable admission.
                     return nil
                 }
             }, afterLearning: { turnID, _ in
