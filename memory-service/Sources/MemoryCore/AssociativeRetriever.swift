@@ -18,6 +18,64 @@ public struct BrainRecallBudget: Equatable, Sendable {
 
 public enum BrainRecallStrategy: Equatable, Sendable { case hybrid, direct, vectorOnly }
 
+/// Short-lived acceleration for a single service and embedder. It holds query vectors, never
+/// input text, evidence, candidate IDs, or authorization decisions.
+public final class RecallQueryPrefetch: @unchecked Sendable {
+    public enum Mode: Sendable { case prepare, consume }
+
+    fileprivate struct Key: Equatable {
+        let threadID: String
+        let operationID: String
+        let digest: String
+    }
+
+    private struct Entry {
+        let key: Key
+        let vector: [Float]
+        let expiry: ContinuousClock.Instant
+    }
+
+    private let lock = NSLock()
+    private let clock = ContinuousClock()
+    private var entries: [Entry] = []
+    private var evictionScheduled = false
+
+    public init() {}
+
+    fileprivate func take(_ key: Key) -> [Float]? {
+        lock.withLock {
+            entries.removeAll { $0.expiry <= clock.now }
+            guard let index = entries.firstIndex(where: { $0.key == key }) else { return nil }
+            return entries.remove(at: index).vector
+        }
+    }
+
+    fileprivate func store(_ vector: [Float], for key: Key) {
+        lock.withLock {
+            let now = clock.now
+            entries.removeAll { $0.expiry <= now || $0.key == key }
+            if entries.count == 16 { entries.removeFirst() }
+            entries.append(.init(key: key, vector: vector, expiry: now.advanced(by: .seconds(15))))
+            scheduleEviction()
+        }
+    }
+
+    /// Called with the lock held. One timer covers both quiet periods and frequent reads.
+    private func scheduleEviction() {
+        guard !evictionScheduled, let expiry = entries.first?.expiry else { return }
+        evictionScheduled = true
+        Task { [weak self, clock] in
+            try? await clock.sleep(until: expiry)
+            guard let self else { return }
+            self.lock.withLock {
+                self.entries.removeAll { $0.expiry <= clock.now }
+                self.evictionScheduled = false
+                self.scheduleEviction()
+            }
+        }
+    }
+}
+
 public struct BrainRecallCandidate: Sendable {
     public let episodeID: String
     public let gist: String
@@ -77,10 +135,13 @@ struct RecallCue {
 public final class AssociativeRetriever {
     let brain: BrainStore
     private let semantic: RecallSemanticLane?
+    private let queryPrefetch: (cache: RecallQueryPrefetch, mode: RecallQueryPrefetch.Mode)?
 
-    public init(brain: BrainStore, embedder: (any Embedder)? = nil, semanticDeadlineMilliseconds: Int = 60) {
+    public init(brain: BrainStore, embedder: (any Embedder)? = nil, semanticDeadlineMilliseconds: Int = 60,
+                queryPrefetch: (cache: RecallQueryPrefetch, mode: RecallQueryPrefetch.Mode)? = nil) {
         self.brain = brain
         semantic = embedder.map { RecallSemanticLane(embedder: $0, deadlineMilliseconds: semanticDeadlineMilliseconds) }
+        self.queryPrefetch = queryPrefetch
     }
 
     public func retrieve(query: String, threadID: String, scope: BrainAccessScope, asOf: Double,
@@ -96,14 +157,21 @@ public final class AssociativeRetriever {
     }
 
     func queryVector(_ query: String, threadID: String, scope: BrainAccessScope,
-                     strategy: BrainRecallStrategy = .hybrid) async throws -> [Float]? {
+                     strategy: BrainRecallStrategy = .hybrid, operationID: String? = nil) async throws -> [Float]? {
         try brain.requirePrincipal()
         guard brain.authorization.threads.contains(threadID), brain.authorization.scopes.contains(scope) else {
             throw BrainStoreError.denied
         }
         guard strategy != .direct, let semantic, !RecallCue(query).terms.isEmpty else { return nil }
         _ = try brain.revision()
-        return await semantic.vector(for: String(query.prefix(4096)))
+        let input = String(query.prefix(4096))
+        guard let queryPrefetch, let operationID, scope == .user else { return await semantic.vector(for: input) }
+        let key = RecallQueryPrefetch.Key(threadID: threadID, operationID: operationID, digest: BrainStore.digest(query))
+        if queryPrefetch.mode == .consume, let vector = queryPrefetch.cache.take(key) { return vector }
+        let vector = await semantic.vector(for: input)
+        try Task.checkCancellation()
+        if queryPrefetch.mode == .prepare, let vector { queryPrefetch.cache.store(vector, for: key) }
+        return vector
     }
 
     func retrieve(query: String, threadID: String, scope: BrainAccessScope, asOf: Double,

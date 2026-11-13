@@ -64,7 +64,8 @@ public final class BrainContextAssembler {
             }
             guard recallOptions.asOf.isFinite else { throw BrainStoreError.invalid }
             if recallOptions.finalizedCue == nil {
-                vector = try await recall.queryVector(request.query, threadID: request.threadID, scope: recallOptions.scope)
+                vector = try await recall.queryVector(request.query, threadID: request.threadID, scope: recallOptions.scope,
+                                                      operationID: request.clientOperationID)
             }
             try Task.checkCancellation()
         }

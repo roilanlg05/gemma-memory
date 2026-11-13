@@ -10,6 +10,7 @@ final class BrainServices: @unchecked Sendable {
     let embedder: any Embedder
     let modelClient: any ModelTextClient
     let gatewayTurns = GatewayTurnCoordinator()
+    private let queryPrefetch = RecallQueryPrefetch()
     private let affectLock = NSLock()
     private var affectSessions: [String: AffectiveContextService] = [:]
     private var affectAccess: [String] = []
@@ -30,7 +31,7 @@ final class BrainServices: @unchecked Sendable {
     }
 
     func context(_ request: BrainContextRequest, startup: Bool = false, excluding currentSource: String? = nil,
-                 semanticSelection: Bool = true) async throws -> BrainContextBundle {
+                 semanticSelection: Bool = true, prefetchMode: RecallQueryPrefetch.Mode? = nil) async throws -> BrainContextBundle {
         let brain = BrainStore(store: store, authorization: grant(threadID: request.threadID))
         let conversation = ConversationStateStore(brain: brain)
         let affect = try affectService(threadID: request.threadID)
@@ -38,7 +39,8 @@ final class BrainServices: @unchecked Sendable {
         for _ in 0..<2 {
             let shared = try brain.ownerSharedRecall(threadID: request.threadID)
             let assembler = BrainContextAssembler(store: conversation, selector: selector, affect: affect,
-                recall: AssociativeRetriever(brain: shared, embedder: embedder))
+                recall: AssociativeRetriever(brain: shared, embedder: embedder,
+                    queryPrefetch: prefetchMode.map { (queryPrefetch, $0) }))
             do {
                 return try await assembler.context(request, recallOptions: .init(asOf: Date().timeIntervalSince1970,
                                                                                    includeStartupOrientation: startup))
@@ -74,7 +76,8 @@ final class BrainServices: @unchecked Sendable {
                                                       query: request.message.text, budget: request.budget)
                 let first = try brain.transcript.range(threadId: request.threadID, from: 1, to: 2).count == 1
                 do {
-                    return try await brain.context(context, startup: first, excluding: source.id)
+                    return try await brain.context(context, startup: first, excluding: source.id,
+                                                   prefetchMode: gateway == nil ? .consume : nil)
                 } catch BrainContextAssemblyError.insufficientBudget where gateway == nil {
                     // The native caller still needs its receipt to complete the admitted turn.
                     // Its local recent window can supply context within the provider's budget.

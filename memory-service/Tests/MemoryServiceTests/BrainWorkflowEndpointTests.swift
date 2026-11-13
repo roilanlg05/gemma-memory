@@ -22,6 +22,62 @@ final class BrainWorkflowEndpointTests: XCTestCase {
         ByteBuffer(bytes: try JSONEncoder().encode(value))
     }
 
+    private final class CountingEmbedder: Embedder, @unchecked Sendable {
+        let dimension = 8
+        private let lock = NSLock()
+        private var calls: [String] = []
+
+        func embed(_ text: String) throws -> [Float] {
+            lock.withLock { calls.append(text) }
+            return try FakeEmbedder(dimension: dimension).embed(text)
+        }
+
+        func count(_ text: String) -> Int {
+            lock.withLock { calls.filter { $0 == text }.count }
+        }
+    }
+
+    func testNativePrefetchOnlyReusesExactQueryForItsOwnTurnAndThread() async throws {
+        let store = try MemoryStore(inMemory: true, embeddingDim: 8)
+        let embedder = CountingEmbedder()
+        let transcript = TranscriptStore(dbQueue: store.dbQueue)
+        let services = await Services(store: store, transcript: transcript, embedder: embedder, bearerToken: "test-token")
+        let app = try await buildApp(services: services, port: 0)
+        let budget = try BrainContextBudget(contextTokens: 5500, outputTokens: 128)
+        let same = "Recuerda la maqueta color azul."
+        let corrected = "Recuerda la maqueta color verde."
+        let changedThread = "Recuerda el proyecto Molino."
+        let unrelatedOperation = "Recuerda el proyecto Semilla."
+        let readOnly = "Recuerda el proyecto Faro."
+
+        try await app.test(.router) { client in
+            let samples = [
+                ("same", "same-chat", "same", "same-chat", same, same, "prefetch", 1),
+                ("changed", "changed-chat", "changed", "changed-chat", same, corrected, "prefetch", 1),
+                ("thread", "draft-chat", "thread", "other-chat", changedThread, changedThread, "prefetch", 2),
+                ("draft", "different-op-chat", "other-op", "different-op-chat", unrelatedOperation, unrelatedOperation, "prefetch", 2),
+                ("read-only", "lookup-chat", "read-only", "lookup-chat", readOnly, readOnly, "cue", 2),
+            ]
+            for (cueID, cueThread, operationID, threadID, cueText, finalText, mode, expected) in samples {
+                let cue = try BrainContextRequest(clientOperationID: cueID, threadID: cueThread, query: cueText,
+                    budget: budget, quoteEvidenceIDs: [], detailEvidenceIDs: [])
+                let cueResult = try await client.execute(uri: "/v1/brain/context?mode=\(mode)", method: .post,
+                                                        headers: Self.auth, body: Self.bytes(cue))
+                XCTAssertEqual(cueResult.status, .ok)
+                XCTAssertTrue(try transcript.range(threadId: cueThread, from: 1, to: 4).isEmpty)
+
+                let turn = try BrainTurnRequest(clientOperationID: operationID, threadID: threadID,
+                    message: .init(id: "message-\(operationID)", speakerID: BrainIdentity.userID, text: finalText,
+                                   observedAt: 1, evidenceIDs: []), budget: budget)
+                let result = try await client.execute(uri: "/v1/brain/turns/begin", method: .post, headers: Self.auth,
+                                                      body: Self.bytes(turn))
+                XCTAssertEqual(result.status, .ok)
+                XCTAssertEqual(embedder.count(finalText), expected, "\(cueID)")
+                XCTAssertEqual(try transcript.range(threadId: threadID, from: 1, to: 4).map(\.text), [finalText])
+            }
+        }
+    }
+
     func testCompletionAndTypedOutcomesAreBoundToTheAdmittedTurn() async throws {
         let (app, services) = try await makeApp()
         let begin = try BrainTurnRequest(clientOperationID: "operation-begin", threadID: "chat",

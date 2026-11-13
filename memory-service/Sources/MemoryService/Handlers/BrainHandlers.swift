@@ -167,8 +167,14 @@ struct BrainHandlers {
         do {
             // The cue mode does not admit a turn, store a claim, or call a selector model.
             // A final begin request always assembles against freshly validated sources.
-            let cueOnly = request.uri.queryParameters["mode"] == "cue"
-            let bundle = try await services.brain.context(body, semanticSelection: !cueOnly)
+            let mode = request.uri.queryParameters["mode"]
+            let prefetch = mode == "prefetch"
+            guard !prefetch || (Self.validID(body.threadID) && Self.validID(body.clientOperationID)
+                && !body.clientOperationID.hasPrefix("gateway:") && body.query.utf8.count <= 1200 && selections.isEmpty) else {
+                return Self.failure(BrainStoreError.invalid)
+            }
+            let bundle = try await services.brain.context(body, semanticSelection: !prefetch && mode != "cue",
+                                                          prefetchMode: prefetch ? .prepare : nil)
             let data = try JSONEncoder().encode(bundle)
             return Response(status: .ok, headers: [.contentType: "application/json"],
                             body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
