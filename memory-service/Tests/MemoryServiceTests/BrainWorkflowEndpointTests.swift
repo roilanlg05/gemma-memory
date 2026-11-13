@@ -187,6 +187,44 @@ final class BrainWorkflowEndpointTests: XCTestCase {
         }
     }
 
+    func testNativeSmallWindowDeliversProjectCheckpointAndStartupOrientation() async throws {
+        let (app, services) = try await makeApp()
+        let owner = ConsolidationEvidenceAdapter.ownerID
+        let subject = "project:aurora"
+        let prior = "previous-chat"
+        let brain = BrainStore(store: services.store, authorization: .init(principal: owner, owner: owner,
+            subjects: [subject], scopes: [.user], threads: [prior],
+            sourceSpeakers: [.userMessage: [BrainIdentity.userID]], mayCommitClaims: true))
+        for (index, predicate, value, text) in [(1, "project.name", "Aurora", "Empezamos el proyecto Aurora."),
+                                                (2, "project.checkpoint", "Falta validar la importación.", "Terminamos revisando el plano.")] {
+            let source = BrainEvidence(id: "prior-source-\(index)", sourceKind: .userMessage, speakerID: BrainIdentity.userID,
+                threadID: prior, observedAt: Double(index), recordedAt: Double(index), accessScope: .user, text: text)
+            let claim = BrainClaim(id: "project-\(index)", revision: 0, subject: subject, predicate: predicate, value: .string(value),
+                modality: .asserted, status: .active, validFrom: Double(index), recordedAt: Double(index), evidenceIDs: [source.id])
+            let result = try brain.commit(.init(clientOperationID: "seed-\(index)", evidence: [source],
+                updates: [.init(claim: claim)], expectedRevision: brain.revision()))
+            XCTAssertEqual(result.state, .committed)
+        }
+        let request = try BrainTurnRequest(clientOperationID: "project-resume", threadID: "fresh-chat",
+            message: .init(id: "input", speakerID: BrainIdentity.userID, text: "Sigamos con el proyecto Aurora.",
+                           observedAt: 3, evidenceIDs: []),
+            budget: .init(contextTokens: 4096, outputTokens: 396, systemTokens: 900, toolTokens: 800))
+        try await app.test(.router) { client in
+            let response = try await client.execute(uri: "/v1/brain/turns/begin", method: .post, headers: Self.auth,
+                                                    body: Self.bytes(request))
+            XCTAssertEqual(response.status, .ok)
+            let result = try JSONDecoder().decode(BrainTurnResult.self, from: Data(response.body.readableBytesView))
+            let bundle = try XCTUnwrap(result.context)
+            XCTAssertTrue(bundle.renderedContext.contains("Falta validar la importación."), bundle.renderedContext)
+            XCTAssertTrue(bundle.renderedContext.contains("previous exchange opening orientation"), bundle.renderedContext)
+            XCTAssertTrue(bundle.renderedContext.contains("previous exchange closing orientation"), bundle.renderedContext)
+            XCTAssertTrue(bundle.recentMessageUnits.isEmpty)
+            let accounting = try XCTUnwrap(bundle.accounting)
+            XCTAssertLessThanOrEqual(accounting.estimatedInputTokens + accounting.reservedOutputTokens
+                                     + accounting.reservedSystemTokens + accounting.reservedToolTokens, 4096)
+        }
+    }
+
     func testStagedUpdateIdentityAffectAndForgetWorkflow() async throws {
         let (app, services) = try await makeApp()
         let native = try BrainTurnRequest(clientOperationID: "native-change", threadID: "workflow",

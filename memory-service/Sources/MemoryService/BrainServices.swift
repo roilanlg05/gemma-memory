@@ -43,14 +43,16 @@ final class BrainServices: @unchecked Sendable {
                     queryPrefetch: prefetchMode.map { (queryPrefetch, $0) }))
             do {
                 return try await assembler.context(request, recallOptions: .init(asOf: Date().timeIntervalSince1970,
-                                                                                   includeStartupOrientation: startup))
+                                                                                   includeStartupOrientation: startup),
+                                                   excludingCurrentMessageID: currentSource)
             } catch BrainStoreError.conflict {
                 try Task.checkCancellation()
             }
         }
         // Avoid reusing either discarded semantic result. A fresh, synchronous context snapshot
         // retains the active conversation when unrelated activity keeps changing the revision.
-        return try await BrainContextAssembler(store: conversation, affect: affect).context(request)
+        return try await BrainContextAssembler(store: conversation, affect: affect)
+            .context(request, excludingCurrentMessageID: currentSource)
     }
 
     func turnService(threadID: String) -> BrainTurnService {

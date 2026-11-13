@@ -37,7 +37,8 @@ public final class BrainContextAssembler {
         self.store = store; self.selector = selector; self.affect = affect
         self.recall = recall; self.opportunityGate = opportunityGate
     }
-    public func context(_ request: BrainContextRequest, recallOptions: RecallContextOptions? = nil) async throws -> BrainContextBundle {
+    public func context(_ request: BrainContextRequest, recallOptions: RecallContextOptions? = nil,
+                        excludingCurrentMessageID: String? = nil) async throws -> BrainContextBundle {
         let snapshot = try store.snapshot(threadID: request.threadID)
         // The envelope and the disclosure floor are checked before the selector runs, so a window
         // that cannot honestly report what it dropped fails before a model is called.
@@ -73,10 +74,12 @@ public final class BrainContextAssembler {
             let interaction = try affect?.interaction(threadID: request.threadID, authorizedBy: store.brain, db: db)
             if let recall, let recallOptions, let content = try RecallContextContent.build(retriever: recall,
                 request: request, current: current, options: recallOptions, gate: opportunityGate, vector: vector, db: db) {
-                let assembled = try assemble(current, request: request, selection: selection, interaction: interaction, recall: content)
+                let assembled = try assemble(current, request: request, selection: selection, interaction: interaction,
+                                             recall: content, excludingCurrentMessageID: excludingCurrentMessageID)
                 if recallOptions.acceptsPrepared(brain: recall.brain, request: request) { return assembled }
             }
-            return try assemble(current, request: request, selection: selection, interaction: interaction, recall: nil)
+            return try assemble(current, request: request, selection: selection, interaction: interaction,
+                                recall: nil, excludingCurrentMessageID: excludingCurrentMessageID)
         }
         try Task.checkCancellation()
         return result
@@ -211,7 +214,8 @@ public final class BrainContextAssembler {
     }
 
     private func assemble(_ snapshot: ConversationSnapshot, request: BrainContextRequest, selection: ConversationSelection,
-                          interaction: BrainInteractionState?, recall: RecallContextContent?) throws -> BrainContextBundle {
+                          interaction: BrainInteractionState?, recall: RecallContextContent?,
+                          excludingCurrentMessageID: String?) throws -> BrainContextBundle {
         let originals = Dictionary(uniqueKeysWithValues: snapshot.sources.map { ($0.evidence.id, $0.evidence) })
         let claims = Dictionary(uniqueKeysWithValues: snapshot.claims
             .filter(Self.admitsLegacySelection).map { ($0.id, $0) })
@@ -294,7 +298,9 @@ public final class BrainContextAssembler {
             return released
         }
         let timeline = Dictionary(uniqueKeysWithValues: snapshot.sources.enumerated().map { ($0.element.evidence.id, $0.offset) })
-        let groups = ConversationCompactor.groups(snapshot.sources).sorted {
+        // Begin already carries this exact message as its query. Charge and forward it once.
+        let priorSources = snapshot.sources.filter { $0.evidence.id != excludingCurrentMessageID }
+        let groups = ConversationCompactor.groups(priorSources).sorted {
             (timeline[$0.last?.evidence.id ?? ""] ?? -1) < (timeline[$1.last?.evidence.id ?? ""] ?? -1)
         }
         func recentUnits(_ group: [ConversationSource], cap: Int? = nil) -> [BrainMessageUnit] {
