@@ -14,7 +14,7 @@ public struct BrainGatewayAdmission: Codable, Equatable, Sendable {
 /// Captures admitted user turns once, learns before retrieval, and records only real output.
 /// Passive IGNORE admission belongs to the caller; this service never classifies ambient text.
 public final class BrainTurnService {
-    public typealias Retrieval = (BrainTurnRequest, BrainEvidence) async throws -> BrainContextBundle
+    public typealias Retrieval = (BrainTurnRequest, BrainEvidence) async throws -> BrainContextBundle?
     public typealias AfterLearning = (String, BrainEvidence) async -> Void
     private let brain: BrainStore
     private let journal: BrainTurnStore

@@ -69,6 +69,44 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                        ["Recordemos el plano.", "Me acuerdo del plano."])
     }
 
+    func testNativeBeginReturnsStableReceiptWhenOptionalContextDoesNotFit() async throws {
+        let (app, services) = try await makeApp()
+        let request = try BrainTurnRequest(clientOperationID: "small-context", threadID: "tight",
+            message: .init(id: "user-input", speakerID: BrainIdentity.userID, text: "La puerta es verde.",
+                           observedAt: 20, evidenceIDs: []),
+            budget: .init(contextTokens: 4096, outputTokens: 1024, systemTokens: 3071))
+        try await app.test(.live) { client in
+            let body = try Self.bytes(request)
+            let first = try await client.execute(uri: "/v1/brain/turns/begin", method: .post, headers: Self.auth, body: body)
+            XCTAssertEqual(first.status, .ok)
+            guard first.status == .ok else { return }
+            let receipt = try JSONDecoder().decode(BrainTurnResult.self, from: Data(first.body.readableBytesView))
+            XCTAssertNil(receipt.context)
+            XCTAssertEqual(receipt.completion.evidenceIDs.count, 1)
+
+            let replay = try await client.execute(uri: "/v1/brain/turns/begin", method: .post, headers: Self.auth, body: body)
+            XCTAssertEqual(replay.status, .ok)
+            let retried = try JSONDecoder().decode(BrainTurnResult.self, from: Data(replay.body.readableBytesView))
+            XCTAssertEqual(retried.turnID, receipt.turnID)
+            XCTAssertEqual(retried.completion.evidenceIDs, receipt.completion.evidenceIDs)
+
+            let complete = try BrainTurnCompletionRequest(clientOperationID: "small-context-reply",
+                turnID: receipt.turnID, assistantText: "Entendido.", evidenceIDs: receipt.completion.evidenceIDs)
+            try await client.execute(uri: "/v1/brain/turns/complete", method: .post, headers: Self.auth,
+                                     body: Self.bytes(complete)) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+            let context = try BrainContextRequest(clientOperationID: "explicit-context", threadID: request.threadID,
+                                                  query: request.message.text, budget: request.budget)
+            try await client.execute(uri: "/v1/brain/context", method: .post, headers: Self.auth,
+                                     body: Self.bytes(context)) { response in
+                XCTAssertEqual(response.status, .unprocessableContent)
+            }
+        }
+        XCTAssertEqual(try services.transcript.range(threadId: "tight", from: 1, to: 4).map(\.text),
+                       ["La puerta es verde.", "Entendido."])
+    }
+
     func testReadOnlyProfileAndProspectiveRoutesEnforceBearerAndScope() async throws {
         let (app, _) = try await makeApp()
         try await app.test(.live) { client in

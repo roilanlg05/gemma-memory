@@ -73,7 +73,13 @@ final class BrainServices: @unchecked Sendable {
                 let context = try BrainContextRequest(clientOperationID: request.clientOperationID, threadID: request.threadID,
                                                       query: request.message.text, budget: request.budget)
                 let first = try brain.transcript.range(threadId: request.threadID, from: 1, to: 2).count == 1
-                return try await brain.context(context, startup: first, excluding: source.id)
+                do {
+                    return try await brain.context(context, startup: first, excluding: source.id)
+                } catch BrainContextAssemblyError.insufficientBudget where gateway == nil {
+                    // The native caller still needs its receipt to complete the admitted turn.
+                    // Its local recent window can supply context within the provider's budget.
+                    return nil
+                }
             }, afterLearning: { turnID, _ in
                 _ = try? await affect.observe(turnID: turnID, now: Date().timeIntervalSince1970)
             })
