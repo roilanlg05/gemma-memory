@@ -188,7 +188,7 @@ public struct ToolCallingClient: AgentModelClient {
                          finalInstruction: String?) async throws -> AgentModelResult {
         let target = try resolve()
         var body: [String: Any] = [
-            "model": target.model, "max_tokens": outputTokens, "temperature": 0.3, "stream": false
+            "model": target.model, "max_tokens": outputTokens, "stream": false
         ]
         if target.anthropic {
             if !systemPrompt.isEmpty { body["system"] = systemPrompt }
@@ -205,6 +205,7 @@ public struct ToolCallingClient: AgentModelClient {
                 }
             }
         } else {
+            body["temperature"] = 0.3
             body["messages"] = compatibleMessages(systemPrompt: systemPrompt, userPrompt: userPrompt,
                                                    history: history, finalInstruction: finalInstruction)
             if target.localMLX { body["chat_template_kwargs"] = ["enable_thinking": false] }

@@ -176,6 +176,7 @@ final class AgentProviderWireTests: XCTestCase {
         XCTAssertNil(first.url.value(forHTTPHeaderField: "Authorization"))
         let initial = try first.json()
         XCTAssertEqual(initial["model"] as? String, "claude-fixture")
+        XCTAssertNil(initial["temperature"], "Anthropic rejects non-default temperature on newer models")
         XCTAssertEqual(initial["max_tokens"] as? Int, 1024)
         XCTAssertNil(initial["chat_template_kwargs"])
         let system = try XCTUnwrap(initial["system"] as? String)
