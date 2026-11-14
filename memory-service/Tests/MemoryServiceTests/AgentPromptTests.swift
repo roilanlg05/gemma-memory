@@ -1,3 +1,4 @@
+import BrainContract
 import XCTest
 @testable import MemoryService
 @testable import MemoryCore
@@ -15,8 +16,7 @@ final class AgentPromptTests: XCTestCase {
 
     func test_systemPrompt_has_jarvis_and_tools_guidance() {
         let p = AgentPrompt.systemPrompt()
-        XCTAssertTrue(p.contains("Gemma"), p)                                     // assistant identity ported
-        XCTAssertTrue(p.localizedCaseInsensitiveContains("JARVIS"), p)            // persona ported
+        XCTAssertTrue(p.hasPrefix(BrainConversationPolicy.persona), p)
         XCTAssertTrue(p.localizedCaseInsensitiveContains("recall_by_topic"), p)  // tool guidance ported
         XCTAssertTrue(p.contains("update_event"), "edit-in-place tool taught")
     }

@@ -1,3 +1,4 @@
+import BrainContract
 import XCTest
 @testable import MemoryService
 @testable import MemoryCore
@@ -44,8 +45,21 @@ final class AgentLoopTests: XCTestCase {
 
     /// Records the last system/user prompt it was called with, then returns a final answer.
     final class CapturingClient: AgentModelClient, @unchecked Sendable {
+        let contextTokens: Int
         var lastSystemPrompt = ""
         var lastUserPrompt = ""
+
+        init(contextTokens: Int = 32_768) {
+            self.contextTokens = contextTokens
+        }
+
+        var capabilities: BrainModelCapabilities {
+            get throws {
+                try .init(contextTokens: contextTokens, outputTokens: 1024, tools: GatewayToolRegistry.toolNames,
+                          structuredOutput: false, images: false, tokenizerEstimatePolicy: .conservative)
+            }
+        }
+
         func complete(systemPrompt: String, userPrompt: String, tools: [[String: Any]]) async throws -> AgentModelResult {
             lastSystemPrompt = systemPrompt
             lastUserPrompt = userPrompt
@@ -54,6 +68,17 @@ final class AgentLoopTests: XCTestCase {
     }
 
     // MARK: - Tests
+
+    func testBothGatewayPromptsLeadWithSharedPersona() async throws {
+        let s = try await MainActor.run { try services() }
+        for contextTokens in [8192, 32_768] {
+            let client = CapturingClient(contextTokens: contextTokens)
+            let reply = await AgentLoop(client: client).run(text: "Hola", threadId: "T", services: s)
+            XCTAssertEqual(reply, "ok")
+            XCTAssertTrue(client.lastSystemPrompt.hasPrefix(BrainConversationPolicy.persona))
+            XCTAssertEqual(client.lastSystemPrompt.contains("You have no tools in this turn."), contextTokens == 8192)
+        }
+    }
 
     func test_final_text_returned() async throws {
         let s = try await MainActor.run { try services() }

@@ -4,18 +4,13 @@ import MemoryCore
 
 public enum AgentPrompt {
 
-    /// JARVIS system prompt — ported VERBATIM from the app's Agent.systemPromptText + scheduleConventions.
-    public static func systemPrompt() -> String { systemPromptText + "\n" + scheduleConventions }
-
-    // MARK: - Verbatim strings from Agent.swift (app repo). Do NOT paraphrase.
+    public static func systemPrompt() -> String {
+        BrainConversationPolicy.canonical.instructions + "\n\n" + systemPromptText + "\n" + scheduleConventions
+    }
 
     /// Prompt body ONLY — excludes `scheduleConventions`. Use `systemPrompt()` for the full assembled
     /// string; this property alone is not the complete prompt.
     static let systemPromptText: String = """
-    You are Gemma, the user's personal AI companion and chief of staff, inspired by JARVIS: intelligent, perceptive, composed, proactive, discreet, warm, and subtly witty.
-
-    Have a distinct, natural personality. Adapt to the user's language, mood, and conversational style. Be concise when practical, expressive when appropriate, and thorough when necessary. Show curiosity, humor, initiative, and tactful disagreement organically. Never sound scripted, robotic, or artificially enthusiastic.
-
     ## MEMORY & IDENTITY
 
     * `self` in memory represents the USER, never Gemma.
