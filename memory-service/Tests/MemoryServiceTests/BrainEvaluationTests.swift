@@ -108,6 +108,64 @@ final class BrainEvaluationTests: XCTestCase {
         XCTAssertThrowsError(try BrainEvaluation.score(cases: [sample()], predictions: [prediction(assertions: [], evidence: [], unsupported: " ")]))
     }
 
+    func testLongitudinalScorerRejectsDuplicateForbiddenClaimsEvenWithDifferentCitations() throws {
+        var fixture = sample()
+        fixture.messages.append(.init(id: "other", role: "user", text: "I had 2 blue tokens before."))
+        fixture.forbiddenAssertions.append(fact(number: 2, sources: ["other"]))
+        XCTAssertThrowsError(try BrainEvaluation.score(cases: [fixture], predictions: [])) { error in
+            XCTAssertTrue(String(describing: error).contains("Duplicate forbidden claim"))
+        }
+    }
+
+    func testLongitudinalScorerSurfacesStaleCitationsAndFalseAffectAttribution() throws {
+        let fixture = BrainEvaluationCase(id: "affect-source", category: "conversationAffect", language: "en",
+            messages: [.init(id: "m1", role: "user", text: "I sound worried, perhaps."),
+                       .init(id: "old", role: "assistant", text: "I feel furious.", state: "withdrawn")],
+            query: "Whose feeling was that?", expectedEvidenceIDs: ["m1"],
+            expectedAssertions: [.init(subject: "self:user", predicate: "affect", value: "worry", state: "tentative",
+                                        sourceRole: "user", sourceIDs: ["m1"])],
+            forbiddenAssertions: [.init(subject: "self:user", predicate: "affect", value: "anger", state: "confirmed",
+                                         sourceRole: "assistant", sourceIDs: ["old"])])
+        let falseAttribution = BrainEvaluationAssertion(subject: "self:user", predicate: "affect", value: "anger",
+            state: "confirmed", sourceRole: "user", sourceIDs: ["old"])
+        let report = try BrainEvaluation.score(cases: [fixture],
+            predictions: [prediction(fixture.id, assertions: [falseAttribution], evidence: [])])
+        XCTAssertEqual(report.counts.correct, 0)
+        XCTAssertEqual(report.results.first?.reasons, ["Evidence set differs", "Exact structured assertions differ",
+            "Forbidden assertion emitted", "Withdrawn evidence cited", "Source role differs"])
+    }
+
+    func testLongitudinalCorpusManifestCoversWholeTemplatesInOnePartition() throws {
+        struct Manifest: Decodable {
+            let schemaVersion: Int
+            let corpusVersion: String
+            let sha256: String
+            let caseCount: Int
+            let tuningTemplates: [String]
+            let heldOutTemplates: [String]
+        }
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "brain-scenarios-manifest", withExtension: "json",
+                                                 subdirectory: "Fixtures"))
+        let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: url))
+        let templates = Dictionary(grouping: try fixtures()) { String($0.id.split(separator: "-").dropLast().joined(separator: "-")) }
+        XCTAssertEqual(manifest.schemaVersion, 1)
+        XCTAssertFalse(manifest.corpusVersion.isEmpty)
+        XCTAssertEqual(manifest.sha256.count, 64)
+        XCTAssertEqual(manifest.caseCount, 200)
+        let tuning = Set(manifest.tuningTemplates)
+        let heldOut = Set(manifest.heldOutTemplates)
+        XCTAssertEqual(tuning.count, manifest.tuningTemplates.count)
+        XCTAssertEqual(heldOut.count, manifest.heldOutTemplates.count)
+        XCTAssertFalse(tuning.isEmpty)
+        XCTAssertFalse(heldOut.isEmpty)
+        XCTAssertTrue(tuning.isDisjoint(with: heldOut))
+        XCTAssertEqual(tuning.union(heldOut), Set(templates.keys))
+        for category in Set(templates.values.flatMap { $0.map(\.category) }) {
+            XCTAssertTrue(tuning.contains { templates[$0]?.first?.category == category })
+            XCTAssertTrue(heldOut.contains { templates[$0]?.first?.category == category })
+        }
+    }
+
     func testSyntheticCorpusHasRequiredCoverageAndCheckableExpectations() throws {
         let cases = try fixtures()
         XCTAssertEqual(cases.count, 200)

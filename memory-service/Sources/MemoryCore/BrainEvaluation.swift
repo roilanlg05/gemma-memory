@@ -191,6 +191,7 @@ public enum BrainEvaluation {
         try require(Set(c.expectedEvidenceIDs) == Set(c.expectedAssertions.flatMap(\.sourceIDs)),
                     "Expected evidence differs from assertion citations: \(c.id)")
         let forbidden = Set(c.forbiddenAssertions.map(claim))
+        try require(forbidden.count == c.forbiddenAssertions.count, "Duplicate forbidden claim: \(c.id)")
         try require(!c.expectedAssertions.contains { forbidden.contains(claim($0)) }, "Contradictory expectations: \(c.id)")
     }
 

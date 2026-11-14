@@ -38,14 +38,14 @@ let package = Package(
             ]),
         .testTarget(
             name: "MemoryCoreTests",
-            dependencies: ["MemoryCore"],
-            resources: [.copy("Fixtures")]),
+            dependencies: ["MemoryCore"]),
         .testTarget(
             name: "MemoryServiceTests",
             dependencies: [
                 "BrainContract",
                 "MemoryService",
+                .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
-            ]),
+            ], resources: [.copy("Fixtures")]),
     ]
 )
