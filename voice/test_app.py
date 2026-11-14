@@ -210,7 +210,7 @@ def test_elevenlabs_stt_parses_text_and_forces_language(monkeypatch):
 def test_elevenlabs_stt_autodetect_when_language_none(monkeypatch):
     class FakeResp:
         def raise_for_status(self): pass
-        def json(self): return {"text": "hola", "language_code": "es"}
+        def json(self): return {"text": "hola", "language_code": "spa"}
 
     monkeypatch.setattr(httpx, "post", lambda url, **kw: FakeResp())
     stt = ElevenLabsScribeSTT(api_key="k", language=None)

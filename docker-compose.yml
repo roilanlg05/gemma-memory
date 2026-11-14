@@ -59,9 +59,9 @@ services:
       - VOICE_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
       - MEMORY_URL=http://memory:8081
       - MEMORY_BEARER_TOKEN=${MEMORY_BEARER_TOKEN}
-      # STT: ElevenLabs Scribe (cloud). Forces English so the reply language is pinned.
+      # STT: ElevenLabs Scribe (cloud). Auto-detect unless a language is configured.
       - STT_ENGINE=elevenlabs
-      - STT_LANGUAGE=en
+      - STT_LANGUAGE=${STT_LANGUAGE:-}
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
       - ELEVENLABS_STT_MODEL=scribe_v1
       # faster-whisper vars below are now the inert fallback (only used if STT_ENGINE is unset).

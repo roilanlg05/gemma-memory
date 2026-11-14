@@ -55,10 +55,11 @@ class FasterWhisperSTT:
 
 class ElevenLabsScribeSTT:
     """ElevenLabs Scribe speech-to-text (cloud). Expects 16 kHz mono WAV bytes.
-    `language` (ISO-639-1, e.g. "en") forces the language AND is returned verbatim, so the
+    `language` (ISO-639-1, e.g. "en") forces the language and determines the language code, so the
     downstream agent reply + TTS voice are pinned deterministically; leave None for auto-detect.
     No local model is loaded."""
     _URL = "https://api.elevenlabs.io/v1/speech-to-text"
+    _LANGUAGE_ALIASES = {"eng": "en", "spa": "es", "por": "pt", "fra": "fr", "deu": "de", "ita": "it"}
 
     def __init__(self, api_key: str, model: str = "scribe_v1", language: str | None = None):
         if not api_key:
@@ -78,8 +79,8 @@ class ElevenLabsScribeSTT:
         body = r.json()
         text = (body.get("text") or "").strip()
         # Forced language wins (deterministic pinning); else the detected code; else "en".
-        lang = self._language or body.get("language_code") or "en"
-        return text, lang
+        lang = (self._language or body.get("language_code") or "en").lower()
+        return text, self._LANGUAGE_ALIASES.get(lang, lang)
 
 
 # --- TTS ---------------------------------------------------------------------
