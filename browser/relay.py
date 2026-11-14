@@ -1,0 +1,834 @@
+"""El relé del stream del navegador: abre el socket del demonio en el i3, filtra,
+decide si el panel está «en vivo», y sirve a uno o varios visores.
+
+El servidor de streaming del demonio escucha SOLO en localhost del i3, en un
+puerto que le asigna el sistema operativo, así que la app no puede conectarse a
+él. Este módulo es el puente, y por estar en medio es también la frontera donde
+se hace cumplir el diseño: la app recibe seis clases de mensaje ya limpias y ya
+decididas, y no calcula nada sobre el estado del navegador.
+
+Tres piezas:
+  - `PanelState`: el predicado de «en vivo», la cuenta de acciones y el host del
+    panel. Es comprobable sola, sin red.
+  - `Viewer`: un visor conectado, con su propia tarea de escritura y su tope de
+    fps. El tope se aplica al DESCARTE y no a la cola: a un visor lento le toca
+    saltarse frames, nunca encolarlos, así que no puede retrasar al rápido ni
+    convertirse en el reloj de todos.
+  - `Relay`: el bucle del socket del demonio, el reparto y el acuse encadenado.
+
+Lo que este módulo NO hace, por restricción del diseño y no por descuido:
+  - no registra nunca el cuerpo de un mensaje del demonio, ni en un log, ni en el
+    texto de una excepción: `params` no sale de este proceso (spec §5.7 y §6.3);
+  - no escribe ningún frame a disco (spec §6.2(a));
+  - no llama nunca a `stream enable`, que devuelve `success:false` cuando ya está
+    activo, que es siempre (spec §5.1). El único uso del CLI es
+    `stream status --json`, para leer el puerto;
+  - no cachea el puerto: lo asigna el sistema operativo y cambia con cada demonio
+    (spec §5.2). Un relé que lo cachea deja el panel muerto el resto de la sesión;
+  - no decide «en vivo» por la edad del frame: los frames se emiten por cambio y
+    no por reloj, así que una página quieta sigue estando viva (spec §6.2(f));
+  - no se inventa un acuse al demonio: acusa cuando el visor le acusa a él, o
+    cuando no queda ningún visor con el frame en vuelo (spec §6.4);
+  - no acepta del visor ningún mensaje que no sea `ack`: no hay control remoto
+    (spec §7).
+"""
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import re
+import time
+from collections import deque
+from typing import Awaitable, Callable
+
+import websockets
+
+import cli
+import stream
+
+# Se usa en UN solo sitio y solo para el nombre de la clase de una excepción que
+# de otro modo moriría en silencio. Nada de cuerpos de mensaje, nunca.
+_log = logging.getLogger(__name__)
+
+# Sesión del CLI que sigue el panel. Un panel, una sesión (spec, no objetivos).
+#
+# ⚠️ EL VALOR TIENE QUE COINCIDIR con el `AGENT_BROWSER_SESSION` de la app (cuyo
+# valor por omisión es `AgentBrowserService.defaultSessionName`, en el repositorio
+# `personal_agent`). Si divergen, el navegador sigue funcionando y el panel se queda
+# EN BLANCO, en silencio, sin un error en ninguna parte: es la avería más barata de
+# producir y la más cara de diagnosticar de todo el panel. Por eso (a) está
+# declarada con su valor escrito en el `docker-compose.yml`, con el comentario
+# simétrico —una variable que solo existe dentro de un `os.environ.get` es una
+# trampa para el yo del futuro—, y (b) el visor declara su sesión en la URL del
+# socket y `session_mismatch` las compara.
+SESSION = os.environ.get("BROWSER_STREAM_SESSION", "gemma")
+
+# Para componer el motivo del `closed`: lo que el visor declara es texto de un
+# cliente, y al cable solo salen textos compuestos en el servidor.
+_SAFE_SESSION = re.compile(r"[^A-Za-z0-9_-]")
+_MAX_SESSION_IN_REASON = 64
+
+
+def session_mismatch(requested: str | None) -> str | None:
+    """Motivo del `closed` si el visor sigue otra sesión que el relé, o None.
+
+    El parámetro es OPCIONAL a propósito: un visor que no declara nada se comporta
+    como siempre, así que un cliente viejo no se rompe. Lo que mata esta guardia es
+    una clase de avería entera: hasta ahora los dos lados coincidían por dos
+    valores por omisión iguales en dos repositorios, no por un contrato.
+
+    El motivo nombra LOS DOS valores a propósito: uno que solo dijera «sesión
+    equivocada» no sirve para arreglarlo, porque el fallo es justamente no saber
+    cuál de los dos lados está mal. La app pinta el motivo de un `closed`, así que
+    esto llega a la pantalla del usuario.
+
+    Y de paso deja de ser necesario que la prueba en vivo del lado de la app cierre
+    la sesión de producción: puede pedir la suya (`gemma-live-test`) y recibir un
+    cierre explicado en vez de un panel mudo."""
+    if not isinstance(requested, str) or not requested or requested == SESSION:
+        return None
+    pedida = _SAFE_SESSION.sub("", requested)[:_MAX_SESSION_IN_REASON] or "(ilegible)"
+    return (f"el relé sigue la sesión «{SESSION}» y el visor pide «{pedida}»: no "
+            "coinciden, así que este panel no vería nada. Ajusta "
+            "BROWSER_STREAM_SESSION en el i3 o AGENT_BROWSER_SESSION en la app.")
+
+
+# Tope de fps que se le pide al demonio, declarado en la URL y no por un mensaje
+# `config`: es la única forma de que cubra el frame de apertura (spec §5.5, §6.2(c)).
+#
+# 25 fps, LOS DOS topes. Procedencia: medición de fluidez, repositorio
+# personal_agent,
+# docs/superpowers/notes/2026-11-08-medicion-fluidez-panel.md
+#
+# ESTOS DOS NÚMEROS ERAN 7, Y EL 7 ESTABA MAL. No por un error de cálculo: por una
+# premisa falsa. El comentario que ocupaba este sitio decía «una página de compras
+# se mira, no se anima» y «pasar de 10 a 7 no quita ningún fotograma de los que el
+# usuario veía de verdad». Las dos frases están ahora medidas como falsas. El
+# usuario mira vídeo de YouTube por este panel, y un vídeo SÍ se anima: pedir 7
+# entregaba exactamente 7,07 fps, que es lo que él describió como «súper lento».
+#
+# Medición del 2026-11-08, dentro del contenedor, contra un vídeo de YouTube de
+# verdad reproduciéndose, con `pacing=ack` igual que el relé:
+#
+#   tope pedido | fps logrados | KB/fotograma | Mbit/s
+#          7    |     7,07     |     47,0     |  2,72
+#         15    |    14,87     |     49,8     |  6,07
+#         30    |    25,18     |     48,2     |  9,95
+#         60    |    25,27     |     47,9     |  9,92
+#
+# 25 fps es el TECHO del i3 (i3-13100, 4 núcleos): pedir 30 y pedir 60 entregan
+# los mismos 25,2, así que pedir más que 25 solo quemaría CPU comparando
+# fotogramas que no existen. CPU medida a 25 fps: 60% de un núcleo. Y la cadena de
+# acuses no estorba: RTT Mac->i3 por Tailscale = 6,3 ms de media, y con un solo
+# fotograma en vuelo el techo que impone es 1/RTT ~= 158 fps.
+#
+# EL COSTE, DICHO CLARO: el pico pasa de 383 kB/s a 1,37 MB/s (25 x 54 715 B), que
+# son ~11 Mbit/s. Eso REVIENTA por 3,4x el presupuesto móvil de 400 kB/s que
+# gobernaba el 7. Ese presupuesto lo puse yo y el usuario nunca lo pidió; lo que
+# él pidió, textual, es que el panel sea «fluido, como si estuviera reproduciendo
+# un video de YouTube». Se le da lo que pidió y se le dice el coste. Lo que lo hace
+# soportable es que el demonio emite POR CAMBIO: una página quieta no manda
+# fotogramas y no cuesta nada, así que los 11 Mbit/s solo corren mientras hay algo
+# moviéndose en la pantalla. No es un caudal permanente, es un pico.
+#
+# EL VISOR PUEDE PEDIR MENOS, y es la vía para un móvil con datos contados: el
+# parámetro `maxFps` de la URL del socket se respeta hacia abajo (ver
+# `viewer_max_fps`). Un cliente en red móvil debería pedir 7 u 8 explícitamente.
+#
+# Se suben los dos porque el visor no puede recibir más de lo que el relé le pide
+# al demonio: con el demonio en 7, subir solo el tope del visor no cambiaría nada.
+DAEMON_MAX_FPS = 25
+# Tope por omisión de un visor, y el que se usa si pide uno inválido (ver arriba).
+DEFAULT_VIEWER_MAX_FPS = 25
+
+# Plazo del `stream status --json`, POR DEBAJO de PORT_TIMEOUT a propósito: así el
+# que salta es este, que es el camino limpio —`cli.run` mata el CLI y devuelve un
+# envelope de plazo agotado— y no la cancelación del `wait_for` de fuera. Medido
+# en vivo en el contenedor, con cero demonios corriendo: la primera llamada tarda
+# **0,38 s** y ya devuelve puerto (el servidor del stream no espera a que Chromium
+# arranque); la segunda, 0,00 s. Cinco segundos son un orden de magnitud de
+# margen.
+STATUS_TIMEOUT = 5.0
+# Plazo del lector del puerto visto desde el relé, por encima del de `cli.run`: el
+# lector se inyecta, y el relé no cuelga del plazo de quien se lo pase. Es la red,
+# no el plazo de trabajo.
+PORT_TIMEOUT = 8.0
+PORT_TRIES = 3                 # el demonio puede estar arrancando todavía
+PORT_RETRY_SECONDS = 2.0
+CONNECT_TIMEOUT = 5.0
+# Presupuesto del camino de arranque ENTERO, no de cada intento: es la cota de lo
+# que un visor puede tardar en saber que no hay panel. Los plazos por intento
+# suman más de un minuto entre los tres, y publicar eso como degradación sería
+# publicar una espera que nadie aguanta mirando una burbuja vacía. El
+# `state{live:false}` sale desde el primer instante, así que el panel es honesto
+# desde el segundo cero y esto solo acota el `closed` que lo remata.
+STARTUP_BUDGET = 25.0
+MAX_FRAME_BYTES = 8 * 1024 * 1024   # un frame son ~92 KB de base64; el tope es por si acaso
+CHANNEL_DEPTH = 64             # mensajes del canal ordenado pendientes por visor
+# Tiempo que el relé puede llevar sin poder acusar antes de declarar el panel
+# congelado. NO es la edad del frame: una página quieta no manda frames y no
+# tiene nada en vuelo, así que este plazo no la toca nunca.
+#
+# Generoso a propósito. Los dos errores no son simétricos: decir «congelado» de
+# un panel que funciona ocurre en el caso NORMAL —la ventana ocluida y el render
+# estrangulado, un tramo malo de Tailscale, un frame grande— y el usuario lo está
+# mirando; decir «en vivo» de un panel atascado solo ocurre en el caso ya roto, y
+# dura como mucho este plazo. Así que el plazo se estira en vez de pedir dos
+# mediciones seguidas, que es el mismo plazo más largo con estado de más.
+STALL_GRACE_SECONDS = 15.0
+STALL_TICK_SECONDS = 1.0
+# El socket del demonio no se suelta en el instante en que se va el último visor:
+# un visor que se va y vuelve a mitad de un turno encuentra el panel con su cuenta
+# y su host (Review Focus 4). Pasado el plazo se suelta, para no dejar al navegador
+# del i3 emitiendo frames para nadie.
+LINGER_SECONDS = 15.0
+
+
+class PanelState:
+    """El estado del panel, decidido en el i3 y mandado ya hecho al visor.
+
+    «En vivo» son cuatro propiedades de la CONEXIÓN, ninguna de la página: el
+    socket al demonio abierto, el relé acusando, el último `status` con
+    `screencasting: true`, y el panel sin colapsar (spec §6.2(f))."""
+
+    def __init__(self, screencasting: bool) -> None:
+        # Nace sembrado de lo que dijo el CLI y no de haber visto un `status`: ese
+        # canal no es durable (spec §5.9), y si el predicado exigiera haberlo
+        # visto, un panel que pinta frames nuevos se marcaría congelado.
+        self._socket_open = True
+        self._acking = True
+        self._screencasting = bool(screencasting)
+        self.collapsed = False
+        self.action_count = 0
+        self.host: str | None = None
+
+    @property
+    def live(self) -> bool:
+        return (self._socket_open and self._acking and self._screencasting
+                and not self.collapsed)
+
+    @property
+    def acking(self) -> bool:
+        return self._acking
+
+    def apply(self, decoded: dict) -> None:
+        """Aplica un mensaje ya filtrado por `stream.decode`."""
+        kind = decoded.get("kind")
+        if kind == "status":
+            self._screencasting = decoded.get("screencasting") is True
+            return
+        if kind == "frame":
+            # Un frame recibido ES el screencast ocurriendo, así que vale como
+            # prueba. Observado en vivo: el demonio manda `status` con
+            # `screencasting:false` justo al engancharse el relé y lo corrige con
+            # otro `status` solo unos segundos después; sin esto el panel diría
+            # «congelado» mientras pinta frames nuevos. Esto NO es la edad del
+            # frame decidiendo nada: es su llegada, no su antigüedad.
+            self._screencasting = True
+        if self.collapsed:
+            return  # un panel colapsado ni pinta ni narra ni cuenta
+        if kind == "command" and decoded.get("action"):
+            self.action_count += 1
+            host = stream.host_of(decoded.get("url"))
+            if host:
+                self.host = host
+
+    def begin_viewer_session(self) -> None:
+        """Arranca la cuenta del resumen para una observación nueva.
+
+        Los dos ciclos de vida no son el mismo, y aquí es donde se casan: el
+        `PanelState` vive por ERA DEL DEMONIO —que sobrevive `LINGER_SECONDS` sin
+        ningún visor, para que un visor que se va y vuelve a mitad de turno no
+        pague un arranque— y el panel de la app vive por TURNO. Sin este reinicio,
+        un turno que abre su panel dentro del plazo de gracia hereda la cuenta del
+        turno anterior y sigue sumando: el usuario vería «7 acciones» en un turno
+        en el que hizo dos, y el resumen es lo único que queda del turno en el
+        historial del chat.
+
+        Se llama cuando entra un visor y no había ninguno, que es el único momento
+        en que el relé puede alinear los dos ciclos sin añadir un contrato nuevo al
+        cable (el visor no declara turnos). El coste conocido: dos visores a la vez
+        (el Mac y el iPhone) comparten la cuenta, y el segundo hereda lo que el
+        primero llevaba visto. Es la misma consecuencia, ya aceptada, de que los
+        dos clientes compartan una sola sesión del navegador.
+
+        NO toca el predicado de «en vivo» —ni el socket, ni el acuse, ni el
+        screencast, ni `collapsed`—: el estado `live` lo sigue decidiendo el
+        servidor por la CONEXIÓN (spec §5.10), y el vigilante sigue mirando el
+        acuse y no la página, así que una página quieta sigue diciendo «en vivo»."""
+        self.action_count = 0
+        self.host = None
+
+    def freeze(self) -> None:
+        """El panel se congela: suelta su imagen y deja la línea de resumen."""
+        self.collapsed = True
+
+    def socket_closed(self) -> None:
+        self._socket_open = False
+
+    def set_acking(self, acking: bool) -> None:
+        self._acking = bool(acking)
+
+    def state_message(self) -> dict:
+        return {"type": "state", "live": self.live, "collapsed": self.collapsed}
+
+    def summary_message(self) -> dict:
+        return {"type": "summary", "text": stream.summary(self.host, self.action_count)}
+
+    def snapshot_messages(self) -> list[dict]:
+        """Lo que recibe un visor que acaba de entrar: el estado actual, no un
+        backlog (Review Focus 4). El `host` solo si hay uno; el cable fija `host`
+        como texto y un null rompería al lado de Swift."""
+        messages = [self.state_message(), self.summary_message()]
+        if self.host:
+            messages.append({"type": "host", "host": self.host})
+        return messages
+
+
+def viewer_max_fps(crudo) -> int:
+    """El tope de fps que se le concede a un visor, a partir de lo que pidió.
+
+    Es la puerta de entrada: el presupuesto de caudal lo sostiene
+    DEFAULT_VIEWER_MAX_FPS, así que ningún valor pedido puede superarlo. Ausente,
+    vacío, no numérico (`abc`, `7.5`), `0`, negativo o fuera de 1..120 cae en el
+    tope por omisión; uno válido por encima del tope se recorta a él, y uno menor
+    se respeta (un visor puede pedir MENOS). `0` ya NO significa «sin tope» para un
+    cliente de red: eso era un agujero por el que cualquiera pedía fps ilimitados.
+    (`add_viewer(max_fps=0)` sigue valiendo para las pruebas internas.)"""
+    try:
+        fps = int(crudo)
+    except (TypeError, ValueError):
+        return DEFAULT_VIEWER_MAX_FPS
+    if not 1 <= fps <= 120:
+        return DEFAULT_VIEWER_MAX_FPS
+    return min(fps, DEFAULT_VIEWER_MAX_FPS)
+
+
+def _frame_interval(max_fps) -> float:
+    """Segundos mínimos entre frames para un visor. `0` es sin tope, como en el
+    demonio; un valor fuera de 1..120 cae al tope por omisión, también como hace
+    el demonio con un `maxFps` inválido (spec §5.6)."""
+    try:
+        fps = int(max_fps)
+    except (TypeError, ValueError):
+        fps = DEFAULT_VIEWER_MAX_FPS
+    if fps == 0:
+        return 0.0
+    if not 1 <= fps <= 120:
+        fps = DEFAULT_VIEWER_MAX_FPS
+    return 1.0 / fps
+
+
+class Viewer:
+    """Un visor conectado al relé.
+
+    Tiene su propia tarea de escritura: el bucle del demonio nunca espera por el
+    socket de un visor. Eso importa porque un frame pasa del tope de escritura del
+    servidor ASGI, así que escribir a un visor atascado bloquearía al resto
+    (Review Focus 3). Los frames van a una ranura de uno que se reemplaza —nunca a
+    una cola—, y los mensajes del canal ordenado (narración, host, estado, resumen,
+    cierre) a una fila acotada que preserva su orden."""
+
+    def __init__(self, ws, max_fps: int) -> None:
+        self.ws = ws
+        self._min_interval = _frame_interval(max_fps)
+        self._next_frame_at = 0.0
+        self._channel: deque[dict] = deque(maxlen=CHANNEL_DEPTH)
+        self._frame: dict | None = None
+        self._wake = asyncio.Event()
+        self._drained = asyncio.Event()
+        self._drained.set()
+        self._gone = False
+        self._pump: asyncio.Task | None = None
+
+    @property
+    def gone(self) -> bool:
+        return self._gone
+
+    def start(self) -> None:
+        self._pump = asyncio.create_task(self._run())
+
+    def offer(self, message: dict) -> None:
+        """Encola un mensaje del canal ordenado. No espera al socket."""
+        if self._gone:
+            return
+        self._channel.append(message)
+        self._drained.clear()
+        self._wake.set()
+
+    def offer_frame(self, message: dict, now: float) -> bool:
+        """Ofrece un frame. Devuelve False si a este visor le toca saltárselo por
+        su tope de fps: se descarta, no se encola."""
+        if self._gone or now < self._next_frame_at:
+            return False
+        self._next_frame_at = now + self._min_interval
+        self._frame = message  # ranura del último: se reemplaza, no se acumula
+        self._drained.clear()
+        self._wake.set()
+        return True
+
+    async def flush(self, timeout: float = 2.0) -> None:
+        """Espera a que lo ofrecido salga, con plazo: un visor que no drena no
+        puede colgar el cierre del panel."""
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(self._drained.wait(), timeout)
+
+    async def stop(self) -> None:
+        self._gone = True
+        pump, self._pump = self._pump, None
+        if pump is not None:
+            pump.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await pump
+
+    async def _run(self) -> None:
+        while not self._gone:
+            await self._wake.wait()
+            self._wake.clear()
+            while self._channel and not self._gone:
+                await self._send(self._channel.popleft())
+            frame, self._frame = self._frame, None
+            if frame is not None and not self._gone:
+                await self._send(frame)
+            if not self._channel and self._frame is None:
+                self._drained.set()
+
+    async def _send(self, message: dict) -> None:
+        try:
+            await self.ws.send_json(message)
+        except Exception:
+            # El mensaje NO se registra: llevaría un frame entero al log.
+            self._gone = True
+            self._drained.set()
+            with contextlib.suppress(Exception):
+                await self.ws.close()
+
+
+def _swallow(task: asyncio.Task) -> None:
+    """Recoge la excepción de una tarea de la que ya no se espera nada, para que
+    asyncio no la registre con su traceback completo."""
+    if not task.cancelled():
+        with contextlib.suppress(Exception):
+            task.exception()
+
+
+def _ack_from(text: str) -> int | None:
+    """El `seq` de un `{"type":"ack","seq":N}` del visor, o None.
+
+    Cualquier otro mensaje del visor se ignora: el relé no reenvía nada al
+    demonio, así que no hay control remoto por esta vía (spec §7)."""
+    try:
+        message = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(message, dict) or message.get("type") != "ack":
+        return None
+    seq = message.get("seq")
+    if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0:
+        return seq
+    return None
+
+
+def _envelope_data(stdout: str) -> dict:
+    """El `data` del envelope del CLI, buscando desde la última línea. El stdout
+    NO se registra ni se devuelve en ningún error."""
+    for line in reversed(stdout.strip().splitlines()):
+        try:
+            envelope = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(envelope, dict) and envelope.get("success") is True:
+            data = envelope.get("data")
+            return data if isinstance(data, dict) else {}
+    return {}
+
+
+async def read_port() -> int | None:
+    """El puerto del servidor de streaming del demonio, leído del CLI.
+
+    Se llama en cada (re)conexión y nunca se cachea: lo asigna el sistema
+    operativo y cambia con cada demonio (spec §5.2). El único subcomando de
+    `stream` que se usa es `status`; `enable` no se llama nunca (spec §5.1)."""
+    arguments = ["--session", SESSION, "stream", "status", "--json"]
+    try:
+        cli.validate(arguments)  # la misma puerta que la red: `enable` no pasa
+        result = await cli.run(arguments, timeout=STATUS_TIMEOUT)
+    except Exception:
+        return None  # el motivo no se registra: arrastraría el stdout del CLI
+    if result.get("exitCode") != 0:
+        return None
+    port = _envelope_data(result.get("stdout") or "").get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
+        return port
+    return None
+
+
+class Relay:
+    """El relé, por sesión: un socket al demonio y los visores que lo miran."""
+
+    def __init__(self, read_port: Callable[[], Awaitable[int | None]], *,
+                 stall_grace: float = STALL_GRACE_SECONDS,
+                 linger: float = LINGER_SECONDS,
+                 startup_budget: float = STARTUP_BUDGET) -> None:
+        self._read_port = read_port
+        self._stall_grace = stall_grace
+        self._linger = linger
+        self._startup_budget = startup_budget
+        self._viewers: set[Viewer] = set()
+        self._panel: PanelState | None = None
+        self._daemon: object | None = None     # el socket al demonio, mientras vive
+        self._daemon_task: asyncio.Task | None = None
+        self._linger_task: asyncio.Task | None = None
+        self._closing_task: asyncio.Task | None = None
+        self._ack_lock = asyncio.Lock()
+        # El frame que está en vuelo y los visores que todavía no lo han acusado.
+        # Con `pacing=ack` el demonio mantiene como máximo uno (spec §5.6).
+        self._pending_seq: int | None = None
+        self._pending_viewers: set[Viewer] = set()
+        self._pending_since = 0.0
+
+    # --- visores ---
+
+    async def add_viewer(self, ws, max_fps: int) -> None:
+        """Atiende a un visor hasta que se va.
+
+        Le manda el estado actual al entrar (Review Focus 4) y solo le acepta
+        `ack`: el acuse del visor es el único momento en que el relé acusa al
+        demonio (spec §6.4)."""
+        viewer = Viewer(ws, max_fps)
+        abre_la_observacion = not self._viewers
+        self._viewers.add(viewer)
+        viewer.start()
+        self._cancel_linger()
+        if abre_la_observacion and self._panel is not None:
+            # Entra un visor sobre un panel que ya existía (el plazo de gracia
+            # mantuvo vivo el socket del demonio): su resumen tiene que describir
+            # lo que ESTE visor va a ver, no la historia del demonio.
+            self._panel.begin_viewer_session()
+        for message in self._snapshot():
+            viewer.offer(message)
+        self._ensure_daemon()
+        try:
+            while True:
+                seq = _ack_from(await ws.receive_text())
+                if seq is not None:
+                    await self.on_viewer_ack(viewer, seq)
+        except Exception:
+            pass  # el visor se fue; lo que mandó no se registra
+        finally:
+            await self._remove_viewer(viewer)
+
+    async def on_viewer_ack(self, viewer, seq: int) -> None:
+        """El visor acusó un frame, y el relé acusa al demonio en ese momento.
+
+        Basta el PRIMER acuse del frame en vuelo, no el de todos los visores: si
+        hiciera falta el de todos, el visor más lento marcaría el ritmo del
+        demonio y sería el reloj de los demás (Review Focus 3). Un visor lento
+        recibe descartes por su tope de fps, y eso es toda su degradación. Los
+        acuses son acumulativos, así que uno más nuevo cubre los anteriores.
+
+        Solo cuenta el acuse de un visor que se quedó ESTE frame: a un visor que
+        se lo saltó por su tope de fps no se le puede dejar mover el ritmo del
+        demonio ni mantener `acking` en `True` sin haber pintado nada."""
+        if self._pending_seq is None or seq < self._pending_seq:
+            return
+        if viewer not in self._pending_viewers:
+            return
+        await self._ack_daemon(self._pending_seq)
+
+    async def shutdown(self) -> None:
+        """Suelta el socket del demonio y las tareas de todos los visores."""
+        self._cancel_linger()
+        await self._drop_daemon()
+        for viewer in list(self._viewers):
+            self._viewers.discard(viewer)
+            await viewer.stop()
+
+    # --- reparto ---
+
+    def _snapshot(self) -> list[dict]:
+        panel = self._panel
+        if panel is None:
+            # Todavía no hay socket al demonio, así que el panel no está en vivo.
+            return [{"type": "state", "live": False, "collapsed": False}]
+        return panel.snapshot_messages()
+
+    def _broadcast(self, message: dict) -> None:
+        for viewer in list(self._viewers):
+            viewer.offer(message)
+
+    def _fan_out(self, is_frame: bool, messages: list[dict]) -> set[Viewer]:
+        """Reparte sin esperar por ningún socket. Devuelve los visores que se
+        quedan el frame en vuelo, que son los que tendrán que acusarlo."""
+        if not messages:
+            return set()
+        now = time.monotonic()
+        served: set[Viewer] = set()
+        for viewer in list(self._viewers):
+            if viewer.gone:
+                continue
+            if is_frame:
+                if viewer.offer_frame(messages[0], now):
+                    served.add(viewer)
+                continue
+            for message in messages:
+                viewer.offer(message)
+        return served
+
+    async def _remove_viewer(self, viewer: Viewer) -> None:
+        self._viewers.discard(viewer)
+        awaited = viewer in self._pending_viewers
+        self._pending_viewers.discard(viewer)
+        pending = self._pending_seq
+        no_viewers = not self._viewers
+        await viewer.stop()
+        # Sin ningún visor con el frame en vuelo se acusa igual: si no, el ritmo
+        # del demonio quedaría atascado para siempre (spec §6.4).
+        if awaited and pending is not None and not self._pending_viewers:
+            await self._ack_daemon(pending)
+        if no_viewers:
+            self._schedule_linger()
+
+    # --- el socket del demonio ---
+
+    def _ensure_daemon(self) -> None:
+        task = self._daemon_task
+        if task is None or task.done():
+            self._daemon_task = asyncio.create_task(self._run_daemon())
+            self._daemon_task.add_done_callback(self._on_daemon_task_done)
+
+    def _on_daemon_task_done(self, task: asyncio.Task) -> None:
+        """Red de seguridad de la era del demonio.
+
+        Si `_run_daemon` muriera por algo que sus `except Exception` no cubren,
+        el visor se quedaría con su `state{live:false}` y SIN `closed`, que es
+        justo el fallo que los plazos de arranque existen para evitar, y con la
+        política de no registrar nada sería indepurable.
+
+        Se registra SOLO el nombre de la clase de la excepción. Nunca `str(e)` ni
+        sus argumentos: podrían arrastrar un cuerpo de mensaje, y `params` no sale
+        de este proceso por ninguna vía, tampoco por un log de error."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        _log.error("la era del socket del demonio terminó por %s", type(error).__name__)
+        with contextlib.suppress(Exception):
+            # Se guarda la referencia por dos razones: asyncio solo mantiene
+            # referencias débiles a las tareas, y una excepción sin recoger la
+            # registraría él con el traceback completo, que sería la única vía de
+            # log del módulo fuera de la disciplina del nombre de la clase.
+            self._closing_task = asyncio.get_running_loop().create_task(
+                self._announce_gone("el panel se cortó"))
+            self._closing_task.add_done_callback(_swallow)
+
+    async def _run_daemon(self) -> None:
+        """Una era del socket del demonio: arranca, reparte y acusa hasta que se
+        cae, y anuncia el cierre.
+
+        El arranque y el bombeo están separados a propósito: el arranque entero
+        lleva un presupuesto global (`STARTUP_BUDGET`), y el bombeo no lleva
+        ninguno porque un panel vivo dura lo que dure la sesión."""
+        connection = await self._connect_within_budget()
+        if connection is None:
+            await self._announce_gone("el navegador no está disponible")
+            return
+        await self._pump_daemon(connection)
+        await self._announce_gone("socket caído")
+
+    async def _connect_within_budget(self):
+        """El camino de arranque, con UN plazo para todo él.
+
+        Los plazos por intento no bastan: tres intentos de leer el puerto y
+        abrir el socket suman más de un minuto, y el visor estaría esperando su
+        `closed` todo ese rato. Con el presupuesto global, el peor caso para
+        saber que no hay panel es `STARTUP_BUDGET`."""
+        try:
+            return await asyncio.wait_for(self._connect_attempts(), self._startup_budget)
+        except Exception:
+            return None
+
+    async def _connect_attempts(self):
+        """Lee el puerto y abre el socket, reintentando. Cada intento vuelve a
+        leer el puerto: nunca se cachea. Los reintentos cubren el caso real de
+        que el demonio esté arrancando todavía, porque el panel se abre a la vez
+        que la primera herramienta del turno, que es la que lo levanta."""
+        for attempt in range(PORT_TRIES):
+            port = await self._read_port_safely()
+            if port is not None:
+                connection = await self._open_daemon(port)
+                if connection is not None:
+                    return connection
+            if attempt + 1 < PORT_TRIES:
+                await asyncio.sleep(PORT_RETRY_SECONDS)
+        return None
+
+    async def _read_port_safely(self) -> int | None:
+        """Con plazo propio, además del presupuesto global: el lector se inyecta,
+        y el relé no cuelga del plazo de quien se lo pase."""
+        try:
+            return await asyncio.wait_for(self._read_port(), PORT_TIMEOUT)
+        except Exception:
+            return None  # sin registrar el motivo: arrastraría el stdout del CLI
+
+    async def _open_daemon(self, port: int):
+        try:
+            return await asyncio.wait_for(
+                websockets.connect(
+                    f"ws://127.0.0.1:{port}/?pacing=ack&maxFps={DAEMON_MAX_FPS}",
+                    max_size=MAX_FRAME_BYTES),
+                CONNECT_TIMEOUT)
+        except Exception:
+            return None
+
+    async def _pump_daemon(self, connection) -> None:
+        """Consume los mensajes del socket del demonio hasta que se cierra."""
+        # El CLI dio un puerto y acabamos de engancharnos con `pacing=ack`: el
+        # panel nace en vivo. `stream status` dice `screencasting:false` hasta que
+        # un consumidor se engancha, así que sembrarlo de ahí dejaría el panel
+        # congelado mientras pinta frames nuevos. El primer `status` del demonio
+        # lo corrige si hace falta.
+        self._daemon = connection
+        self._panel = PanelState(screencasting=True)
+        self._broadcast(self._panel.state_message())
+        watchdog = asyncio.create_task(self._watch_stall())
+        try:
+            async for message in connection:
+                if isinstance(message, str):  # el stream es JSON en texto (§5.4)
+                    await self._on_daemon_text(message)
+        except Exception:
+            pass  # el socket se cayó; el cuerpo que lo causó no se registra
+        finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watchdog
+            self._daemon = None
+            with contextlib.suppress(Exception):
+                await connection.close()
+
+    async def _on_daemon_text(self, text: str) -> None:
+        """Un mensaje del demonio: se filtra, se aplica al panel, se reparte, y se
+        anota el acuse como pendiente. `params` muere en `stream.decode`."""
+        decoded = stream.decode(text)
+        if decoded is None:
+            return
+        if decoded.get("kind") == "frame" and decoded.get("captured_at") is None:
+            # `stream.decode` es puro y no tiene reloj; el sello lo pone el relé
+            # porque el cable fija `captured_at` como número.
+            decoded["captured_at"] = time.time()
+        panel = self._panel
+        was_live = panel.live if panel is not None else False
+        resumen_antes = (panel.action_count, panel.host) if panel is not None else None
+        if panel is not None:
+            panel.apply(decoded)
+        messages = stream.wire_messages(decoded)
+        if panel is not None and panel.collapsed:
+            messages = []  # un panel congelado no vuelve a pintar (spec §6.2(g))
+        served = self._fan_out(decoded.get("kind") == "frame", messages)
+        if panel is not None and (panel.action_count, panel.host) != resumen_antes:
+            # El resumen se reenvía cada vez que cambia, y no solo al morir el
+            # socket del demonio: en un turno normal el que se va es el VISOR —la
+            # app cierra el socket al acabar el turno— y entonces ya no hay a quién
+            # mandárselo. Así el visor tiene SIEMPRE el resumen vigente en el
+            # instante en que la app congela el panel, que es cuando lo pinta; sin
+            # esto, la etiqueta del panel plegado se quedaba en su literal de
+            # reserva («navegador») y el turno no dejaba rastro (spec §6.2(g),
+            # §10(2)). Va después del reparto para que la narración de la acción
+            # llegue antes que el resumen que la cuenta.
+            self._broadcast(panel.summary_message())
+        seq = stream.ack_seq(decoded)
+        if seq is not None:
+            self._pending_seq = seq
+            self._pending_viewers = served
+            self._pending_since = time.monotonic()
+            if not served:
+                # Nadie se quedó el frame (ilegible, descartado por fps, o sin
+                # visores): se acusa ya, o el ritmo se atasca.
+                await self._ack_daemon(seq)
+        if panel is not None and panel.live != was_live:
+            self._broadcast(panel.state_message())
+
+    async def _ack_daemon(self, seq: int) -> None:
+        """El único sitio del relé que acusa al demonio."""
+        self._pending_seq = None
+        self._pending_viewers = set()
+        connection = self._daemon
+        if connection is None:
+            return
+        async with self._ack_lock:  # un solo escritor en el socket del demonio
+            try:
+                await connection.send(json.dumps({"type": "ack", "seq": seq}))
+            except Exception:
+                return
+        panel = self._panel
+        if panel is not None and not panel.acking:
+            panel.set_acking(True)
+            self._broadcast(panel.state_message())
+
+    async def _watch_stall(self) -> None:
+        """Vigila el acuse, no la página: un frame en vuelo que ningún visor acusa
+        significa que el relé no está acusando, y un panel que no acusa está
+        congelado (spec §6.2(f)). No se inventa el acuse para destrabarlo."""
+        tick = max(0.01, min(STALL_TICK_SECONDS, self._stall_grace / 2))
+        while True:
+            await asyncio.sleep(tick)
+            panel = self._panel
+            if panel is None or self._pending_seq is None or not panel.acking:
+                continue
+            if time.monotonic() - self._pending_since < self._stall_grace:
+                continue
+            panel.set_acking(False)
+            self._broadcast(panel.state_message())
+
+    async def _announce_gone(self, reason: str) -> None:
+        """El socket del demonio ya no está: el panel se marca congelado, suelta su
+        imagen dejando la línea de resumen, y los visores se cierran."""
+        panel, self._panel = self._panel, None
+        self._pending_seq = None
+        self._pending_viewers = set()
+        if panel is not None:
+            panel.socket_closed()
+            panel.freeze()
+            self._broadcast(panel.state_message())
+            self._broadcast(panel.summary_message())
+        self._broadcast({"type": "closed", "reason": reason})
+        for viewer in list(self._viewers):
+            await viewer.flush()
+            with contextlib.suppress(Exception):
+                await viewer.ws.close()
+
+    # --- el plazo de gracia sin visores ---
+
+    def _schedule_linger(self) -> None:
+        task = self._daemon_task
+        if task is None or task.done():
+            return
+        self._cancel_linger()
+        self._linger_task = asyncio.create_task(self._linger_then_drop())
+
+    def _cancel_linger(self) -> None:
+        task, self._linger_task = self._linger_task, None
+        if task is not None:
+            task.cancel()
+
+    async def _linger_then_drop(self) -> None:
+        await asyncio.sleep(self._linger)
+        if self._viewers:
+            return
+        await self._drop_daemon()
+
+    async def _drop_daemon(self) -> None:
+        task, self._daemon_task = self._daemon_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        connection, self._daemon = self._daemon, None
+        if connection is not None:
+            with contextlib.suppress(Exception):
+                await connection.close()
+        self._panel = None
+        self._pending_seq = None
+        self._pending_viewers = set()

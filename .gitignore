@@ -3,6 +3,8 @@
 
 # Python
 embedder/__pycache__/
+browser/__pycache__/
+voice/__pycache__/
 embedder/models/
 embedder/.pytest_cache/
 embedder/.venv/
@@ -20,3 +22,6 @@ docker-data/
 # OS
 .DS_Store
 .venv-voicetest/
+
+# Git worktrees (aislamiento de ramas de trabajo)
+.worktrees/

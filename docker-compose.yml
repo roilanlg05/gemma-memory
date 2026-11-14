@@ -84,6 +84,56 @@ services:
       retries: 3
     restart: unless-stopped
 
+  browser:
+    build:
+      context: ./browser
+    ports:
+      - "8083:8083"
+    environment:
+      # Secreto PROPIO del navegador, NO el de la memoria. Dos razones: este
+      # servicio conduce un Chromium de verdad dentro de la red del usuario, así
+      # que no puede quedarse guardado por el placeholder débil y conocido de
+      # MEMORY_BEARER_TOKEN; y el despliegue que ya está en marcha usa su propio
+      # token, así que reusar el de la memoria daría 401 en TODAS las herramientas
+      # del navegador en cuanto se redesplegara. Define BROWSER_BEARER_TOKEN en el
+      # `.env` con una cadena larga y aleatoria (ver `.env.example`).
+      - BROWSER_BEARER_TOKEN=${BROWSER_BEARER_TOKEN}
+      # Sesión del CLI que sigue el relé del panel.
+      # ⚠️ TIENE QUE COINCIDIR con el AGENT_BROWSER_SESSION de la app (valor por
+      # omisión `gemma`, en el repositorio `personal_agent`). Si divergen, el
+      # navegador sigue funcionando y el panel se queda EN BLANCO, sin un error en
+      # ninguna parte. El relé lo compara con la sesión que declara el visor y
+      # cierra con un motivo que nombra las dos (ver `SESSION` en browser/relay.py).
+      # Se declara aquí con su valor escrito a propósito: una variable que solo
+      # existe dentro de un `os.environ.get` es una trampa para el yo del futuro.
+      - BROWSER_STREAM_SESSION=gemma
+      - TZ=${TZ:-America/Havana}
+      # Chrome de Debian; sin esto el CLI busca uno que no existe en la imagen.
+      - AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+      # AGENT_BROWSER_NO_XVFB queda SIN declarar a propósito: en Linux el CLI usa
+      # Xvfb (la imagen lo instala). No añadirla.
+      # El demonio se apaga por inactividad; media hora cubre una conversación larga.
+      - AGENT_BROWSER_IDLE_TIMEOUT_MS=1800000
+      - AGENT_BROWSER_SOCKET_DIR=/run/agent-browser
+      # Calidad y tamaño máximo del JPEG del streaming: 1080x608 a calidad 45.
+      # Salen de una medición real, no de un valor heredado (el 640x360 q20
+      # anterior se veía borroso). Procedencia: repositorio personal_agent,
+      # docs/superpowers/notes/2026-11-08-medicion-nitidez-panel.md
+      # docker-compose.browser.yml define el mismo servicio y TIENE QUE decir lo
+      # mismo: browser/test_compose.py lo comprueba. Si se cambia uno, el otro.
+      - AGENT_BROWSER_STREAM_QUALITY=45
+      - AGENT_BROWSER_STREAM_MAX_WIDTH=1080
+      - AGENT_BROWSER_STREAM_MAX_HEIGHT=608
+      # Que no toque la red en cada llamada.
+      - AGENT_BROWSER_NO_VERSION_CHECK=1
+    # Sin depends_on: el navegador no necesita la memoria.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
 volumes:
   embedder-models:
   voice-models:
