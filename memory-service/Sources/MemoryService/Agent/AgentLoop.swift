@@ -72,8 +72,11 @@ public struct AgentLoop {
             .filter { supported.contains($0.name) }
         let toolSpecs = registeredTools.map { $0.functionSpec }
         let toolBytes = toolSpecs.isEmpty ? 0 : try JSONSerialization.data(withJSONObject: toolSpecs).count
-        let reserved = min(available, system.utf8.count + 2048)
-        let useTools = system == Self.generationSystem && available - reserved >= toolBytes + 512
+        // Text-only exchanges have no tool-call framing or final tool-round directive.
+        let fullPrompt = system == Self.generationSystem
+        let framing = fullPrompt ? 2048 : 1536
+        let reserved = min(available, system.utf8.count + framing)
+        let useTools = fullPrompt && available - reserved >= toolBytes + 512
         let specs = useTools ? toolSpecs : []
         let allowedTools = useTools ? Set(registeredTools.map { $0.name }) : []
         let budget = try BrainContextBudget(contextTokens: capabilities.contextTokens, outputTokens: capabilities.outputTokens,
