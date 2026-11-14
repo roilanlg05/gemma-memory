@@ -74,7 +74,7 @@ public struct AgentLoop {
         let toolBytes = toolSpecs.isEmpty ? 0 : try JSONSerialization.data(withJSONObject: toolSpecs).count
         // Text-only exchanges have no tool-call framing or final tool-round directive.
         let fullPrompt = system == Self.generationSystem
-        let framing = fullPrompt ? 2048 : 1536
+        let framing = fullPrompt ? 2048 : 1152
         let reserved = min(available, system.utf8.count + framing)
         let useTools = fullPrompt && available - reserved >= toolBytes + 512
         let specs = useTools ? toolSpecs : []
