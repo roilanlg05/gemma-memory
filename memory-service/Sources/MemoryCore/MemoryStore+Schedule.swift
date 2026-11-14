@@ -33,8 +33,18 @@ extension MemoryStore {
     /// Scheduled events overlapping the proposed [start,end). Cancelled/done excluded.
     /// `excluding` drops nodes by id so an edit never conflicts with the event being edited.
     public func scheduleConflicts(start: Double, end: Double, excluding: Set<String> = []) throws -> [Node] {
-        let events = try allNodes().filter { $0.kind == NodeKind.event.rawValue }
-        return events.filter { node in
+        try dbQueue.read { db in
+            try Self.scheduleConflicts(in: Self.liveEvents(db), start: start, end: end, excluding: excluding)
+        }
+    }
+
+    private static func liveEvents(_ db: Database) throws -> [Node] {
+        try Node.filter(Column("kind") == NodeKind.event.rawValue && Column("deleted") == false).fetchAll(db)
+    }
+
+    private static func scheduleConflicts(in events: [Node], start: Double, end: Double,
+                                          excluding: Set<String>) -> [Node] {
+        events.filter { node in
             guard !excluding.contains(node.id) else { return false }
             let a = NodeAttributes.from(node.extra)
             guard let s = a.startAt, let e = a.endAt, a.status == "scheduled" else { return false }
@@ -50,16 +60,23 @@ extension MemoryStore {
                                    checkpoint: ConsolidationCheckpoint? = nil)
         throws -> (id: String?, conflicts: [Node]) {
         let key = MemoryText.eventCanonicalKey(title: title, startAt: start)
-        let existing = try allNodes().first { node in
-            node.kind == NodeKind.event.rawValue && NodeAttributes.from(node.extra).canonicalKey == key
+        let result: (id: String?, conflicts: [Node]) = try dbQueue.write { db in
+            let events = try Self.liveEvents(db)
+            let existing = Self.matchingEvent(in: events, key: key)
+            if let existing, Self.retainsEvent(existing, against: origin) {
+                try Self.recordMatchedEvent(checkpoint, db: db)
+                return (existing.id, [])
+            }
+            let conflicts = Self.scheduleConflicts(in: events, start: start, end: end,
+                                                   excluding: existing.map { [$0.id] } ?? [])
+            if !conflicts.isEmpty && !force { return (nil, conflicts) }
+            let id = try Self.writeEvent(title: title, start: start, end: end, allDay: allDay,
+                                         location: location, origin: origin, key: key,
+                                         existing: existing, checkpoint: checkpoint, db: db)
+            return (id, conflicts)
         }
-        let excludingIds: Set<String> = existing != nil ? [existing!.id] : []
-        let conflicts = try scheduleConflicts(start: start, end: end, excluding: excludingIds)
-        if !conflicts.isEmpty && !force { return (nil, conflicts) }
-        let id = try upsertEvent(title: title, start: start, end: end,
-                                 allDay: allDay, location: location, origin: origin,
-                                 checkpoint: checkpoint)
-        return (id, conflicts)
+        if let id = result.id { try? linkToHub(nodeId: id, kindRaw: NodeKind.event.rawValue) }
+        return result
     }
 
     /// Create or update an event, deduping by canonicalKey. Returns the node id.
@@ -68,9 +85,41 @@ extension MemoryStore {
                             location: String?, origin: Origin,
                             checkpoint: ConsolidationCheckpoint? = nil) throws -> String {
         let key = MemoryText.eventCanonicalKey(title: title, startAt: start)
-        let existing = try allNodes().first { node in
-            node.kind == NodeKind.event.rawValue && NodeAttributes.from(node.extra).canonicalKey == key
+        let id = try dbQueue.write { db in
+            let existing = try Self.matchingEvent(in: Self.liveEvents(db), key: key)
+            if let existing, Self.retainsEvent(existing, against: origin) {
+                try Self.recordMatchedEvent(checkpoint, db: db)
+                return existing.id
+            }
+            return try Self.writeEvent(title: title, start: start, end: end, allDay: allDay,
+                                       location: location, origin: origin, key: key,
+                                       existing: existing, checkpoint: checkpoint, db: db)
         }
+        try? linkToHub(nodeId: id, kindRaw: NodeKind.event.rawValue)
+        return id
+    }
+
+    private static func matchingEvent(in events: [Node], key: String) -> Node? {
+        events.first { node in
+            guard let start = NodeAttributes.from(node.extra).startAt else { return false }
+            return MemoryText.eventCanonicalKey(title: node.label, startAt: start) == key
+        }
+    }
+
+    private static func retainsEvent(_ event: Node, against origin: Origin) -> Bool {
+        origin == .extracted && (event.origin == .explicit || NodeAttributes.from(event.extra).appleEventId != nil)
+    }
+
+    private static func recordMatchedEvent(_ checkpoint: ConsolidationCheckpoint?, db: Database) throws {
+        guard let checkpoint else { return }
+        try writeReceipt(db, jobID: checkpoint.jobID, operationID: checkpoint.operationID,
+                         phase: checkpoint.phase, outcome: .committed, committed: 1,
+                         refused: 0, unresolved: 0, stage: nil, retryable: false, at: checkpoint.at)
+    }
+
+    private static func writeEvent(title: String, start: Double, end: Double, allDay: Bool,
+                                   location: String?, origin: Origin, key: String, existing: Node?,
+                                   checkpoint: ConsolidationCheckpoint?, db: Database) throws -> String {
         let now = Date().timeIntervalSince1970
         var attrs = NodeAttributes(status: "scheduled", startAt: start, endAt: end,
                                    allDay: allDay, location: location, canonicalKey: key)
@@ -86,8 +135,9 @@ extension MemoryStore {
                 attrs.status = existingStatus   // don't resurrect a cancelled/done event
             }
             node.label = title; node.body = title; node.updatedAt = now; node.lastSeenAt = now
+            if origin == .explicit { node.origin = .explicit }
             node.extra = attrs.toJSON(); node.dirty = true
-            try upsert(node, checkpoint: checkpoint)
+            try writeNode(node, checkpoint: checkpoint, db: db)
             return existing.id
         } else {
             attrs.contentUpdatedAt = now
@@ -96,7 +146,7 @@ extension MemoryStore {
                             createdAt: now, updatedAt: now, lastSeenAt: now, salience: 3, decayRate: 0,
                             confidence: .probable, mentionCount: 1, ttlExpiresAt: nil, sourceRef: nil,
                             origin: origin, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
-            try upsert(node, checkpoint: checkpoint)
+            try writeNode(node, checkpoint: checkpoint, db: db)
             return id
         }
     }

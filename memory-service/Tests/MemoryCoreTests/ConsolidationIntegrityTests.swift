@@ -216,6 +216,26 @@ final class ConsolidationIntegrityTests: XCTestCase {
         }
     }
 
+    func testReflectionDoesNotTurnImpliedPreparationIntoTasks() async throws {
+        let store = try makeStore()
+        let ts = TranscriptStore(dbQueue: store.dbQueue)
+        try store.upsert(node("trip", NodeKind.plan.rawValue, "Hiking trip"))
+        let runtime = SchemaAwareRuntime([
+            "insights": #"{"insights":[],"implicitTasks":[{"text":"Pack hiking boots"},{"text":"Put hiking boots in your bag"}],"companions":[]}"#,
+            "entities": #"{"entities":[{"entity":"Book campsite","kind":"task","attributes":{"status":"pending"}}]}"#,
+        ])
+        let engine = MemoryConsolidationEngine(store: store, embedder: nil, runtime: runtime, now: { 2_000 })
+        try ts.append(threadId: "T", turnIndex: 0, role: "user", text: "I need to book a campsite.", now: 1_000)
+
+        await engine.runLight(isCancelled: { false })
+        XCTAssertTrue(try store.allNodes().filter { $0.kind == NodeKind.task.rawValue }.isEmpty)
+
+        await engine.runCycle(isCancelled: { false })
+        let tasks = try store.allNodes().filter { $0.kind == NodeKind.task.rawValue }
+        XCTAssertEqual(tasks.map(\.label), ["Book campsite"])
+        XCTAssertEqual(NodeAttributes.from(tasks.first?.extra).status, "pending")
+    }
+
     func test_reflect_provenanceUsesCanonicalIdAfterSemanticMerge() async throws {
         // Dimension > 16 so reflect takes the semantic-merge path (its own guard).
         let store = try makeStore(dim: 32)

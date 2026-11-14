@@ -199,7 +199,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     /// when the caller supplies one.
     ///
     /// `tightThreshold` is for the kinds whose duplicates have to be near-identical before they may
-    /// be folded together — insights, follow-ups, implicit tasks. It is only honoured when there is
+    /// be folded together — insights and follow-ups. It is only honoured when there is
     /// a real embedding space to measure it in; with none, the store falls back to the dedup key,
     /// because consolidation must work with no embedder configured at all.
     ///
@@ -755,9 +755,7 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
     // MARK: Reflect Topics — Topic/Event-based implicit synthesis (travel, health, projects)
     private struct TopicReflectionOut: Decodable {
         struct Insight: Decodable { let text: String; let sourceEntities: [String]? }
-        struct ImplicitTask: Decodable { let text: String; let horizon: String? }
         let insights: [Insight]?
-        let implicitTasks: [ImplicitTask]?
         let companions: [String]?
     }
 
@@ -778,7 +776,6 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
         guard !topics.isEmpty else { return tally.result }
 
         var addedInsights = 0
-        var addedTasks = 0
 
         for topic in topics.prefix(15) {
             let edges = (try? store.edges(from: topic.id)) ?? []
@@ -793,11 +790,10 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
 
             Synthesize implicit knowledge about this topic:
             1. `insights`: Higher-level grounded facts or patterns about the user and this topic. CRITICAL: Insights MUST describe persistent user habits, preferences, relations, or long-term patterns. NEVER output an insight describing a single specific event, a specific date, or containing temporal words like 'today', 'hoy', 'tomorrow', 'mañana', 'yesterday', 'ayer', 'this weekend', etc. Generalize instead.
-            2. `implicitTasks`: IMPLICIT preparation needs, requirements, packing, flights, reservations, or follow-up tasks logically implied by this topic that the user may not have explicitly stated.
-            3. `companions`: Exact names of people involved or traveling/participating with the user.
+            2. `companions`: Exact names of people involved or traveling/participating with the user.
 
             Output JSON only.
-            Schema: {"insights":[{"text":"...","sourceEntities":["..."]}],"implicitTasks":[{"text":"...","horizon":"short|long"}],"companions":["..."]}
+            Schema: {"insights":[{"text":"...","sourceEntities":["..."]}],"companions":["..."]}
             JSON:
             """
             let out: TopicReflectionOut
@@ -834,28 +830,6 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
                 tally.committed += 1
             }
 
-            for task in out.implicitTasks ?? [] {
-                let text = task.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if text.isEmpty { continue }
-                var attrs = NodeAttributes(); attrs.status = "pending"; attrs.horizon = task.horizon ?? "short"
-                let node = Node(id: UUID().uuidString, kind: NodeKind.task.rawValue, label: String(text.prefix(60)),
-                                body: text, layer: .daily, createdAt: t, updatedAt: t, lastSeenAt: t, salience: 3,
-                                decayRate: Decay.defaultDecayRate(for: .daily), confidence: .probable, mentionCount: 1,
-                                ttlExpiresAt: nil, sourceRef: topic.id, origin: .extracted, serverId: nil, dirty: true, deleted: false, extra: attrs.toJSON())
-                let emb = legacyEmbedding(node.label)
-                let saved = persistMerging("implicit_task", node, embedding: emb, tightThreshold: 0.15)
-                guard case .success(let canonicalID) = saved else {
-                    if case .failure(let problem) = saved { tally.note(problem) }
-                    continue
-                }
-                if canonicalID != topic.id {
-                    if case .failure(let problem) = persistEdge("implicit_task_link", from: topic.id, to: canonicalID,
-                                                                relation: .relatedTo, confidence: .probable, at: t) { tally.note(problem) }
-                }
-                addedTasks += 1
-                tally.committed += 1
-            }
-
             for cName in out.companions ?? [] {
                 let key = MemoryText.dedupKey(cName)
                 if let cNode = allNodes.first(where: { $0.kind == NodeKind.person.rawValue && MemoryText.dedupKey($0.label) == key }) {
@@ -869,8 +843,8 @@ public final class MemoryConsolidationEngine: ConsolidationRunning, @unchecked S
             }
         }
 
-        if addedInsights > 0 || addedTasks > 0 {
-            onProgress?("+\(addedInsights) topic insights, +\(addedTasks) implicit tasks")
+        if addedInsights > 0 {
+            onProgress?("+\(addedInsights) topic insights")
         }
         return tally.result
     }

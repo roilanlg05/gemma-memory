@@ -93,6 +93,46 @@ final class ScheduleStoreTests: XCTestCase {
         XCTAssertEqual(NodeAttributes.from(events[0].extra).location, "clinic", "update applied")
     }
 
+    func testExtractedEventMatchesLegacyEventAndPreservesVerifiedDetails() throws {
+        let store = try makeStore()
+        let id = try store.upsertEvent(title: "Dentist", start: 1_000, end: 2_000,
+                                       allDay: false, location: "Clinic", origin: .explicit)
+        var legacy = try XCTUnwrap(store.node(id: id))
+        var attributes = NodeAttributes.from(legacy.extra)
+        attributes.canonicalKey = nil
+        legacy.extra = attributes.toJSON()
+        try store.upsert(legacy)
+
+        let result = try store.createEventChecked(title: "dentist", start: 1_000, end: 4_600,
+                                                  allDay: false, location: nil, origin: .extracted, force: false)
+        XCTAssertEqual(result.id, id)
+        XCTAssertTrue(result.conflicts.isEmpty)
+        let events = try store.scheduleWindow(from: 0, to: 5_000)
+        XCTAssertEqual(events.map(\.id), [id])
+        XCTAssertEqual(events.first?.label, "Dentist")
+        let saved = NodeAttributes.from(events.first?.extra)
+        XCTAssertEqual(saved.endAt, 2_000)
+        XCTAssertEqual(saved.location, "Clinic")
+    }
+
+    func testConcurrentEventCreatesReturnOneCanonicalID() async throws {
+        let store = try makeStore()
+        let ids = try await withThrowingTaskGroup(of: String?.self, returning: [String?].self) { group in
+            for _ in 0..<12 {
+                group.addTask {
+                    try store.createEventChecked(title: "Dentist", start: 1_000, end: 2_000,
+                                                 allDay: false, location: nil, origin: .explicit, force: false).id
+                }
+            }
+            var ids: [String?] = []
+            for try await id in group { ids.append(id) }
+            return ids
+        }
+        let events = try store.scheduleWindow(from: 0, to: 5_000)
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(ids, Array(repeating: events.first?.id, count: 12))
+    }
+
     func test_cancelEvents_byWindow_softCancels() throws {
         let s = try makeStore()
         try addEvent(s, "A", 100, 160)
