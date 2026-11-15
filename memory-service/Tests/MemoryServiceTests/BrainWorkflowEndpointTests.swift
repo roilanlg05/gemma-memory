@@ -225,6 +225,58 @@ final class BrainWorkflowEndpointTests: XCTestCase {
         }
     }
 
+    func testNativeRecallAcrossChatsFindsRecentAndYearOldUnconsolidatedMessages() async throws {
+        let (app, services) = try await makeApp()
+        let now = Date().timeIntervalSince1970
+        let history = [
+            ("old-chat", now - 365 * 86_400, "La receta de berenjenas llevaba tahini y limón."),
+            ("dental-chat", now - 650, "Me puedes agendar un evento para mañana a la 1:30: limpieza con el dentista."),
+            ("other-chat", now - 60, "Puse música para cocinar.")
+        ]
+        for (thread, timestamp, text) in history {
+            let prior = try BrainTurnRequest(clientOperationID: "seed-" + thread, threadID: thread,
+                message: .init(id: "input", speakerID: BrainIdentity.userID, text: text, observedAt: timestamp, evidenceIDs: []),
+                budget: .init(contextTokens: 4096, outputTokens: 256))
+            let grant = services.brain.grant(threadID: thread, write: true)
+            let brain = BrainStore(store: services.store, authorization: grant)
+            _ = try BrainTurnStore(brain: brain).capture(prior)
+        }
+
+        let oldRow = try XCTUnwrap(services.transcript.range(threadId: "old-chat", from: 1, to: 1).first)
+        try await app.test(.router) { client in
+            for (index, query, expected) in [
+                (0, "Oye, créame el evento que te pedí anteriormente", "limpieza con el dentista"),
+                (1, "¿Qué te dije de la receta de berenjenas hace un año?", "tahini y limón")
+            ] {
+                let request = try BrainTurnRequest(clientOperationID: "recall-\(index)", threadID: "new-chat-\(index)",
+                    message: .init(id: "input", speakerID: BrainIdentity.userID, text: query, observedAt: now, evidenceIDs: []),
+                    budget: .init(contextTokens: 4096, outputTokens: 396, systemTokens: 900, toolTokens: 1600))
+                let response = try await client.execute(uri: "/v1/brain/turns/begin", method: .post, headers: Self.auth,
+                                                        body: Self.bytes(request))
+                XCTAssertEqual(response.status, .ok)
+                let result = try JSONDecoder().decode(BrainTurnResult.self, from: Data(response.body.readableBytesView))
+                let bundle = try XCTUnwrap(result.context)
+                XCTAssertTrue(bundle.renderedContext.contains("prior user message on"), bundle.renderedContext)
+                XCTAssertTrue(bundle.renderedContext.contains(expected), bundle.renderedContext)
+                XCTAssertFalse(bundle.renderedContext.contains("Puse música"), bundle.renderedContext)
+                XCTAssertTrue(bundle.recentMessageUnits.isEmpty)
+                XCTAssertTrue(bundle.exactCitationSourceReferences(includingRenderedContext: true, forwardedRecentUnitIDs: []).isEmpty)
+            }
+
+            let grant = services.brain.grant(threadID: "old-chat", forget: true)
+            let brain = BrainStore(store: services.store, authorization: grant)
+            let forgotten = try BrainRetractionService(brain: brain).forget(
+                scope: .init(kind: .evidence, id: ConsolidationEvidenceAdapter.evidenceID(for: oldRow)),
+                expectedRevision: brain.revision(), operationID: "forget-recipe")
+            XCTAssertEqual(forgotten.state, .committed)
+            let query = try BrainContextRequest(clientOperationID: "after-forget", threadID: "new-after-forget",
+                query: "¿Qué te dije de la receta de berenjenas hace un año?",
+                budget: .init(contextTokens: 4096, outputTokens: 396))
+            let context = try await services.brain.context(query, semanticSelection: false)
+            XCTAssertFalse(context.renderedContext.contains("tahini"))
+        }
+    }
+
     func testStagedUpdateIdentityAffectAndForgetWorkflow() async throws {
         let (app, services) = try await makeApp()
         let native = try BrainTurnRequest(clientOperationID: "native-change", threadID: "workflow",

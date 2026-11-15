@@ -423,6 +423,23 @@ public final class MemoryStore: @unchecked Sendable {
         m.registerMigration("v24-embedding-index") { db in
             try Self.createEmbeddingIndexSchema(db)
         }
+        m.registerMigration("v25-transcript-search") { db in
+            try db.execute(sql: """
+                CREATE INDEX transcript_role_created_at ON transcript(role, createdAt);
+                CREATE VIRTUAL TABLE transcript_fts USING fts5(text, content='transcript', tokenize='unicode61 remove_diacritics 2');
+                CREATE TRIGGER transcript_fts_insert AFTER INSERT ON transcript BEGIN
+                    INSERT INTO transcript_fts(rowid,text) VALUES (new.rowid,new.text);
+                END;
+                CREATE TRIGGER transcript_fts_delete AFTER DELETE ON transcript BEGIN
+                    INSERT INTO transcript_fts(transcript_fts,rowid,text) VALUES ('delete',old.rowid,old.text);
+                END;
+                CREATE TRIGGER transcript_fts_update AFTER UPDATE OF text ON transcript BEGIN
+                    INSERT INTO transcript_fts(transcript_fts,rowid,text) VALUES ('delete',old.rowid,old.text);
+                    INSERT INTO transcript_fts(rowid,text) VALUES (new.rowid,new.text);
+                END;
+                INSERT INTO transcript_fts(transcript_fts) VALUES ('rebuild');
+                """)
+        }
         return m
     }
 

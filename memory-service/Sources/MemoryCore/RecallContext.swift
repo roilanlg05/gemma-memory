@@ -102,7 +102,18 @@ struct RecallContextContent {
                     sources: [fragment.source], use: .startupOrientation))
             }
         }
-        let blocks = wantsProject || conversation.explicitlyRequested ? retrieved + startup : startup + retrieved
+        let transcriptRecall = TranscriptRecall(query: request.query, asOf: options.asOf)
+        let excerpts = try transcriptRecall.sources(brain: retriever.brain, threadID: request.threadID,
+            scope: options.scope, current: current, snapshot: graph, db: db).map { source in
+            let timestamp = Date(timeIntervalSince1970: source.observedAt).ISO8601Format()
+            return block(label: "prior user message on \(timestamp), historical context; anchor relative dates here; verify current state before acting",
+                         text: transcriptRecall.excerpt(from: source), sources: [AssociativeRetriever.metadata(source)])
+        }
+        let blocks = if wantsProject { retrieved + excerpts + startup }
+            else if !excerpts.isEmpty { excerpts + retrieved }
+            else if transcriptRecall.isExplicit { retrieved + startup }
+            else if conversation.explicitlyRequested { retrieved + startup }
+            else { startup + retrieved }
         return .init(originals: originals, quotes: quoteIDs, blocks: blocks)
     }
 
