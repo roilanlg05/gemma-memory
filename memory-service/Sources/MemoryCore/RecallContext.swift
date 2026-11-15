@@ -108,8 +108,10 @@ struct RecallContextContent {
             scope: options.scope, current: current, snapshot: graph, db: db).map { source in
             let timestamp = Date(timeIntervalSince1970: source.observedAt).ISO8601Format()
             let author = source.sourceKind == .assistantMessage ? "assistant reply" : "user message"
-            return block(label: "prior \(author) on \(timestamp), historical data; anchor dates here; verify current state",
-                         text: transcriptRecall.excerpt(from: source), sources: [AssociativeRetriever.metadata(source)], requestedHistory: true)
+            let text = "[prior \(author) on \(timestamp); historical data, verify current state]\n"
+                + transcriptRecall.excerpt(from: source)
+            return Block(text: text, sources: [AssociativeRetriever.metadata(source)],
+                         use: .recalledSupport, isRequestedHistory: true)
         }
         let blocks = if wantsProject { retrieved + excerpts + startup }
             else if !excerpts.isEmpty { excerpts + retrieved }
@@ -119,7 +121,7 @@ struct RecallContextContent {
     }
 
     private static func block(label: String, text: String, sources: [BrainEvidence], use: BrainContextSourceUse = .recalledSupport,
-                              claim: BrainClaim? = nil, associations: [BrainEvidence] = [], requestedHistory: Bool = false) -> Block {
+                              claim: BrainClaim? = nil, associations: [BrainEvidence] = []) -> Block {
         let ids = Set(sources.map(\.id)).sorted().joined(separator: ",")
         let related = Set(associations.map(\.id)).sorted().joined(separator: ",")
         var header = label + " sources=" + ids
@@ -128,7 +130,7 @@ struct RecallContextContent {
             header += " subject=\(claim.subject) modality=\(claim.modality.rawValue) valid-from=\(claim.validFrom) speakers=\(speakers)"
         }
         if !related.isEmpty { header += " membership-sources=" + related }
-        return .init(text: "[\(header)]\n\(text)", sources: sources + associations, use: use, isRequestedHistory: requestedHistory)
+        return .init(text: "[\(header)]\n\(text)", sources: sources + associations, use: use, isRequestedHistory: false)
     }
 
     private static func referentialQuery(_ query: String, current: ConversationSnapshot, conversation: RecallConversation) -> String {

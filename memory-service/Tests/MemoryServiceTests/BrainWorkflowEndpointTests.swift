@@ -255,6 +255,10 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 (1, "¿Qué te dije de la receta de berenjenas hace un año?", "tahini y limón"),
                 (2, "¿Qué me recomendaste para las berenjenas hace un año?", "pimentón ahumado")
             ] {
+                let ampleRequest = try BrainContextRequest(clientOperationID: "probe-\(index)", threadID: "new-chat-\(index)",
+                    query: query, budget: .init(contextTokens: 8192, outputTokens: 396))
+                let ample = try await services.brain.context(ampleRequest, semanticSelection: false)
+                XCTAssertTrue(ample.renderedContext.contains(expected), "Ample window for \(index): \(ample.renderedContext)")
                 let request = try BrainTurnRequest(clientOperationID: "recall-\(index)", threadID: "new-chat-\(index)",
                     message: .init(id: "input", speakerID: BrainIdentity.userID, text: query, observedAt: now, evidenceIDs: []),
                     budget: .init(contextTokens: 4096, outputTokens: 396, systemTokens: 900, toolTokens: 1600))
@@ -264,8 +268,8 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 let result = try JSONDecoder().decode(BrainTurnResult.self, from: Data(response.body.readableBytesView))
                 let bundle = try XCTUnwrap(result.context)
                 let label = index == 2 ? "prior assistant reply on" : "prior user message on"
-                XCTAssertTrue(bundle.renderedContext.contains(label), bundle.renderedContext)
-                XCTAssertTrue(bundle.renderedContext.contains(expected), bundle.renderedContext)
+                XCTAssertTrue(bundle.renderedContext.contains(label), "Compact window for \(index): \(bundle.renderedContext)")
+                XCTAssertTrue(bundle.renderedContext.contains(expected), "Compact window for \(index): \(bundle.renderedContext)")
                 XCTAssertFalse(bundle.renderedContext.contains("Puse música"), bundle.renderedContext)
                 XCTAssertTrue(bundle.recentMessageUnits.isEmpty)
                 XCTAssertTrue(bundle.exactCitationSourceReferences(includingRenderedContext: true, forwardedRecentUnitIDs: []).isEmpty)
