@@ -340,11 +340,18 @@ public final class BrainContextAssembler {
                 }
             }
         }
-        // The agent's identity gets its own section. It goes in before any conversation content,
-        // so sheer conversation volume cannot evict who the assistant is, and after the mandatory
-        // omission notices, so it cannot take the space an original's disclosure is owed. It is
-        // never folded in with user memories: a `[memory]` block is something the user told the
-        // brain, an `[agent ...]` block is not, and a reader must be able to tell which is which.
+        // A directly requested past exchange gets one excerpt before identity when space is
+        // tight. Keep mandatory disclosures and preserve room for a whole newest local group.
+        var prioritizedHistory: String?
+        if selected.isEmpty, let block = recall?.blocks.first(where: \.isRequestedHistory) {
+            let next = adding(to: draft, block: block.text, ids: block.sources.map(\.id), renderedUse: block.use)
+            if try fits(next, request: request, revision: snapshot.revision),
+               try (!fitsWithNewestGroup(draft) || fitsWithNewestGroup(next)) {
+                draft = next
+                prioritizedHistory = block.text
+            }
+        }
+        // Keep identity separate and whole. Its omission remains explicit under tight budgets.
         if let identity = snapshot.identity, identity.agentProfile != nil {
             for evidence in snapshot.identityEvidence { available[evidence.id] = evidence }
             let identityIDs = snapshot.identityEvidence.map(\.id)
@@ -463,7 +470,7 @@ public final class BrainContextAssembler {
             let spent = try estimatedInput(draft, request: request, revision: snapshot.revision)
             let room = capacity(request.budget) - spent
             let firstLimit = spent + (recent.count > 1 ? room / 2 : room)
-            for block in recall.blocks {
+            for block in recall.blocks where block.text != prioritizedHistory {
                 if try !add(block: block.text, ids: block.sources.map(\.id), renderedUse: block.use,
                             maximumInput: firstLimit) { deferredRecall.append(block) }
             }
