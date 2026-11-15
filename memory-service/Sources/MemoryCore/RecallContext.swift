@@ -107,7 +107,8 @@ struct RecallContextContent {
         let excerpts = try transcriptRecall.sources(brain: retriever.brain, threadID: request.threadID,
             scope: options.scope, current: current, snapshot: graph, db: db).map { source in
             let timestamp = Date(timeIntervalSince1970: source.observedAt).ISO8601Format()
-            return block(label: "prior user message on \(timestamp), historical data; anchor dates here; verify current state",
+            let author = source.sourceKind == .assistantMessage ? "assistant reply" : "user message"
+            return block(label: "prior \(author) on \(timestamp), historical data; anchor dates here; verify current state",
                          text: transcriptRecall.excerpt(from: source), sources: [AssociativeRetriever.metadata(source)], requestedHistory: true)
         }
         let blocks = if wantsProject { retrieved + excerpts + startup }

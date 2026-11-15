@@ -240,14 +240,20 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 budget: .init(contextTokens: 4096, outputTokens: 256))
             let grant = services.brain.grant(threadID: thread, write: true)
             let brain = BrainStore(store: services.store, authorization: grant)
-            _ = try BrainTurnStore(brain: brain).capture(prior)
+            let journal = BrainTurnStore(brain: brain)
+            let turn = try journal.capture(prior)
+            if thread == "old-chat" {
+                _ = try journal.assistant(turnID: turn, operationID: "seed-old-reply",
+                    text: "Para las berenjenas te recomiendo pimentón ahumado.", timestamp: timestamp + 1)
+            }
         }
 
         let oldRow = try XCTUnwrap(services.transcript.range(threadId: "old-chat", from: 1, to: 1).first)
         try await app.test(.router) { client in
             for (index, query, expected) in [
                 (0, "Oye, créame el evento que te pedí anteriormente", "limpieza con el dentista"),
-                (1, "¿Qué te dije de la receta de berenjenas hace un año?", "tahini y limón")
+                (1, "¿Qué te dije de la receta de berenjenas hace un año?", "tahini y limón"),
+                (2, "¿Qué me recomendaste para las berenjenas hace un año?", "pimentón ahumado")
             ] {
                 let request = try BrainTurnRequest(clientOperationID: "recall-\(index)", threadID: "new-chat-\(index)",
                     message: .init(id: "input", speakerID: BrainIdentity.userID, text: query, observedAt: now, evidenceIDs: []),
@@ -257,7 +263,8 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 XCTAssertEqual(response.status, .ok)
                 let result = try JSONDecoder().decode(BrainTurnResult.self, from: Data(response.body.readableBytesView))
                 let bundle = try XCTUnwrap(result.context)
-                XCTAssertTrue(bundle.renderedContext.contains("prior user message on"), bundle.renderedContext)
+                let label = index == 2 ? "prior assistant reply on" : "prior user message on"
+                XCTAssertTrue(bundle.renderedContext.contains(label), bundle.renderedContext)
                 XCTAssertTrue(bundle.renderedContext.contains(expected), bundle.renderedContext)
                 XCTAssertFalse(bundle.renderedContext.contains("Puse música"), bundle.renderedContext)
                 XCTAssertTrue(bundle.recentMessageUnits.isEmpty)
