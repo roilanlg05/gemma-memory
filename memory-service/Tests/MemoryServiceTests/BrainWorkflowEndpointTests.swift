@@ -231,6 +231,7 @@ final class BrainWorkflowEndpointTests: XCTestCase {
         let history = [
             ("old-chat", now - 365 * 86_400, "La receta de berenjenas llevaba tahini y limón."),
             ("dental-chat", now - 650, "Me puedes agendar un evento para mañana a la 1:30: limpieza con el dentista."),
+            ("retry-chat", now - 120, "Oye, créame el evento que te pedí anteriormente"),
             ("other-chat", now - 60, "Puse música para cocinar.")
         ]
         for (thread, timestamp, text) in history {

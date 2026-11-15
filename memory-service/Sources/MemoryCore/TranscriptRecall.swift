@@ -10,7 +10,7 @@ struct TranscriptRecall {
         "agenda", "agendar", "crea", "creame", "cual", "cuentame", "deje", "dije", "dijimos", "dime", "discussed",
         "donde", "don", "earlier", "eso", "esto", "estaba", "estabamos", "find", "fue", "habia", "hablamos", "hace",
         "hablaste", "haz", "hazlo", "last", "mencione", "meses", "month", "months", "pasado",
-        "pedi", "pediste", "pedimos", "please", "pon", "previously", "puedes", "quedamos",
+        "oye", "otro", "otra", "pedi", "pediste", "pedimos", "please", "pon", "previously", "puedes", "quedamos",
         "recordar", "recuerda", "recuerdo", "acuerdas", "retoma", "said", "sobre", "tema", "tell", "tiempo", "time",
         "told", "vez", "want", "year", "years", "ano", "anos", "ago", "chat", "conversation", "would"
     ]
@@ -59,7 +59,13 @@ struct TranscriptRecall {
                   try !BrainStore.isExcluded(db, kind: .transcript, id: row.id, fingerprint: BrainStore.transcriptFingerprint(row.text)),
                   let source = try resolver.evidence(ConsolidationEvidenceAdapter.evidenceID(for: row)),
                   source.speakerID == BrainIdentity.userID, !snapshot.blockedOriginals.contains(source.id) else { return nil }
-            let matches = terms.intersection(RecallCue(source.text ?? "").terms).count
+            guard let text = source.text else { return nil }
+            let prior = TranscriptRecall(query: text, asOf: asOf)
+            guard prior.normalized != normalized else { return nil }
+            let priorTerms = RecallCue(text).terms
+            let matches = terms.intersection(priorTerms).count
+            // A previous bare reference is a pointer. Keep looking for the message with its details.
+            guard !prior.isExplicit || !priorTerms.subtracting(terms.union(Self.filler)).isEmpty else { return nil }
             guard terms.isEmpty || matches > 0 else { return nil }
             return (source, matches)
         }
