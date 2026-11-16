@@ -1,5 +1,16 @@
 import Foundation
 
+/// Shared by recall and the client's context budget so a continuation receives the space
+/// needed to carry relevant earlier messages.
+public enum BrainConversationReference {
+    private static let pattern = #"\b(anteriormente|lo de antes|de la otra vez|recuerda|recuerdo|recuerdas|acuerdas|retoma[r]?|retomemos|reanuda[r]?|reanudemos|continuemos|continuar|sigamos|volver a lo|volvamos|te pedi|te dije|te conte|me dijiste|me contaste|me recomendaste|hablamos|mencione|previously|earlier|remember|last time|we discussed|continue|resume|i (asked|said|told)|you (told|said|recommended))\b"#
+
+    public static func refersToHistory(_ message: String) -> Bool {
+        let text = message.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        return text.range(of: pattern, options: .regularExpression) != nil
+    }
+}
+
 public struct BrainContextRequest: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let clientOperationID: String

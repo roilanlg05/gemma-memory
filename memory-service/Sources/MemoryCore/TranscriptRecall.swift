@@ -5,7 +5,6 @@ import GRDB
 /// Bounded, source-backed recall for explicit references to past conversations.
 struct TranscriptRecall {
     private static let assistantReference = #"\b(me dijiste|me contaste|me recomendaste|you told|you said|you recommended)\b"#
-    private static let reference = #"\b(anteriormente|lo de antes|de la otra vez|recuerda|recuerdo|recuerdas|acuerdas|retoma|te pedi|te dije|te conte|hablamos|mencione|previously|earlier|remember|last time|we discussed|i (asked|said|told))\b"#
     private static let filler: Set<String> = [
         "anterior", "anteriormente", "antes", "asked", "ayudame", "can", "come", "conversacion", "conte", "contaste",
         "agenda", "agendar", "crea", "creame", "cual", "cuentame", "deje", "dije", "dijiste", "dijimos", "dime", "discussed",
@@ -13,14 +12,16 @@ struct TranscriptRecall {
         "hablaste", "haz", "hazlo", "last", "mencione", "meses", "month", "months", "pasado",
         "oye", "otro", "otra", "pedi", "pediste", "pedimos", "please", "pon", "previously", "puedes", "quedamos",
         "recordar", "recuerda", "recuerdo", "acuerdas", "recomendaste", "recommended", "retoma", "said", "sobre", "tema", "tell", "tiempo", "time",
-        "told", "vez", "want", "year", "years", "ano", "anos", "ago", "chat", "conversation", "would"
+        "told", "vez", "want", "year", "years", "ano", "anos", "ago", "chat", "conversation", "would",
+        "agendando", "agendalo", "agendemos", "continuar", "continuemos", "continue", "hola", "hello", "hi",
+        "retomar", "retomemos", "reanuda", "reanudar", "reanudemos", "resume", "sigamos", "volvamos", "volver"
     ]
 
     let query: String
     let asOf: Double
 
     var isExplicit: Bool {
-        asksAboutAssistant || normalized.range(of: Self.reference, options: .regularExpression) != nil
+        BrainConversationReference.refersToHistory(query)
     }
 
     private var asksAboutAssistant: Bool {
@@ -31,11 +32,22 @@ struct TranscriptRecall {
         query.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
     }
 
+    private var topicTerms: Set<String> {
+        Set(RecallCue(query).terms.filter { $0.count > 2 && !$0.allSatisfy(\.isNumber) })
+            .subtracting(Self.filler)
+    }
+
+    private func providesContext(for terms: Set<String>) -> Bool {
+        let ownTerms = topicTerms
+        guard !ownTerms.isEmpty, terms.isEmpty || !ownTerms.isDisjoint(with: terms) else { return false }
+        return !isExplicit || !ownTerms.subtracting(terms).isEmpty
+    }
+
     func sources(brain: BrainStore, threadID: String, scope: BrainAccessScope,
                  current: ConversationSnapshot, snapshot: GraphRecallSnapshot, db: Database) throws -> [BrainEvidence] {
         guard isExplicit, scope == .user else { return [] }
         let cue = RecallCue(query)
-        let terms = Set(cue.terms.filter { $0.count > 2 && !$0.allSatisfy(\.isNumber) }).subtracting(Self.filler)
+        let terms = topicTerms
         let role = asksAboutAssistant ? "assistant" : "user"
         let sourceKind: BrainSourceKind = asksAboutAssistant ? .assistantMessage : .userMessage
         let speaker = asksAboutAssistant ? BrainIdentity.agentID : BrainIdentity.userID
@@ -44,7 +56,7 @@ struct TranscriptRecall {
         let dates = searchDates(year: cue.year)
         if !explicitlyOtherChat, dates.lower == 0, current.sources.contains(where: { item in
             guard item.evidence.sourceKind == sourceKind, let text = item.evidence.text, text != query else { return false }
-            return terms.isEmpty || !terms.isDisjoint(with: RecallCue(text).terms)
+            return TranscriptRecall(query: text, asOf: asOf).providesContext(for: terms)
         }) { return [] }
 
         let rows: [TranscriptRow]
@@ -69,13 +81,9 @@ struct TranscriptRecall {
                   source.sourceKind == sourceKind, source.speakerID == speaker, !snapshot.blockedOriginals.contains(source.id) else { return nil }
             guard let text = source.text else { return nil }
             let prior = TranscriptRecall(query: text, asOf: asOf)
-            guard prior.normalized != normalized else { return nil }
-            let priorTerms = RecallCue(text).terms
-            let matches = terms.intersection(priorTerms).count
-            // A previous bare reference is a pointer. Keep looking for the message with its details.
-            guard !prior.isExplicit || !priorTerms.subtracting(terms.union(Self.filler)).isEmpty else { return nil }
-            guard terms.isEmpty || matches > 0 else { return nil }
-            return (source, matches)
+            // Follow-up pointers and greetings cannot substitute for the original details.
+            guard prior.normalized != normalized, prior.providesContext(for: terms) else { return nil }
+            return (source, terms.intersection(prior.topicTerms).count)
         }
         return Array(candidates.sorted {
             ($0.matches, $0.source.observedAt, $0.source.id) > ($1.matches, $1.source.observedAt, $1.source.id)

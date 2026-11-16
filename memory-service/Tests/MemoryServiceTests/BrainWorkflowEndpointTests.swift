@@ -232,7 +232,8 @@ final class BrainWorkflowEndpointTests: XCTestCase {
             ("old-chat", now - 365 * 86_400, "La receta de berenjenas llevaba tahini y limón."),
             ("dental-chat", now - 650, "Me puedes agendar un evento para mañana a la 1:30: limpieza con el dentista."),
             ("retry-chat", now - 120, "Oye, créame el evento que te pedí anteriormente"),
-            ("other-chat", now - 60, "Puse música para cocinar.")
+            ("other-chat", now - 60, "Puse música para cocinar."),
+            ("new-chat-3", now - 30, "Hola")
         ]
         for (thread, timestamp, text) in history {
             let prior = try BrainTurnRequest(clientOperationID: "seed-" + thread, threadID: thread,
@@ -242,6 +243,10 @@ final class BrainWorkflowEndpointTests: XCTestCase {
             let brain = BrainStore(store: services.store, authorization: grant)
             let journal = BrainTurnStore(brain: brain)
             let turn = try journal.capture(prior)
+            if thread == "new-chat-3" {
+                _ = try journal.assistant(turnID: turn, operationID: "greeting-reply",
+                    text: "Hola. Aquí estoy. ¿Qué necesitas?", timestamp: timestamp + 1)
+            }
             if thread == "old-chat" {
                 _ = try journal.assistant(turnID: turn, operationID: "seed-old-reply",
                     text: "Para las berenjenas te recomiendo pimentón ahumado.", timestamp: timestamp + 1)
@@ -253,7 +258,9 @@ final class BrainWorkflowEndpointTests: XCTestCase {
             for (index, query, expected) in [
                 (0, "Oye, créame el evento que te pedí anteriormente", "limpieza con el dentista"),
                 (1, "¿Qué te dije de la receta de berenjenas hace un año?", "tahini y limón"),
-                (2, "¿Qué me recomendaste para las berenjenas hace un año?", "pimentón ahumado")
+                (2, "¿Qué me recomendaste para las berenjenas hace un año?", "pimentón ahumado"),
+                (3, "Q continuemos agendando el evento", "limpieza con el dentista"),
+                (4, "Retomemos lo de la receta de berenjenas", "tahini y limón")
             ] {
                 let ampleRequest = try BrainContextRequest(clientOperationID: "probe-\(index)", threadID: "new-chat-\(index)",
                     query: query, budget: .init(contextTokens: 8192, outputTokens: 396))
@@ -261,7 +268,7 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 XCTAssertTrue(ample.renderedContext.contains(expected), "Ample window for \(index): \(ample.renderedContext)")
                 let request = try BrainTurnRequest(clientOperationID: "recall-\(index)", threadID: "new-chat-\(index)",
                     message: .init(id: "input", speakerID: BrainIdentity.userID, text: query, observedAt: now, evidenceIDs: []),
-                    budget: .init(contextTokens: 4096, outputTokens: 396, systemTokens: 900, toolTokens: 1600))
+                    budget: .init(contextTokens: 4096, outputTokens: 396, systemTokens: 900, toolTokens: index == 3 ? 900 : 1600))
                 let response = try await client.execute(uri: "/v1/brain/turns/begin", method: .post, headers: Self.auth,
                                                         body: Self.bytes(request))
                 XCTAssertEqual(response.status, .ok)
@@ -271,7 +278,14 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 XCTAssertTrue(bundle.renderedContext.contains(label), "Compact window for \(index): \(bundle.renderedContext)")
                 XCTAssertTrue(bundle.renderedContext.contains(expected), "Compact window for \(index): \(bundle.renderedContext)")
                 XCTAssertFalse(bundle.renderedContext.contains("Puse música"), bundle.renderedContext)
-                XCTAssertTrue(bundle.recentMessageUnits.isEmpty)
+                if index == 3 {
+                    // The client already has the greeting in its local buffer.
+                    XCTAssertTrue(bundle.recentMessageUnits.allSatisfy {
+                        $0.text == "Hola" || $0.text == "Hola. Aquí estoy. ¿Qué necesitas?"
+                    })
+                } else {
+                    XCTAssertTrue(bundle.recentMessageUnits.isEmpty)
+                }
                 XCTAssertTrue(bundle.exactCitationSourceReferences(includingRenderedContext: true, forwardedRecentUnitIDs: []).isEmpty)
             }
 
