@@ -230,10 +230,13 @@ final class BrainWorkflowEndpointTests: XCTestCase {
         let now = Date().timeIntervalSince1970
         let history = [
             ("old-chat", now - 365 * 86_400, "La receta de berenjenas llevaba tahini y limón."),
+            ("mechanic-chat", now - 1000, "Me puedes agendar una cita con el mecánico."),
             ("dental-chat", now - 650, "Me puedes agendar un evento para mañana a la 1:30: limpieza con el dentista."),
             ("retry-chat", now - 120, "Oye, créame el evento que te pedí anteriormente"),
             ("other-chat", now - 60, "Puse música para cocinar."),
-            ("new-chat-3", now - 30, "Hola")
+            ("new-chat-3", now - 30, "Hola"),
+            ("new-chat-5", now - 20, "Hablamos del horario de la cita."),
+            ("new-chat-6", now - 20, "¿Qué hablamos de la cita anterior?")
         ]
         for (thread, timestamp, text) in history {
             let prior = try BrainTurnRequest(clientOperationID: "seed-" + thread, threadID: thread,
@@ -260,7 +263,9 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 (1, "¿Qué te dije de la receta de berenjenas hace un año?", "tahini y limón"),
                 (2, "¿Qué me recomendaste para las berenjenas hace un año?", "pimentón ahumado"),
                 (3, "Q continuemos agendando el evento", "limpieza con el dentista"),
-                (4, "Retomemos lo de la receta de berenjenas", "tahini y limón")
+                (4, "Retomemos lo de la receta de berenjenas", "tahini y limón"),
+                (5, "¿Qué hablamos de la cita con el dentista?", "limpieza con el dentista"),
+                (6, "Ok, q hay de lo q hablamos hacerca de es cita??", "limpieza con el dentista")
             ] {
                 let ampleRequest = try BrainContextRequest(clientOperationID: "probe-\(index)", threadID: "new-chat-\(index)",
                     query: query, budget: .init(contextTokens: 8192, outputTokens: 396))
@@ -268,7 +273,7 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 XCTAssertTrue(ample.renderedContext.contains(expected), "Ample window for \(index): \(ample.renderedContext)")
                 let request = try BrainTurnRequest(clientOperationID: "recall-\(index)", threadID: "new-chat-\(index)",
                     message: .init(id: "input", speakerID: BrainIdentity.userID, text: query, observedAt: now, evidenceIDs: []),
-                    budget: .init(contextTokens: 4096, outputTokens: 396, systemTokens: 900, toolTokens: index == 3 ? 900 : 1600))
+                    budget: .init(contextTokens: 4096, outputTokens: 396, systemTokens: 900, toolTokens: [3, 5, 6].contains(index) ? 900 : 1600))
                 let response = try await client.execute(uri: "/v1/brain/turns/begin", method: .post, headers: Self.auth,
                                                         body: Self.bytes(request))
                 XCTAssertEqual(response.status, .ok)
@@ -278,12 +283,13 @@ final class BrainWorkflowEndpointTests: XCTestCase {
                 XCTAssertTrue(bundle.renderedContext.contains(label), "Compact window for \(index): \(bundle.renderedContext)")
                 XCTAssertTrue(bundle.renderedContext.contains(expected), "Compact window for \(index): \(bundle.renderedContext)")
                 XCTAssertFalse(bundle.renderedContext.contains("Puse música"), bundle.renderedContext)
+                if index == 5 { XCTAssertFalse(bundle.renderedContext.contains("mecánico"), bundle.renderedContext) }
                 if index == 3 {
                     // The client already has the greeting in its local buffer.
                     XCTAssertTrue(bundle.recentMessageUnits.allSatisfy {
                         $0.text == "Hola" || $0.text == "Hola. Aquí estoy. ¿Qué necesitas?"
                     })
-                } else {
+                } else if index < 5 {
                     XCTAssertTrue(bundle.recentMessageUnits.isEmpty)
                 }
                 XCTAssertTrue(bundle.exactCitationSourceReferences(includingRenderedContext: true, forwardedRecentUnitIDs: []).isEmpty)

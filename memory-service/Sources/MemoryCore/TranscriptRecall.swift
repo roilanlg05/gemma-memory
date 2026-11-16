@@ -5,11 +5,12 @@ import GRDB
 /// Bounded, source-backed recall for explicit references to past conversations.
 struct TranscriptRecall {
     private static let assistantReference = #"\b(me dijiste|me contaste|me recomendaste|you told|you said|you recommended)\b"#
+    private static let eventTerms: Set<String> = ["cita", "citas", "evento", "eventos", "appointment", "appointments", "event", "events"]
     private static let filler: Set<String> = [
-        "anterior", "anteriormente", "antes", "asked", "ayudame", "can", "come", "conversacion", "conte", "contaste",
+        "acerca", "anterior", "anteriormente", "antes", "asked", "ayudame", "can", "come", "conversacion", "conte", "contaste",
         "agenda", "agendar", "crea", "creame", "cual", "cuentame", "deje", "dije", "dijiste", "dijimos", "dime", "discussed",
         "donde", "don", "earlier", "eso", "esto", "estaba", "estabamos", "find", "fue", "habia", "hablamos", "hace",
-        "hablaste", "haz", "hazlo", "last", "mencione", "meses", "month", "months", "pasado",
+        "hablaste", "hacerca", "hay", "haz", "hazlo", "last", "mencione", "meses", "month", "months", "pasado",
         "oye", "otro", "otra", "pedi", "pediste", "pedimos", "please", "pon", "previously", "puedes", "quedamos",
         "recordar", "recuerda", "recuerdo", "acuerdas", "recomendaste", "recommended", "retoma", "said", "sobre", "tema", "tell", "tiempo", "time",
         "told", "vez", "want", "year", "years", "ano", "anos", "ago", "chat", "conversation", "would",
@@ -33,14 +34,16 @@ struct TranscriptRecall {
     }
 
     private var topicTerms: Set<String> {
-        Set(RecallCue(query).terms.filter { $0.count > 2 && !$0.allSatisfy(\.isNumber) })
+        let terms = Set(RecallCue(query).terms.filter { $0.count > 2 && !$0.allSatisfy(\.isNumber) })
             .subtracting(Self.filler)
+        return terms.isDisjoint(with: Self.eventTerms) ? terms : terms.subtracting(Self.eventTerms).union(["evento"])
     }
 
     private func providesContext(for terms: Set<String>) -> Bool {
         let ownTerms = topicTerms
         guard !ownTerms.isEmpty, terms.isEmpty || !ownTerms.isDisjoint(with: terms) else { return false }
-        return !isExplicit || !ownTerms.subtracting(terms).isEmpty
+        if !isExplicit { return true }
+        return !query.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?") && !ownTerms.subtracting(terms).isEmpty
     }
 
     func sources(brain: BrainStore, threadID: String, scope: BrainAccessScope,
@@ -48,19 +51,23 @@ struct TranscriptRecall {
         guard isExplicit, scope == .user else { return [] }
         let cue = RecallCue(query)
         let terms = topicTerms
+        let searchTerms = terms.contains("evento") ? terms.union(Self.eventTerms) : terms
+        let specificTerms = terms.subtracting(["evento"])
         let role = asksAboutAssistant ? "assistant" : "user"
         let sourceKind: BrainSourceKind = asksAboutAssistant ? .assistantMessage : .userMessage
         let speaker = asksAboutAssistant ? BrainIdentity.agentID : BrainIdentity.userID
         let explicitlyOtherChat = normalized.range(of: #"\b(otro chat|chat anterior|otra conversacion|previous chat|another chat)\b"#,
                                                    options: .regularExpression) != nil
         let dates = searchDates(year: cue.year)
-        if !explicitlyOtherChat, dates.lower == 0, current.sources.contains(where: { item in
+        // A named topic can be discussed in both chats. Only an unqualified pointer
+        // such as “lo que te dije” can be resolved just because local context exists.
+        if terms.isEmpty, !explicitlyOtherChat, dates.lower == 0, current.sources.contains(where: { item in
             guard item.evidence.sourceKind == sourceKind, let text = item.evidence.text, text != query else { return false }
             return TranscriptRecall(query: text, asOf: asOf).providesContext(for: terms)
         }) { return [] }
 
         let rows: [TranscriptRow]
-        if let pattern = FTS5Pattern(matchingAnyTokenIn: terms.sorted().joined(separator: " ")), !terms.isEmpty {
+        if let pattern = FTS5Pattern(matchingAnyTokenIn: searchTerms.sorted().joined(separator: " ")), !terms.isEmpty {
             rows = try TranscriptRow.fetchAll(db, sql: """
                 SELECT t.* FROM transcript_fts JOIN transcript t ON t.rowid=transcript_fts.rowid
                 WHERE transcript_fts MATCH ? AND t.threadId<>? AND t.role=? AND t.createdAt BETWEEN ? AND ?
@@ -74,7 +81,7 @@ struct TranscriptRecall {
         }
         var resolver = GraphMemoryQuery.EvidenceResolver(brain: brain, threadID: threadID,
                                                         scope: scope, asOf: asOf, db: db)
-        let candidates = try rows.compactMap { row -> (source: BrainEvidence, matches: Int)? in
+        let candidates = try rows.compactMap { row -> (source: BrainEvidence, matches: Int, direct: Int)? in
             guard cue.allows(row.createdAt),
                   try !BrainStore.isExcluded(db, kind: .transcript, id: row.id, fingerprint: BrainStore.transcriptFingerprint(row.text)),
                   let source = try resolver.evidence(ConsolidationEvidenceAdapter.evidenceID(for: row)),
@@ -82,11 +89,13 @@ struct TranscriptRecall {
             guard let text = source.text else { return nil }
             let prior = TranscriptRecall(query: text, asOf: asOf)
             // Follow-up pointers and greetings cannot substitute for the original details.
-            guard prior.normalized != normalized, prior.providesContext(for: terms) else { return nil }
-            return (source, terms.intersection(prior.topicTerms).count)
+            guard prior.normalized != normalized, prior.providesContext(for: terms),
+                  specificTerms.isEmpty || !prior.topicTerms.isDisjoint(with: specificTerms) else { return nil }
+            return (source, terms.intersection(prior.topicTerms).count, prior.isExplicit ? 0 : 1)
         }
         return Array(candidates.sorted {
-            ($0.matches, $0.source.observedAt, $0.source.id) > ($1.matches, $1.source.observedAt, $1.source.id)
+            ($0.matches, $0.direct, $0.source.observedAt, $0.source.id) >
+                ($1.matches, $1.direct, $1.source.observedAt, $1.source.id)
         }.prefix(terms.isEmpty ? 1 : 2).map(\.source))
     }
 
